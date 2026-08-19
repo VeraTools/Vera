@@ -1154,22 +1154,34 @@ mod tests {
             rows.join(" | ")
         };
 
-        for (label, sql) in [
-            ("find_callers", SQL_FIND_CALLERS),
-            ("find_callees", SQL_FIND_CALLEES),
-            ("find_type_relations", SQL_FIND_TYPE_RELATIONS),
-            ("get_chunks_by_symbol_name", SQL_CHUNKS_BY_SYMBOL_NAME),
+        for (label, sql, expected_index) in [
+            ("find_callers", SQL_FIND_CALLERS, "idx_refs_callee_lower"),
+            ("find_callees", SQL_FIND_CALLEES, "idx_refs_caller_lower"),
+            (
+                "find_type_relations",
+                SQL_FIND_TYPE_RELATIONS,
+                "idx_type_relations_target_lower",
+            ),
+            (
+                "get_chunks_by_symbol_name",
+                SQL_CHUNKS_BY_SYMBOL_NAME,
+                "idx_chunks_symbol_name_lower",
+            ),
         ] {
             let plan = plan_for(sql);
-            // Assert on SEARCH vs SCAN, not on the presence of an index name.
-            // A full scan can still read *through* an index and report
-            // "SCAN t USING COVERING INDEX ...", so looking for "USING INDEX"
-            // passes on exactly the plan this test exists to reject.
             assert!(
-                plan.starts_with("SEARCH"),
-                "{label} must seek its table, but the plan was: {plan}"
+                plan.contains(&format!("USING INDEX {expected_index}")),
+                "{label} must use {expected_index}, but the plan was: {plan}"
             );
-            assert!(!plan.contains("SCAN"), "{label} still scans: {plan}");
+            assert!(
+                plan.split(" | ").all(|detail| {
+                    detail
+                        .split_whitespace()
+                        .next()
+                        .is_none_or(|operation| operation != "SCAN")
+                }),
+                "{label} still scans: {plan}"
+            );
         }
     }
 
