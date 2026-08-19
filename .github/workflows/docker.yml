@@ -44,6 +44,9 @@ jobs:
           - variant: rocm
             dockerfile: docker/Dockerfile.rocm
             tag_suffix: rocm
+          - variant: openvino
+            dockerfile: docker/Dockerfile.openvino
+            tag_suffix: openvino
 
     steps:
       # Checkout the requested tag so the Dockerfiles match what the release
