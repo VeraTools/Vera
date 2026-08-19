@@ -3,6 +3,8 @@
 //! Uses the sqlite-vec extension for brute-force KNN vector search.
 //! Vectors are stored alongside the metadata DB in the same SQLite file.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, ffi::sqlite3_auto_extension, params};
 use sqlite_vec::sqlite3_vec_init;
@@ -234,9 +236,13 @@ impl VectorStore {
         }
         let limit = limit.min(MAX_KNN_K);
 
+        // `prepare`, not `prepare_cached`: `limit` is interpolated into the
+        // text, so every distinct limit is a distinct cache key. Caching these
+        // never hits and evicts the statements that do have stable text, since
+        // rusqlite's cache is a 16-entry LRU shared by the whole connection.
         let mut stmt = self
             .conn
-            .prepare_cached(&format!(
+            .prepare(&format!(
                 "SELECT v.rowid, v.distance
                  FROM vec_chunks v
                  WHERE v.embedding MATCH ?1
@@ -245,29 +251,59 @@ impl VectorStore {
             ))
             .context("failed to prepare vector search")?;
 
-        let rows = stmt
+        let hits: Vec<(i64, f64)> = stmt
             .query_map([query.as_bytes()], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
             })
-            .context("failed to execute vector search")?;
+            .context("failed to execute vector search")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read vector result")?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            let (rowid, distance) = row.context("failed to read vector result")?;
-            // Map rowid back to chunk_id.
-            let chunk_id: String = self
-                .conn
-                .query_row(
-                    "SELECT chunk_id FROM chunk_id_map WHERE rowid = ?1",
-                    params![rowid],
-                    |row| row.get(0),
-                )
-                .with_context(|| format!("failed to map rowid {rowid} to chunk_id"))?;
+        // Resolve the rowids in one query instead of one per hit. The KNN
+        // query above is deliberately left alone: joining `chunk_id_map` into
+        // it would risk losing the vec0 KNN optimization.
+        let chunk_ids = self.chunk_ids_for_rowids(&hits)?;
 
-            results.push(VectorSearchResult { chunk_id, distance });
+        hits.iter()
+            .map(|(rowid, distance)| {
+                let chunk_id = chunk_ids
+                    .get(rowid)
+                    .with_context(|| format!("failed to map rowid {rowid} to chunk_id"))?
+                    .clone();
+                Ok(VectorSearchResult {
+                    chunk_id,
+                    distance: *distance,
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve many rowids to their chunk ids in a single query.
+    fn chunk_ids_for_rowids(&self, hits: &[(i64, f64)]) -> Result<HashMap<i64, String>> {
+        if hits.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        Ok(results)
+        let placeholders = std::iter::repeat_n("?", hits.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // Text varies with the number of ids, so plain `prepare` here too.
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT rowid, chunk_id FROM chunk_id_map WHERE rowid IN ({placeholders})"
+            ))
+            .context("failed to prepare chunk id lookup")?;
+
+        let mapped = stmt
+            .query_map(
+                rusqlite::params_from_iter(hits.iter().map(|(rowid, _)| *rowid)),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .context("failed to query chunk ids")?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()
+            .context("failed to collect chunk ids")?;
+        Ok(mapped)
     }
 
     /// Count total vectors in the store.
@@ -508,6 +544,42 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].chunk_id, "c1");
         assert!(results[0].distance < 0.001); // Self-match should be ~0 distance.
+    }
+
+    #[test]
+    fn search_pairs_each_chunk_id_with_its_own_distance() {
+        // The rowid -> chunk_id mapping is now one batched query returning a
+        // HashMap, so the results have to be re-projected back into the KNN
+        // distance order. Insert so that rowid order (insertion order) is the
+        // reverse of distance order, then assert the pairing — not just that
+        // distances ascend, which holds for any implementation that emits one
+        // result per hit in hit order.
+        let store = VectorStore::open_in_memory(4).unwrap();
+        store.insert("far", &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        store.insert("mid", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        store.insert("near", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let results = store.search(&[1.0, 0.0, 0.0, 0.0], 3).unwrap();
+        assert_eq!(results.len(), 3);
+
+        let order: Vec<&str> = results.iter().map(|r| r.chunk_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["near", "mid", "far"],
+            "results must come back in distance order, not rowid order"
+        );
+        assert!(
+            results[0].distance < 0.001,
+            "the self-match must keep its own near-zero distance, got {}",
+            results[0].distance
+        );
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].distance <= pair[1].distance,
+                "distances must ascend: {:?}",
+                results.iter().map(|r| r.distance).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
