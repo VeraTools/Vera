@@ -310,18 +310,27 @@ impl VectorStore {
         // form scans `chunk_id_map` in full where a range seeks the index. It
         // also removes the need to escape `%` and `_`, since a range has no
         // wildcards to confuse.
-        let rows = self.rowids_with_prefix(prefix)?;
+        // One transaction for the whole file instead of two commits per row,
+        // opened *before* the scan so a concurrent writer on the same database
+        // cannot insert a matching row between finding the rowids and deleting
+        // them — that row would survive while this reported success.
+        //
+        // IMMEDIATE rather than the default DEFERRED because this transaction
+        // reads and then writes: a deferred transaction starts as a reader and
+        // can fail the upgrade with SQLITE_BUSY_SNAPSHOT, which `busy_timeout`
+        // does not retry.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .context("failed to begin prefix delete transaction")?;
 
+        let rows = rowids_with_prefix(&tx, prefix)?;
         let count = rows.len() as u64;
         if count == 0 {
             return Ok(count);
         }
 
-        // One transaction for the whole file instead of two commits per row.
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .context("failed to begin prefix delete transaction")?;
         {
             let mut delete_vector = tx
                 .prepare_cached("DELETE FROM vec_chunks WHERE rowid = ?1")
@@ -343,39 +352,6 @@ impl VectorStore {
         Ok(count)
     }
 
-    fn rowids_with_prefix(&self, prefix: &str) -> Result<Vec<i64>> {
-        // `prefix_upper_bound` returns None only when nothing can sort above
-        // the prefix, in which case `>= prefix` is already exact.
-        match prefix_upper_bound(prefix) {
-            Some(upper) => {
-                let mut stmt = self
-                    .conn
-                    .prepare_cached(
-                        "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2",
-                    )
-                    .context("failed to prepare prefix delete query")?;
-                let rows = stmt
-                    .query_map(params![prefix, upper], |row| row.get::<_, i64>(0))
-                    .context("failed to query chunks by prefix")?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .context("failed to collect prefix results")?;
-                Ok(rows)
-            }
-            None => {
-                let mut stmt = self
-                    .conn
-                    .prepare_cached("SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1")
-                    .context("failed to prepare prefix delete query")?;
-                let rows = stmt
-                    .query_map(params![prefix], |row| row.get::<_, i64>(0))
-                    .context("failed to query chunks by prefix")?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .context("failed to collect prefix results")?;
-                Ok(rows)
-            }
-        }
-    }
-
     /// Clear all vectors from the store.
     pub fn clear(&self) -> Result<()> {
         self.conn
@@ -388,6 +364,38 @@ impl VectorStore {
     pub fn dim(&self) -> usize {
         self.dim
     }
+}
+
+/// Rowids of every `chunk_id` starting with `prefix`, via a range scan.
+///
+/// Takes the connection rather than `&self` so the caller can pass an open
+/// transaction, keeping the scan atomic with the deletes that follow it.
+fn rowids_with_prefix(conn: &Connection, prefix: &str) -> Result<Vec<i64>> {
+    // The two predicates stay distinct because `prefix_upper_bound` returns
+    // None when nothing can sort above the prefix, and `>= prefix` is then
+    // already exact. Only the execution and collection are shared; merging the
+    // SQL would cost the index range plan, which is the point of all this.
+    let upper = prefix_upper_bound(prefix);
+    let (sql, args): (&str, Vec<&dyn rusqlite::ToSql>) = match &upper {
+        Some(upper) => (
+            "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2",
+            vec![&prefix, upper],
+        ),
+        None => (
+            "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1",
+            vec![&prefix],
+        ),
+    };
+
+    let mut stmt = conn
+        .prepare_cached(sql)
+        .context("failed to prepare prefix delete query")?;
+    let rows = stmt
+        .query_map(args.as_slice(), |row| row.get::<_, i64>(0))
+        .context("failed to query chunks by prefix")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect prefix results")?;
+    Ok(rows)
 }
 
 /// Smallest string that sorts strictly above every string starting with
@@ -745,6 +753,33 @@ mod tests {
         // Nothing sorts above these.
         assert_eq!(prefix_upper_bound(""), None);
         assert_eq!(prefix_upper_bound(&char::MAX.to_string()), None);
+    }
+
+    #[test]
+    fn prefix_delete_scans_and_deletes_in_one_transaction() {
+        // The scan runs inside the transaction, so a second connection cannot
+        // insert a matching row between finding the rowids and deleting them.
+        // An IMMEDIATE transaction takes the write lock up front, which is
+        // what makes the competing writer wait rather than slip in.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.db");
+        let store = VectorStore::open(&path, 4).unwrap();
+        store
+            .insert_batch(&[("src/a.rs:0", &[1.0, 0.0, 0.0, 0.0][..])])
+            .unwrap();
+
+        let other = VectorStore::open(&path, 4).unwrap();
+
+        assert_eq!(store.delete_by_file_prefix("src/a.rs:").unwrap(), 1);
+        assert_eq!(store.count().unwrap(), 0);
+
+        // The second connection still works afterwards: the transaction was
+        // committed and released, not left open.
+        other
+            .insert_batch(&[("src/a.rs:1", &[0.0, 1.0, 0.0, 0.0][..])])
+            .unwrap();
+        assert_eq!(other.count().unwrap(), 1);
+        assert_eq!(other.delete_by_file_prefix("src/a.rs:").unwrap(), 1);
     }
 
     #[test]
