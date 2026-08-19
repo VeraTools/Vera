@@ -4028,6 +4028,7 @@ dependencies = [
  "console 0.16.4",
  "dirs",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,6 +1,10 @@
 //! `vera upgrade` — inspect or apply the binary update plan.
 
+use std::cmp::Ordering;
+use std::path::Path;
+
 use anyhow::{Result, bail};
+use semver::Version;
 use serde::Serialize;
 
 use crate::state;
@@ -59,12 +63,17 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
 
     // Read what the installer recorded *before* running it. The no-op is
     // "the installer resolved the same version again", so the comparison has to
-    // be against the installer's own previous record. Comparing against the
-    // running binary's version instead would misread a stale or foreign
-    // provenance record as a successful upgrade.
-    let baseline_version = state::load_install_provenance()
-        .ok()
-        .and_then(|provenance| provenance.version);
+    // be against the installer's own previous record. Only trust that record as
+    // a baseline when it identifies the binary that is currently running;
+    // otherwise a stale or foreign record could make an unchanged binary look
+    // upgraded when the wrapper rewrites install.json.
+    let baseline_provenance = state::load_install_provenance().ok();
+    let current_executable = std::env::current_exe().ok();
+    let baseline_version = verified_baseline_version(
+        baseline_provenance.as_ref(),
+        &report.current_version,
+        current_executable.as_deref(),
+    );
 
     update_check::apply_update(method)?;
 
@@ -79,7 +88,7 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
 
     match verification_outcome(
         method,
-        baseline_version.as_deref(),
+        baseline_version,
         report.latest_version.as_deref(),
         report.installed_version.as_deref(),
     ) {
@@ -89,7 +98,7 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
             bail!(message);
         }
         VerificationOutcome::Unknown => {
-            let message = "could not confirm the upgrade applied because the installed version is unavailable";
+            let message = "could not confirm the upgrade because install provenance is missing or does not identify the running binary";
             if !json_output {
                 eprintln!("Warning: {message}.");
             }
@@ -99,6 +108,38 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
     }
 
     print_report(&report, json_output)
+}
+
+fn verified_baseline_version<'a>(
+    provenance: Option<&'a state::InstallProvenance>,
+    current_version: &str,
+    current_executable: Option<&Path>,
+) -> Option<&'a str> {
+    let provenance = provenance?;
+    let version = provenance.version.as_deref()?;
+    if !same_version(version, current_version) {
+        return None;
+    }
+
+    let current_executable = current_executable?.canonicalize().ok()?;
+    let recorded_executable = Path::new(provenance.binary_path.as_deref()?)
+        .canonicalize()
+        .ok()?;
+    (recorded_executable == current_executable).then_some(version)
+}
+
+fn normalize_version(version: &str) -> &str {
+    version.strip_prefix('v').unwrap_or(version)
+}
+
+fn same_version(left: &str, right: &str) -> bool {
+    normalize_version(left) == normalize_version(right)
+}
+
+fn version_order(baseline: &str, installed: &str) -> Option<Ordering> {
+    let baseline = Version::parse(normalize_version(baseline)).ok()?;
+    let installed = Version::parse(normalize_version(installed)).ok()?;
+    Some(installed.cmp(&baseline))
 }
 
 /// Describe why an applied upgrade did not take effect, or `None` when it did.
@@ -127,7 +168,7 @@ fn applied_version_mismatch(
     latest: Option<&str>,
     installed: &str,
 ) -> Option<String> {
-    if installed != baseline {
+    if !same_version(installed, baseline) {
         return None;
     }
     let target = latest.unwrap_or("new version");
@@ -138,6 +179,21 @@ fn applied_version_mismatch(
          Hint: retry later, or install the {target} binary from \
          https://github.com/VeraTools/Vera/releases"
     ))
+}
+
+fn applied_version_downgrade(
+    method: &str,
+    baseline: &str,
+    latest: Option<&str>,
+    installed: &str,
+) -> String {
+    let target = latest.unwrap_or("new version");
+    format!(
+        "upgrade resolved older version {installed} than the current {baseline}.\n\
+         This usually means the {method} package for {target} resolved to an older release.\n\
+         Hint: retry later, or install the {target} binary from \
+         https://github.com/VeraTools/Vera/releases"
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -159,9 +215,15 @@ fn verification_outcome(
     let (Some(baseline), Some(installed)) = (baseline, installed) else {
         return VerificationOutcome::Unknown;
     };
-    match applied_version_mismatch(method, baseline, latest, installed) {
-        Some(message) => VerificationOutcome::Mismatch(message),
-        None => VerificationOutcome::Confirmed,
+    if let Some(message) = applied_version_mismatch(method, baseline, latest, installed) {
+        return VerificationOutcome::Mismatch(message);
+    }
+    match version_order(baseline, installed) {
+        Some(Ordering::Less) => VerificationOutcome::Mismatch(applied_version_downgrade(
+            method, baseline, latest, installed,
+        )),
+        Some(Ordering::Equal | Ordering::Greater) => VerificationOutcome::Confirmed,
+        None => VerificationOutcome::Unknown,
     }
 }
 
@@ -261,7 +323,11 @@ fn install_method_source_name(source: InstallMethodSource) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{VerificationOutcome, applied_version_mismatch, verification_outcome};
+    use super::{
+        VerificationOutcome, applied_version_mismatch, same_version, verification_outcome,
+        verified_baseline_version,
+    };
+    use crate::state::InstallProvenance;
 
     #[test]
     fn reports_nothing_when_the_recorded_version_changed() {
@@ -302,15 +368,88 @@ mod tests {
         );
     }
 
-    /// The baseline is the installer's own previous record, not the running
-    /// binary. A stale or foreign provenance record that happens to differ from
-    /// the running version must not be read as a successful upgrade.
+    /// A provenance record only qualifies as the baseline when it identifies
+    /// the running binary: same version (v-prefix tolerant) and same binary
+    /// path. Stale, foreign, or missing records make the upgrade unverifiable
+    /// instead of letting a rewritten record pose as a successful upgrade.
     #[test]
-    fn detects_the_no_op_when_provenance_disagrees_with_the_running_binary() {
-        assert!(matches!(
-            verification_outcome("bun", Some("0.11.0"), Some("1.0.0"), Some("0.11.0")),
-            VerificationOutcome::Mismatch(_)
-        ));
+    fn baseline_requires_provenance_identifying_the_running_binary() {
+        let exe = std::env::current_exe().unwrap();
+        let matching = InstallProvenance {
+            version: Some("1.0.0".to_string()),
+            binary_path: Some(exe.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            verified_baseline_version(Some(&matching), "1.0.0", Some(exe.as_path())),
+            Some("1.0.0")
+        );
+
+        // Stale record: the recorded version is not the running version.
+        assert_eq!(
+            verified_baseline_version(Some(&matching), "1.0.1", Some(exe.as_path())),
+            None
+        );
+
+        // Foreign record: same version, but recorded for another binary.
+        let foreign = InstallProvenance {
+            binary_path: Some("/dev/null".to_string()),
+            ..matching.clone()
+        };
+        assert_eq!(
+            verified_baseline_version(Some(&foreign), "1.0.0", Some(exe.as_path())),
+            None
+        );
+
+        // No record, or a record without the fields needed to verify.
+        assert_eq!(
+            verified_baseline_version(None, "1.0.0", Some(exe.as_path())),
+            None
+        );
+        let incomplete = InstallProvenance {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            verified_baseline_version(Some(&incomplete), "1.0.0", Some(exe.as_path())),
+            None
+        );
+    }
+
+    #[test]
+    fn version_comparison_ignores_a_v_prefix() {
+        assert!(same_version("v1.0.0", "1.0.0"));
+        assert!(!same_version("v1.0.0", "1.0.1"));
+    }
+
+    /// A registry resolving an older version than the baseline (yank,
+    /// rollback, channel mismatch) is a failed upgrade, not a success.
+    #[test]
+    fn flags_a_downgrade_as_a_failed_upgrade() {
+        let outcome = verification_outcome("bun", Some("1.2.0"), Some("1.3.0"), Some("1.1.0"));
+        match outcome {
+            VerificationOutcome::Mismatch(message) => {
+                assert!(message.contains("older version"), "{message}");
+                assert!(message.contains("1.1.0"), "{message}");
+                assert!(message.contains("bun"), "{message}");
+            }
+            other => panic!("a downgrade must not be reported as success: {other:?}"),
+        }
+    }
+
+    /// Versions that cannot be parsed change the record but cannot be ordered,
+    /// so the outcome is unverifiable rather than assumed success.
+    #[test]
+    fn unparseable_version_change_is_unverifiable() {
+        assert_eq!(
+            verification_outcome(
+                "bun",
+                Some("nightly-abc"),
+                Some("1.0.0"),
+                Some("nightly-def")
+            ),
+            VerificationOutcome::Unknown
+        );
     }
 
     /// `latest` only words the hint, so an unknown release must still produce
