@@ -185,12 +185,13 @@ mod tests {
         );
 
         // The same content under a .ts path keeps the old behaviour, which is
-        // correct: there the angle brackets really are type syntax.
+        // correct: there the angle brackets really are type syntax. Assert the
+        // exact `first_n_lines` output rather than merely "not the tsx one" —
+        // a differently malformed signature would satisfy a negative check.
         let ts = extract_signature(code, Language::TypeScript, "Widget.ts");
-        assert_ne!(ts, tsx);
-        assert!(
-            !ts.contains("{ ... }"),
-            "the .ts path should fall back, got: {ts}"
+        assert_eq!(
+            ts,
+            "const A = <p>{ q }</p>;\nfunction Later(x: number) {\n  return x;\n[... 1 more lines]"
         );
     }
 
