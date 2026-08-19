@@ -65,8 +65,13 @@ impl VectorStore {
                     rowid INTEGER PRIMARY KEY AUTOINCREMENT,
                     chunk_id TEXT NOT NULL UNIQUE
                 );
-                CREATE INDEX IF NOT EXISTS idx_chunk_id_map
-                    ON chunk_id_map(chunk_id);",
+                -- `chunk_id` is UNIQUE, which already builds
+                -- `sqlite_autoindex_chunk_id_map_1` over the same column. The
+                -- explicit index duplicated it exactly and only added a second
+                -- B-tree to maintain on every vector insert. Dropped here so
+                -- existing databases shed it on next open; the autoindex
+                -- serves both the equality lookup and the prefix range scan.
+                DROP INDEX IF EXISTS idx_chunk_id_map;",
             )
             .context("failed to create chunk_id_map table")?;
 
@@ -300,41 +305,75 @@ impl VectorStore {
     /// This is used for incremental indexing: when a file is re-indexed, all
     /// old chunks for that file (whose IDs start with "filepath:") are removed.
     pub fn delete_by_file_prefix(&self, prefix: &str) -> Result<u64> {
-        // Find all rowids matching the prefix.
-        // Escape SQL LIKE wildcards (_ and %) in the prefix to avoid
-        // incorrect matches on file paths containing those characters.
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT rowid, chunk_id FROM chunk_id_map \
-                 WHERE chunk_id LIKE ?1 ESCAPE '\\'",
-            )
-            .context("failed to prepare prefix delete query")?;
-
-        let escaped_prefix = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let like_pattern = format!("{escaped_prefix}%");
-        let rows: Vec<(i64, String)> = stmt
-            .query_map(params![like_pattern], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .context("failed to query chunks by prefix")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect prefix results")?;
+        // A half-open range rather than `LIKE ?1 ESCAPE '\'`. The ESCAPE
+        // clause disqualifies SQLite's LIKE-prefix optimization, so the LIKE
+        // form scans `chunk_id_map` in full where a range seeks the index. It
+        // also removes the need to escape `%` and `_`, since a range has no
+        // wildcards to confuse.
+        let rows = self.rowids_with_prefix(prefix)?;
 
         let count = rows.len() as u64;
-        for (rowid, _chunk_id) in &rows {
-            self.conn
-                .execute("DELETE FROM vec_chunks WHERE rowid = ?1", params![rowid])
-                .context("failed to delete vector by prefix")?;
-            self.conn
-                .execute("DELETE FROM chunk_id_map WHERE rowid = ?1", params![rowid])
-                .context("failed to delete chunk id by prefix")?;
+        if count == 0 {
+            return Ok(count);
         }
 
+        // One transaction for the whole file instead of two commits per row.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin prefix delete transaction")?;
+        {
+            let mut delete_vector = tx
+                .prepare_cached("DELETE FROM vec_chunks WHERE rowid = ?1")
+                .context("failed to prepare vector delete")?;
+            let mut delete_mapping = tx
+                .prepare_cached("DELETE FROM chunk_id_map WHERE rowid = ?1")
+                .context("failed to prepare chunk id delete")?;
+            for rowid in &rows {
+                delete_vector
+                    .execute(params![rowid])
+                    .context("failed to delete vector by prefix")?;
+                delete_mapping
+                    .execute(params![rowid])
+                    .context("failed to delete chunk id by prefix")?;
+            }
+        }
+        tx.commit().context("failed to commit prefix delete")?;
+
         Ok(count)
+    }
+
+    fn rowids_with_prefix(&self, prefix: &str) -> Result<Vec<i64>> {
+        // `prefix_upper_bound` returns None only when nothing can sort above
+        // the prefix, in which case `>= prefix` is already exact.
+        match prefix_upper_bound(prefix) {
+            Some(upper) => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2",
+                    )
+                    .context("failed to prepare prefix delete query")?;
+                let rows = stmt
+                    .query_map(params![prefix, upper], |row| row.get::<_, i64>(0))
+                    .context("failed to query chunks by prefix")?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .context("failed to collect prefix results")?;
+                Ok(rows)
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached("SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1")
+                    .context("failed to prepare prefix delete query")?;
+                let rows = stmt
+                    .query_map(params![prefix], |row| row.get::<_, i64>(0))
+                    .context("failed to query chunks by prefix")?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .context("failed to collect prefix results")?;
+                Ok(rows)
+            }
+        }
     }
 
     /// Clear all vectors from the store.
@@ -349,6 +388,43 @@ impl VectorStore {
     pub fn dim(&self) -> usize {
         self.dim
     }
+}
+
+/// Smallest string that sorts strictly above every string starting with
+/// `prefix`, giving the exclusive upper bound of a prefix range scan.
+///
+/// SQLite's default `BINARY` collation compares TEXT bytewise, and UTF-8 byte
+/// order matches code point order, so incrementing the final character is
+/// sufficient. Two cases need care: the successor of a code point may land in
+/// the surrogate range, which is not a valid `char`, so it is skipped; and a
+/// trailing `char::MAX` has no successor at all, so it is dropped and the
+/// character before it is incremented instead.
+///
+/// Returns `None` when no upper bound exists (an empty prefix, or one made
+/// entirely of `char::MAX`), in which case `chunk_id >= prefix` is already
+/// exact and needs no upper bound.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = next_char(last) {
+            let mut bound: String = chars.into_iter().collect();
+            bound.push(next);
+            return Some(bound);
+        }
+    }
+    None
+}
+
+/// Next valid `char` above `c`, skipping the UTF-16 surrogate range.
+fn next_char(c: char) -> Option<char> {
+    let mut code = c as u32 + 1;
+    while code <= char::MAX as u32 {
+        if let Some(next) = char::from_u32(code) {
+            return Some(next);
+        }
+        code += 1;
+    }
+    None
 }
 
 /// Register the sqlite-vec extension globally (idempotent).
@@ -588,5 +664,110 @@ mod tests {
         // Remaining vector should be src/lib.rs:0.
         let results = store.search(&[0.0, 0.0, 1.0, 0.0], 1).unwrap();
         assert_eq!(results[0].chunk_id, "src/lib.rs:0");
+    }
+
+    #[test]
+    fn delete_by_file_prefix_does_not_treat_wildcards_as_patterns() {
+        // `_` matches any character and `%` any sequence in LIKE. A range
+        // predicate has no wildcards, but the paths that would have been
+        // mis-matched are exactly the ones worth pinning.
+        let store = VectorStore::open_in_memory(4).unwrap();
+        let items: Vec<(&str, &[f32])> = vec![
+            ("src/a_b.rs:0", &[1.0, 0.0, 0.0, 0.0]),
+            ("src/axb.rs:0", &[0.0, 1.0, 0.0, 0.0]),
+            ("src/100%.rs:0", &[0.0, 0.0, 1.0, 0.0]),
+            ("src/100pct.rs:0", &[0.0, 0.0, 0.0, 1.0]),
+        ];
+        store.insert_batch(&items).unwrap();
+
+        assert_eq!(store.delete_by_file_prefix("src/a_b.rs:").unwrap(), 1);
+        assert_eq!(store.delete_by_file_prefix("src/100%.rs:").unwrap(), 1);
+        assert_eq!(store.count().unwrap(), 2);
+
+        // The literal-looking siblings survive.
+        let remaining = store.search(&[0.0, 1.0, 0.0, 0.0], 4).unwrap();
+        let ids: Vec<&str> = remaining.iter().map(|r| r.chunk_id.as_str()).collect();
+        assert!(ids.contains(&"src/axb.rs:0"), "{ids:?}");
+        assert!(ids.contains(&"src/100pct.rs:0"), "{ids:?}");
+    }
+
+    #[test]
+    fn delete_by_file_prefix_stops_at_the_prefix_boundary() {
+        // The upper bound must exclude the next sibling but include every
+        // descendant of the prefix, however long.
+        let store = VectorStore::open_in_memory(4).unwrap();
+        let items: Vec<(&str, &[f32])> = vec![
+            ("src/app.rs:0", &[1.0, 0.0, 0.0, 0.0]),
+            ("src/app.rs:10", &[0.0, 1.0, 0.0, 0.0]),
+            ("src/app2.rs:0", &[0.0, 0.0, 1.0, 0.0]),
+            ("src/apq.rs:0", &[0.0, 0.0, 0.0, 1.0]),
+        ];
+        store.insert_batch(&items).unwrap();
+
+        assert_eq!(store.delete_by_file_prefix("src/app.rs:").unwrap(), 2);
+        assert_eq!(store.count().unwrap(), 2);
+        let remaining = store.search(&[0.0, 0.0, 1.0, 0.0], 4).unwrap();
+        let ids: Vec<&str> = remaining.iter().map(|r| r.chunk_id.as_str()).collect();
+        assert!(ids.contains(&"src/app2.rs:0"), "{ids:?}");
+        assert!(ids.contains(&"src/apq.rs:0"), "{ids:?}");
+    }
+
+    #[test]
+    fn delete_by_file_prefix_handles_non_ascii_paths() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        let items: Vec<(&str, &[f32])> = vec![
+            ("src/café.rs:0", &[1.0, 0.0, 0.0, 0.0]),
+            ("src/cafz.rs:0", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        store.insert_batch(&items).unwrap();
+
+        assert_eq!(store.delete_by_file_prefix("src/café.rs:").unwrap(), 1);
+        assert_eq!(store.count().unwrap(), 1);
+        let remaining = store.search(&[0.0, 1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(remaining[0].chunk_id, "src/cafz.rs:0");
+    }
+
+    #[test]
+    fn prefix_upper_bound_covers_the_awkward_code_points() {
+        assert_eq!(prefix_upper_bound("src/a"), Some("src/b".to_string()));
+        assert_eq!(prefix_upper_bound("a:"), Some("a;".to_string()));
+
+        // Successor lands in the surrogate range and must be skipped.
+        let below_surrogates = char::from_u32(0xD7FF).unwrap();
+        let bound = prefix_upper_bound(&below_surrogates.to_string()).unwrap();
+        assert_eq!(bound.chars().next(), char::from_u32(0xE000));
+
+        // A trailing char::MAX has no successor, so the previous character is
+        // incremented and the max is dropped.
+        let trailing_max = format!("a{}", char::MAX);
+        assert_eq!(prefix_upper_bound(&trailing_max), Some("b".to_string()));
+
+        // Nothing sorts above these.
+        assert_eq!(prefix_upper_bound(""), None);
+        assert_eq!(prefix_upper_bound(&char::MAX.to_string()), None);
+    }
+
+    #[test]
+    fn prefix_range_seeks_the_index_instead_of_scanning() {
+        // The whole point of the range form: `LIKE ... ESCAPE` cannot use the
+        // index, so a plan check is what actually guards this.
+        let store = VectorStore::open_in_memory(4).unwrap();
+        let mut stmt = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["a", "b"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("USING COVERING INDEX") || plan.contains("USING INDEX"),
+            "prefix range must seek the index: {plan}"
+        );
     }
 }
