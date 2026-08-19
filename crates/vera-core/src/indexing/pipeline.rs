@@ -15,7 +15,9 @@ use tracing::{debug, info, warn};
 use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery::{self, DiscoveryResult};
-use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation};
+use crate::embedding::{
+    EmbeddingError, EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation,
+};
 use crate::indexing::update::content_hash;
 use crate::parsing;
 use crate::parsing::references::RawReference;
@@ -291,8 +293,18 @@ where
         progress_cb,
     )
     .await;
+    let mut embeddings = match embedding_result {
+        Ok(embeddings) => embeddings,
+        Err(error) => {
+            // A completed provider error outranks a simultaneous cancellation,
+            // mirroring the biased select in the CLI's cancel_on_signal.
+            if matches!(error, EmbeddingError::Cancelled) {
+                cancellation.check()?;
+            }
+            return Err(error).context("embedding generation failed");
+        }
+    };
     cancellation.check()?;
-    let mut embeddings = embedding_result.context("embedding generation failed")?;
 
     // Truncate vectors if max_stored_dim is configured.
     let stored_dim = super::truncate_embeddings(&mut embeddings, config.embedding.max_stored_dim);

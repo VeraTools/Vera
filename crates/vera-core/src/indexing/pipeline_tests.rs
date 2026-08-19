@@ -36,6 +36,32 @@ impl EmbeddingProvider for BlockingProvider {
     }
 }
 
+/// Cancels the token mid-request and then fails, modelling a provider error
+/// that completes at the same moment cancellation fires.
+struct CancelThenFailProvider;
+
+impl EmbeddingProvider for CancelThenFailProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Err(EmbeddingError::ApiError {
+            status: 500,
+            message: "provider exploded".to_string(),
+        })
+    }
+
+    async fn embed_batch_cancellable(
+        &self,
+        texts: &[String],
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        cancel.cancel();
+        self.embed_batch(texts).await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
+}
+
 #[tokio::test]
 async fn index_simple_repo() {
     let dir = TempDir::new().unwrap();
@@ -154,6 +180,29 @@ async fn cancellation_after_embedding_does_not_publish_index_artifacts() {
 
     assert!(error.to_string().contains("operation cancelled"));
     assert!(!dir.path().join(".vera").exists());
+}
+
+#[tokio::test]
+async fn provider_error_wins_over_simultaneous_cancellation() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let config = default_config();
+
+    let error = super::index_repository_with_progress_and_cancellation(
+        dir.path(),
+        &CancelThenFailProvider,
+        &config,
+        "mock-model",
+        |_| {},
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("embedding generation failed"),
+        "provider error should win over the simultaneous cancellation: {error}"
+    );
 }
 
 #[tokio::test]

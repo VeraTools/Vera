@@ -1067,7 +1067,12 @@ where
 
         let results = futures::future::join_all(futures).await;
         for result in results {
+            // Batch errors (real provider failures or Cancelled) win over a
+            // pending cancellation so the caller sees the actual failure.
             let batch_results = result?;
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled);
+            }
             done_count += batch_results.len();
             all_results.extend(batch_results);
             on_progress(done_count, total);
@@ -1259,6 +1264,29 @@ mod tests {
         )
         .with_max_retries(0);
         (OpenAiProvider::new(config).unwrap(), server)
+    }
+
+    /// Cancels the token mid-request but still returns vectors, modelling an
+    /// embedding response that completes at the same moment cancellation fires.
+    struct CancelThenSucceedProvider;
+
+    impl EmbeddingProvider for CancelThenSucceedProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(vec![vec![0.0; 8]; texts.len()])
+        }
+
+        async fn embed_batch_cancellable(
+            &self,
+            texts: &[String],
+            cancel: &CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            cancel.cancel();
+            self.embed_batch(texts).await
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(8)
+        }
     }
 
     struct CancellationAwareProvider;
@@ -1544,5 +1572,36 @@ mod tests {
 
         assert!(matches!(error, EmbeddingError::RateLimitError { .. }));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_completed_batch_suppresses_further_progress() {
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "fn main() {}".to_string(),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let progress_events = AtomicUsize::new(0);
+
+        let result = embed_chunks_concurrent_with_progress_and_cancellation(
+            &CancelThenSucceedProvider,
+            &chunks,
+            1,
+            1,
+            0,
+            &CancellationToken::new(),
+            |_, _| {
+                progress_events.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(EmbeddingError::Cancelled)));
+        assert_eq!(progress_events.load(Ordering::SeqCst), 0);
     }
 }
