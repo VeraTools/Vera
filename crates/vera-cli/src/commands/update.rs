@@ -155,6 +155,7 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
         };
 
         let task_repo_path = repo_path.to_path_buf();
+        let signal = wait_for_interrupt(rt.handle())?;
         let task = rt.handle().spawn(async move {
             vera_core::indexing::update_repository_with_options_and_progress_and_cancellation(
                 &task_repo_path,
@@ -167,16 +168,12 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
             )
             .await
         });
-        let result = rt.block_on(cancel_task_on_signal(
-            task,
-            wait_for_interrupt(),
-            cancellation,
-            "update",
-        ));
+        let result = rt.block_on(cancel_task_on_signal(task, signal, cancellation, "update"));
         multi.stop();
         result.context("update failed")?
     } else {
         let task_repo_path = repo_path.to_path_buf();
+        let signal = wait_for_interrupt(rt.handle())?;
         let task = rt.handle().spawn(async move {
             vera_core::indexing::update_repository_with_options_and_progress_and_cancellation(
                 &task_repo_path,
@@ -189,13 +186,8 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
             )
             .await
         });
-        rt.block_on(cancel_task_on_signal(
-            task,
-            wait_for_interrupt(),
-            cancellation,
-            "update",
-        ))
-        .context("update failed")?
+        rt.block_on(cancel_task_on_signal(task, signal, cancellation, "update"))
+            .context("update failed")?
     };
 
     // Output results.

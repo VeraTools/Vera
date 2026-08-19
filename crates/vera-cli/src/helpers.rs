@@ -8,9 +8,28 @@ use anyhow::Context;
 use clap::Args;
 use vera_core::presentation::{CompactResult, truncate_to_budget};
 
-/// Wait for the process interrupt used to cancel long-running CLI operations.
-pub async fn wait_for_interrupt() {
-    let _ = tokio::signal::ctrl_c().await;
+/// Install the process interrupt handler and return a future for its first event.
+#[cfg(unix)]
+pub fn wait_for_interrupt(
+    runtime: &tokio::runtime::Handle,
+) -> std::io::Result<impl std::future::Future<Output = ()> + Send + 'static> {
+    let _guard = runtime.enter();
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    Ok(async move {
+        signal.recv().await;
+    })
+}
+
+/// Install the process interrupt handler and return a future for its first event.
+#[cfg(windows)]
+pub fn wait_for_interrupt(
+    runtime: &tokio::runtime::Handle,
+) -> std::io::Result<impl std::future::Future<Output = ()> + Send + 'static> {
+    let _guard = runtime.enter();
+    let mut signal = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        signal.recv().await;
+    })
 }
 
 /// Cancel a spawned operation when signalled, then wait for it to stop safely.

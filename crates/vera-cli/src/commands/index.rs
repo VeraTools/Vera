@@ -98,6 +98,7 @@ pub fn execute(
         let cancellation = vera_core::CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let task_repo_path = repo_path.to_path_buf();
+        let signal = wait_for_interrupt(rt.handle())?;
         let task = rt.handle().spawn(async move {
             vera_core::indexing::pipeline::index_repository_with_cancellation(
                 &task_repo_path,
@@ -111,7 +112,7 @@ pub fn execute(
         let summary = rt
             .block_on(cancel_task_on_signal(
                 task,
-                wait_for_interrupt(),
+                signal,
                 cancellation,
                 "indexing",
             ))
@@ -155,6 +156,7 @@ pub fn execute(
     let cancellation = vera_core::CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task_repo_path = repo_path.to_path_buf();
+    let signal = wait_for_interrupt(rt.handle())?;
     let task = rt.handle().spawn(async move {
         vera_core::indexing::pipeline::index_repository_with_progress_and_cancellation(
             &task_repo_path,
@@ -168,7 +170,7 @@ pub fn execute(
     });
     let result = rt.block_on(cancel_task_on_signal(
         task,
-        wait_for_interrupt(),
+        signal,
         cancellation,
         "indexing",
     ));
