@@ -397,6 +397,67 @@ export function App() {
     );
 }
 
+#[test]
+fn jsx_dotted_components_index_under_the_rightmost_segment() {
+    // Pins the naming convention for dotted JSX components.
+    //
+    // `<Icons.Arrow />` is recorded as `Arrow`, not `Icons.Arrow`. That is not
+    // an accident of `extract_callee` — it is what makes the call site link to
+    // the definition. A component re-exported as `Icons.Arrow` is *defined*
+    // somewhere as `Arrow` (`export function Arrow`), and definitions are
+    // indexed under that bare name, as is every other member call
+    // (`obj.method()` records `method`). Recording `Icons.Arrow` would leave
+    // the reference matching no definition, which is the invisibility this
+    // whole path exists to fix.
+    //
+    // A lowercase root stays a component too: `<icons.Arrow />` is a member
+    // expression, and a member expression is always a value lookup. Only a
+    // bare lowercase identifier is an intrinsic host element.
+    let source = r#"import * as Icons from "./icons";
+import * as icons from "./icons";
+
+export function Toolbar() {
+    return (
+        <div className="bar">
+            <Icons.Arrow />
+            <icons.Chevron />
+            <span />
+        </div>
+    );
+}
+"#;
+    let (_, refs, diagnostics) = parse_file_with_diagnostics(
+        source,
+        "src/toolbar.tsx",
+        Language::TypeScript,
+        &default_config(),
+    )
+    .unwrap();
+
+    assert!(
+        !diagnostics.tree_has_error,
+        "tsx should parse without errors"
+    );
+    let callees: Vec<&str> = refs.iter().map(|r| r.callee.as_str()).collect();
+
+    assert!(
+        callees.contains(&"Arrow"),
+        "uppercase-rooted dotted component should index as its rightmost segment: {callees:?}"
+    );
+    assert!(
+        callees.contains(&"Chevron"),
+        "lowercase-rooted dotted component is still a value lookup: {callees:?}"
+    );
+    assert!(
+        !callees.iter().any(|c| c.contains('.')),
+        "no callee should carry the full member path: {callees:?}"
+    );
+    assert!(
+        !callees.contains(&"div") && !callees.contains(&"span"),
+        "intrinsic host elements must stay out of the call graph: {callees:?}"
+    );
+}
+
 // =========================================================
 // Go tests
 // =========================================================
