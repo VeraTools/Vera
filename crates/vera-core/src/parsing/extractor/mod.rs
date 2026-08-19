@@ -160,8 +160,8 @@ fn collect_symbols(
         }
     }
 
-    // Handle TS/JS `const name = () => {}`: the name lives on the declarator,
-    // and a function initialiser makes the binding a function, not a variable.
+    // Handle TS/JS function-valued bindings: the name lives on the declarator,
+    // and a function initializer makes the binding a function, not a variable.
     if (lang == Language::TypeScript || lang == Language::JavaScript)
         && matches!(kind, "lexical_declaration" | "variable_declaration")
     {
