@@ -515,7 +515,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(index.doc_count().unwrap(), before - 3);
-        let hits = index.search("hello", 50).unwrap();
+
+        // The query has to match a surviving document *and* a deleted one, or
+        // the loop below cannot fail: a term present only in the deleted docs
+        // returns zero hits after deletion and `all()` passes trivially.
+        // "name" is in src/main.rs:1 (deleted) and fuzz/Cargo.toml:0 (kept).
+        let hits = index.search("name", 50).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "query must match surviving documents, or the assertion is vacuous"
+        );
         for path in ["src/main.rs:", "src/lib.py:"] {
             assert!(
                 hits.iter().all(|hit| !hit.chunk_id.starts_with(path)),
