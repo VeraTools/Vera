@@ -9,6 +9,7 @@
 
 mod provider;
 
+pub(crate) use provider::embed_chunks_concurrent_with_progress_and_cancellation;
 pub use provider::{
     CachedEmbeddingProvider, EmbeddingError, EmbeddingProvider, EmbeddingProviderConfig,
     OpenAiProvider, embed_chunks_concurrent, embed_chunks_concurrent_with_progress,

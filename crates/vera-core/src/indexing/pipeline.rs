@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery::{self, DiscoveryResult};
-use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
+use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation};
 use crate::indexing::update::content_hash;
 use crate::parsing;
 use crate::parsing::references::RawReference;
@@ -281,17 +281,18 @@ where
     let progress_cb = |done: usize, total: usize| {
         on_progress(IndexProgress::EmbeddingProgress { done, total });
     };
-    let mut embeddings = embed_chunks_concurrent_with_progress(
+    let embedding_result = embed_chunks_concurrent_with_progress_and_cancellation(
         provider,
         &all_chunks,
         batch_size,
         max_concurrent_requests,
         config.indexing.max_chunk_bytes,
+        cancellation.as_async_token(),
         progress_cb,
     )
-    .await
-    .context("embedding generation failed")?;
+    .await;
     cancellation.check()?;
+    let mut embeddings = embedding_result.context("embedding generation failed")?;
 
     // Truncate vectors if max_stored_dim is configured.
     let stored_dim = super::truncate_embeddings(&mut embeddings, config.embedding.max_stored_dim);
@@ -305,6 +306,8 @@ where
     });
 
     // ── 5. Store everything on disk ──────────────────────────────
+    // Publication is synchronous, so cancellation must win before any artifact is replaced.
+    cancellation.check()?;
     let idx_dir = index_dir(&repo_root);
     store_index(
         &idx_dir,

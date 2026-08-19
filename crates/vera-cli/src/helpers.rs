@@ -26,6 +26,7 @@ where
     Signal: std::future::Future<Output = ()>,
 {
     tokio::select! {
+        biased;
         result = operation => result,
         _ = signal => anyhow::bail!("{operation_name} cancelled"),
     }
@@ -518,16 +519,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operation_result_wins_before_cancellation() {
-        let result = cancel_on_signal(
-            async { Ok::<_, anyhow::Error>(42) },
-            std::future::pending(),
-            "test operation",
-        )
-        .await
-        .unwrap();
+    async fn ready_operation_error_wins_over_ready_signal() {
+        for _ in 0..64 {
+            let error = cancel_on_signal(
+                async { Err::<(), _>(anyhow::anyhow!("provider failed")) },
+                std::future::ready(()),
+                "test operation",
+            )
+            .await
+            .unwrap_err();
 
-        assert_eq!(result, 42);
+            assert_eq!(error.to_string(), "provider failed");
+        }
     }
 
     #[tokio::test]

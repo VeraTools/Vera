@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -50,21 +51,37 @@ async fn indexed_repo(
 
 struct BatchBoundProvider {
     max_batch_size: usize,
-    largest_batch: AtomicUsize,
+    active_inputs: AtomicUsize,
+    peak_inputs: AtomicUsize,
+}
+
+struct FailingProvider;
+
+impl EmbeddingProvider for FailingProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Err(EmbeddingError::ApiError {
+            status: 503,
+            message: "provider unavailable".to_string(),
+        })
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
 }
 
 impl BatchBoundProvider {
     fn new(max_batch_size: usize) -> Self {
         Self {
             max_batch_size,
-            largest_batch: AtomicUsize::new(0),
+            active_inputs: AtomicUsize::new(0),
+            peak_inputs: AtomicUsize::new(0),
         }
     }
 }
 
 impl EmbeddingProvider for BatchBoundProvider {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        self.largest_batch.fetch_max(texts.len(), Ordering::SeqCst);
         if texts.len() > self.max_batch_size {
             return Err(EmbeddingError::ApiError {
                 status: 400,
@@ -76,11 +93,20 @@ impl EmbeddingProvider for BatchBoundProvider {
             });
         }
 
+        let active = self.active_inputs.fetch_add(texts.len(), Ordering::SeqCst) + texts.len();
+        self.peak_inputs.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        self.active_inputs.fetch_sub(texts.len(), Ordering::SeqCst);
+
         Ok(vec![vec![0.0; 8]; texts.len()])
     }
 
     fn expected_dim(&self) -> Option<usize> {
         Some(8)
+    }
+
+    fn max_batch_size(&self) -> Option<usize> {
+        Some(self.max_batch_size)
     }
 }
 
@@ -143,15 +169,17 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
         .await
         .unwrap();
 
-    for name in ["one.rs", "two.rs", "three.rs"] {
+    for name in [
+        "one.rs", "two.rs", "three.rs", "four.rs", "five.rs", "six.rs",
+    ] {
         fs::write(dir.path().join(name), format!("fn {}() {{}}\n", &name[..3])).unwrap();
     }
 
     let provider = BatchBoundProvider::new(2);
     let mut config = default_config();
-    config.embedding.batch_size = 128;
+    config.embedding.batch_size = 2;
     config.embedding.max_concurrent_requests = 8;
-    config.embedding.max_in_flight_inputs = 2;
+    config.embedding.max_in_flight_inputs = 4;
 
     let events = std::sync::Mutex::new(Vec::new());
     let summary =
@@ -161,9 +189,11 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
         .await
         .unwrap();
 
-    assert_eq!(summary.files_added, 3);
+    assert_eq!(summary.files_added, 6);
     assert_eq!(summary.files_deferred, 0);
-    assert_eq!(provider.largest_batch.load(Ordering::SeqCst), 2);
+    let peak_inputs = provider.peak_inputs.load(Ordering::SeqCst);
+    assert!(peak_inputs > 2);
+    assert!(peak_inputs <= 4);
 
     let events = events.into_inner().unwrap();
     assert!(matches!(
@@ -173,20 +203,96 @@ async fn update_reports_progress_and_respects_max_in_flight_input_bound() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, UpdateProgress::ClassificationDone { added: 3, .. }))
+            .any(|event| matches!(event, UpdateProgress::ClassificationDone { added: 6, .. }))
     );
     assert!(events.iter().any(|event| matches!(
         event,
         UpdateProgress::ParsingDone {
-            file_count: 3,
+            file_count: 6,
             chunk_count
-        } if *chunk_count >= 3
+        } if *chunk_count >= 6
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        UpdateProgress::EmbeddingProgress { done, total } if done == total && *total >= 3
+        UpdateProgress::EmbeddingProgress { done, total } if done == total && *total >= 6
     )));
     assert!(matches!(events.last(), Some(UpdateProgress::StorageDone)));
+}
+
+#[tokio::test]
+async fn update_keeps_indexed_data_when_a_discovered_file_cannot_be_read() {
+    let (dir, provider, config, _) =
+        indexed_repo(&[("main.rs", "fn preserved_symbol() -> u32 { 42 }\n")]).await;
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    let hash_before = metadata.get_file_hash("main.rs").unwrap();
+    let chunks_before: Vec<_> = metadata
+        .get_chunks_by_file("main.rs")
+        .unwrap()
+        .into_iter()
+        .map(|chunk| (chunk.id, chunk.content))
+        .collect();
+    let vectors_before = VectorStore::open(&idx.join("vectors.db"), 8)
+        .unwrap()
+        .count()
+        .unwrap();
+    let bm25 = Bm25Index::open(&idx.join("bm25")).unwrap();
+    assert!(!bm25.search("preserved_symbol", 10).unwrap().is_empty());
+
+    let source = dir.path().join("main.rs");
+    let replaced = std::sync::atomic::AtomicBool::new(false);
+    update_repository_with_progress(dir.path(), &provider, &config, "mock-model", |event| {
+        if matches!(event, UpdateProgress::DiscoveryDone { .. })
+            && !replaced.swap(true, Ordering::SeqCst)
+        {
+            fs::remove_file(&source).unwrap();
+            fs::create_dir(&source).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(metadata.get_file_hash("main.rs").unwrap(), hash_before);
+    let chunks_after: Vec<_> = metadata
+        .get_chunks_by_file("main.rs")
+        .unwrap()
+        .into_iter()
+        .map(|chunk| (chunk.id, chunk.content))
+        .collect();
+    assert_eq!(chunks_after, chunks_before);
+    assert_eq!(
+        VectorStore::open(&idx.join("vectors.db"), 8)
+            .unwrap()
+            .count()
+            .unwrap(),
+        vectors_before
+    );
+    assert!(!bm25.search("preserved_symbol", 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn update_embedding_failure_preserves_existing_parse_data() {
+    let (dir, _provider, config, _) = indexed_repo(&[(
+        "types.ts",
+        "class Loader {}\nclass CachedLoader extends Loader {}\n",
+    )])
+    .await;
+    let idx = index_dir(&dir.path().canonicalize().unwrap());
+    let metadata = MetadataStore::open(&idx.join("metadata.db")).unwrap();
+    assert_eq!(metadata.find_type_relations("Loader").unwrap().len(), 1);
+
+    fs::write(
+        dir.path().join("types.ts"),
+        "class Saver {}\nclass CachedSaver extends Saver {}\n",
+    )
+    .unwrap();
+
+    let error = update_repository(dir.path(), &FailingProvider, &config, "mock-model")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("embedding generation failed"));
+    assert_eq!(metadata.find_type_relations("Loader").unwrap().len(), 1);
+    assert!(metadata.find_type_relations("Saver").unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -9,12 +11,29 @@ use super::*;
 use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
+use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
 
 fn default_config() -> VeraConfig {
     VeraConfig::default()
+}
+
+#[derive(Clone)]
+struct BlockingProvider {
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl EmbeddingProvider for BlockingProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        Some(8)
+    }
 }
 
 #[tokio::test]
@@ -71,6 +90,70 @@ async fn pre_cancelled_index_stops_before_creating_artifacts() {
 
     assert!(error.to_string().contains("operation cancelled"));
     assert!(!index_dir(dir.path()).exists());
+}
+
+#[tokio::test]
+async fn cancellation_stops_an_in_flight_embedding_request() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let provider = BlockingProvider {
+        started: started.clone(),
+    };
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let path = dir.path().to_path_buf();
+
+    let task = tokio::spawn(async move {
+        super::index_repository_with_progress_and_cancellation(
+            &path,
+            &provider,
+            &config,
+            "mock-model",
+            |_| {},
+            &task_cancellation,
+        )
+        .await
+    });
+    started.notified().await;
+    cancellation.cancel();
+
+    let error = tokio::time::timeout(Duration::from_millis(250), task)
+        .await
+        .expect("cancellation must stop the active embedding request")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("cancel"));
+    assert!(!dir.path().join(".vera").exists());
+}
+
+#[tokio::test]
+async fn cancellation_after_embedding_does_not_publish_index_artifacts() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let provider = MockProvider::new(8);
+    let config = default_config();
+    let cancellation = CancellationToken::new();
+    let progress_cancellation = cancellation.clone();
+
+    let error = super::index_repository_with_progress_and_cancellation(
+        dir.path(),
+        &provider,
+        &config,
+        "mock-model",
+        move |event| {
+            if matches!(event, IndexProgress::EmbeddingDone { .. }) {
+                progress_cancellation.cancel();
+            }
+        },
+        &cancellation,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("operation cancelled"));
+    assert!(!dir.path().join(".vera").exists());
 }
 
 #[tokio::test]

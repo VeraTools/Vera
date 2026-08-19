@@ -344,7 +344,16 @@ pub(crate) async fn search_hybrid_reranked_with_augmentation(
                 reranked = reranked.len(),
                 "reranking complete"
             );
-            reranked.extend(hybrid_results.into_iter().skip(rerank_limit));
+            let mut score_ceiling = reranked.last().map(|result| result.score);
+            for mut result in hybrid_results.into_iter().skip(rerank_limit) {
+                // RRF and reranker scores have different scales. Keep the untouched tail below
+                // the reranked prefix so the public score order still matches the result order.
+                if let Some(ceiling) = score_ceiling {
+                    result.score = result.score.min(ceiling);
+                }
+                score_ceiling = Some(result.score);
+                reranked.push(result);
+            }
             reranked.truncate(fetch_limit);
             Ok((reranked, timings))
         }

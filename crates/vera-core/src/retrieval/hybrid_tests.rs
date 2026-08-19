@@ -1,5 +1,25 @@
 use super::*;
+use crate::retrieval::reranker::{RerankScore, Reranker, RerankerError};
 use crate::types::{Language, SymbolType};
+
+struct NegativeReranker;
+
+impl Reranker for NegativeReranker {
+    async fn rerank(
+        &self,
+        _query: &str,
+        documents: &[String],
+    ) -> Result<Vec<RerankScore>, RerankerError> {
+        Ok(documents
+            .iter()
+            .enumerate()
+            .map(|(index, _)| RerankScore {
+                index,
+                relevance_score: -1.0 - index as f64,
+            })
+            .collect())
+    }
+}
 
 /// Helper to create a SearchResult with given parameters.
 fn make_result(
@@ -474,6 +494,39 @@ async fn search_hybrid_reranked_returns_reranked_results() {
             results[i].score,
         );
     }
+}
+
+#[tokio::test]
+async fn reranked_tail_scores_remain_descending_across_score_domains() {
+    use crate::embedding::test_helpers::MockProvider;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (index_dir, dim) = setup_test_index(tmp.path()).await;
+    let provider = MockProvider::new(dim);
+
+    let (results, _) = search_hybrid_reranked(
+        &index_dir,
+        &provider,
+        &NegativeReranker,
+        "function",
+        "function",
+        &SearchFilters::default(),
+        10,
+        1,
+        60.0,
+        dim,
+        1,
+        50,
+    )
+    .await
+    .unwrap();
+
+    assert!(results.len() > 1);
+    assert!(
+        results
+            .windows(2)
+            .all(|pair| pair[0].score >= pair[1].score)
+    );
 }
 
 #[tokio::test]

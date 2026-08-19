@@ -3,6 +3,9 @@
 //! Detects changed files via content hashing, then re-indexes only
 //! modified/new files and removes deleted files from the index.
 //!
+//! Parsing and embedding finish before stored rows are replaced. A read or
+//! provider failure therefore leaves the previous index data available.
+//!
 //! The algorithm:
 //! 1. Discover current files on disk
 //! 2. Load stored content hashes from the metadata DB
@@ -87,6 +90,17 @@ pub enum UpdateProgress {
     EmbeddingDone { count: usize },
     /// Updated index artifacts have been written to disk.
     StorageDone,
+}
+
+/// Parsed update data held in memory until embedding has succeeded.
+struct PreparedFile {
+    path: String,
+    hash: String,
+    modified: bool,
+    chunks: Vec<crate::types::Chunk>,
+    references: Vec<parsing::references::RawReference>,
+    type_relations: Vec<parsing::type_relations::RawTypeRelation>,
+    state: FileIndexState,
 }
 
 /// Compute a SHA-256 content hash for a file's contents.
@@ -297,7 +311,11 @@ where
         }
     }
 
-    let current_paths: HashSet<&str> = current_files.keys().map(|s| s.as_str()).collect();
+    let current_paths: HashSet<&str> = disc
+        .files
+        .iter()
+        .map(|file| file.relative_path.as_str())
+        .collect();
 
     // Classify files.
     let mut modified = Vec::new();
@@ -368,36 +386,24 @@ where
         deferred: files_deferred,
     });
 
-    // ── 4. Process deletions ─────────────────────────────────────
-    if !deleted.is_empty() {
-        let vector_path = idx_dir.join("vectors.db");
-        let vector_store = VectorStore::open(&vector_path, stored_dim)
-            .context("failed to open vector store for deletion")?;
-        let bm25_dir = idx_dir.join("bm25");
-        let bm25_index =
-            Bm25Index::open(&bm25_dir).context("failed to open BM25 index for deletion")?;
-
-        for file_path in &deleted {
-            remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
-        }
-    }
-
-    // ── 5. Process modifications and additions ───────────────────
-    let files_to_index: Vec<(String, String, String)> =
-        modified.iter().chain(added.iter()).cloned().collect();
-    let mut file_states = Vec::new();
+    // ── 4. Prepare modifications and additions ───────────────────
+    let files_to_index: Vec<(String, String, String, bool)> = modified
+        .iter()
+        .cloned()
+        .map(|(path, content, hash)| (path, content, hash, true))
+        .chain(
+            added
+                .iter()
+                .cloned()
+                .map(|(path, content, hash)| (path, content, hash, false)),
+        )
+        .collect();
+    let mut prepared_files = Vec::new();
     let mut parse_errors = Vec::new();
 
     if !files_to_index.is_empty() {
-        // References and type relations are re-inserted during parsing, so
-        // clear the previous rows for modified files first.
-        for (file_path, _, _) in &modified {
-            remove_file_parse_data(&metadata_store, file_path)?;
-        }
-
         // Parse and chunk new/modified files.
-        let mut all_chunks = Vec::new();
-        for (rel_path, content, _hash) in &files_to_index {
+        for (rel_path, content, hash, is_modified) in &files_to_index {
             let language = detect_language_for_path(rel_path);
 
             // For RST, refs come from raw source; chunks from preprocessed.
@@ -430,20 +436,7 @@ where
                 chunk_file_for_update(content, rel_path, language, config, None, &mut parse_errors)
             };
 
-            file_states.push(file_state);
-
-            if !refs.is_empty() {
-                metadata_store
-                    .insert_references(rel_path, &refs)
-                    .context("failed to store references")?;
-            }
-
             let type_relations = parsing::type_relations::extract_type_relations(&chunks);
-            if !type_relations.is_empty() {
-                metadata_store
-                    .insert_type_relations(rel_path, &type_relations)
-                    .context("failed to store type relations")?;
-            }
 
             debug!(
                 file = %rel_path,
@@ -452,99 +445,35 @@ where
                 type_relations = type_relations.len(),
                 "parsed file"
             );
-            all_chunks.extend(chunks);
+
+            if file_state.status == FileIndexStatus::Indexed {
+                prepared_files.push(PreparedFile {
+                    path: rel_path.clone(),
+                    hash: hash.clone(),
+                    modified: *is_modified,
+                    chunks,
+                    references: refs,
+                    type_relations,
+                    state: file_state,
+                });
+            }
         }
+    }
+
+    let all_chunks: Vec<_> = prepared_files
+        .iter()
+        .flat_map(|file| file.chunks.iter().cloned())
+        .collect();
+    let file_states: Vec<_> = prepared_files
+        .iter()
+        .map(|file| file.state.clone())
+        .collect();
+
+    if !files_to_index.is_empty() {
         on_progress(UpdateProgress::ParsingDone {
             file_count: files_to_index.len(),
             chunk_count: all_chunks.len(),
         });
-
-        if !all_chunks.is_empty() {
-            // Generate embeddings.
-            let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
-            if batch_size != config.embedding.batch_size
-                || max_concurrent_requests != config.embedding.max_concurrent_requests
-            {
-                info!(
-                    configured_batch_size = config.embedding.batch_size,
-                    configured_concurrency = config.embedding.max_concurrent_requests,
-                    max_in_flight_inputs = config.embedding.max_in_flight_inputs,
-                    batch_size,
-                    max_concurrent_requests,
-                    "clamped update embedding parallelism to the in-flight input bound"
-                );
-            }
-            let progress_cb = |done: usize, total: usize| {
-                on_progress(UpdateProgress::EmbeddingProgress { done, total });
-            };
-            let mut embeddings = embed_chunks_concurrent_with_progress(
-                provider,
-                &all_chunks,
-                batch_size,
-                max_concurrent_requests,
-                config.indexing.max_chunk_bytes,
-                progress_cb,
-            )
-            .await
-            .context("embedding generation failed")?;
-            on_progress(UpdateProgress::EmbeddingDone {
-                count: embeddings.len(),
-            });
-
-            // Truncate if needed.
-            let final_stored_dim = super::truncate_embeddings(&mut embeddings, stored_dim);
-
-            // Replace old chunk data for modified files only after embedding
-            // succeeded, so a failure leaves the previous index entries intact.
-            if !modified.is_empty() {
-                remove_modified_chunk_data(&metadata_store, &idx_dir, stored_dim, &modified)?;
-            }
-
-            // Store metadata.
-            metadata_store
-                .insert_chunks(&all_chunks)
-                .context("failed to insert updated chunk metadata")?;
-
-            // Store vectors.
-            let vector_path = idx_dir.join("vectors.db");
-            let vector_store = VectorStore::open(&vector_path, final_stored_dim)
-                .context("failed to open vector store for insertion")?;
-
-            let batch: Vec<(&str, &[f32])> = embeddings
-                .iter()
-                .map(|(id, vec)| (id.as_str(), vec.as_slice()))
-                .collect();
-            vector_store
-                .insert_batch(&batch)
-                .context("failed to insert updated vectors")?;
-
-            // Store BM25 documents.
-            let bm25_dir = idx_dir.join("bm25");
-            let bm25_index =
-                Bm25Index::open(&bm25_dir).context("failed to open BM25 index for insertion")?;
-
-            bm25_index
-                .insert_chunks(&all_chunks)
-                .context("failed to insert updated BM25 documents")?;
-        } else {
-            if !modified.is_empty() {
-                remove_modified_chunk_data(&metadata_store, &idx_dir, stored_dim, &modified)?;
-            }
-            on_progress(UpdateProgress::EmbeddingDone { count: 0 });
-        }
-
-        if !file_states.is_empty() {
-            metadata_store
-                .insert_file_states(&file_states)
-                .context("failed to update file index states")?;
-        }
-
-        // Update file hashes for all indexed files.
-        for (rel_path, _content, hash) in &files_to_index {
-            metadata_store
-                .set_file_hash(rel_path, hash)
-                .context("failed to update file hash")?;
-        }
     } else {
         on_progress(UpdateProgress::ParsingDone {
             file_count: 0,
@@ -553,7 +482,112 @@ where
         on_progress(UpdateProgress::EmbeddingDone { count: 0 });
     }
 
-    // ── 6. Get final counts ──────────────────────────────────────
+    let mut embeddings = if all_chunks.is_empty() {
+        if !files_to_index.is_empty() {
+            on_progress(UpdateProgress::EmbeddingDone { count: 0 });
+        }
+        Vec::new()
+    } else {
+        let (batch_size, max_concurrent_requests) = config.embedding.bounded_parallelism();
+        if batch_size != config.embedding.batch_size
+            || max_concurrent_requests != config.embedding.max_concurrent_requests
+        {
+            info!(
+                configured_batch_size = config.embedding.batch_size,
+                configured_concurrency = config.embedding.max_concurrent_requests,
+                max_in_flight_inputs = config.embedding.max_in_flight_inputs,
+                batch_size,
+                max_concurrent_requests,
+                "clamped update embedding parallelism to the in-flight input bound"
+            );
+        }
+        let progress_cb = |done: usize, total: usize| {
+            on_progress(UpdateProgress::EmbeddingProgress { done, total });
+        };
+        let embeddings = embed_chunks_concurrent_with_progress(
+            provider,
+            &all_chunks,
+            batch_size,
+            max_concurrent_requests,
+            config.indexing.max_chunk_bytes,
+            progress_cb,
+        )
+        .await
+        .context("embedding generation failed")?;
+        on_progress(UpdateProgress::EmbeddingDone {
+            count: embeddings.len(),
+        });
+        embeddings
+    };
+
+    let final_stored_dim = if embeddings.is_empty() {
+        stored_dim
+    } else {
+        super::truncate_embeddings(&mut embeddings, stored_dim)
+    };
+    let successful_modified = prepared_files.iter().filter(|file| file.modified).count();
+    let successful_added = prepared_files.len() - successful_modified;
+
+    if !deleted.is_empty() || !prepared_files.is_empty() {
+        let vector_path = idx_dir.join("vectors.db");
+        let vector_store = VectorStore::open(&vector_path, final_stored_dim)
+            .context("failed to open vector store for update")?;
+        let bm25_dir = idx_dir.join("bm25");
+        let bm25_index =
+            Bm25Index::open(&bm25_dir).context("failed to open BM25 index for update")?;
+
+        // All parsing and embedding work is complete. Writes below publish the prepared update.
+        for file_path in &deleted {
+            remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
+        }
+
+        for file in prepared_files.iter().filter(|file| file.modified) {
+            remove_file_parse_data(&metadata_store, &file.path)?;
+            remove_file_chunk_data(&metadata_store, &vector_store, &bm25_index, &file.path)?;
+        }
+
+        for file in &prepared_files {
+            if !file.references.is_empty() {
+                metadata_store
+                    .insert_references(&file.path, &file.references)
+                    .context("failed to store references")?;
+            }
+            if !file.type_relations.is_empty() {
+                metadata_store
+                    .insert_type_relations(&file.path, &file.type_relations)
+                    .context("failed to store type relations")?;
+            }
+        }
+
+        if !all_chunks.is_empty() {
+            metadata_store
+                .insert_chunks(&all_chunks)
+                .context("failed to insert updated chunk metadata")?;
+            let batch: Vec<(&str, &[f32])> = embeddings
+                .iter()
+                .map(|(id, vector)| (id.as_str(), vector.as_slice()))
+                .collect();
+            vector_store
+                .insert_batch(&batch)
+                .context("failed to insert updated vectors")?;
+            bm25_index
+                .insert_chunks(&all_chunks)
+                .context("failed to insert updated BM25 documents")?;
+        }
+
+        if !file_states.is_empty() {
+            metadata_store
+                .insert_file_states(&file_states)
+                .context("failed to update file index states")?;
+        }
+        for file in &prepared_files {
+            metadata_store
+                .set_file_hash(&file.path, &file.hash)
+                .context("failed to update file hash")?;
+        }
+    }
+
+    // ── 5. Get final counts ──────────────────────────────────────
     let total_chunks = metadata_store
         .chunk_count()
         .context("failed to count chunks")?;
@@ -562,8 +596,8 @@ where
     on_progress(UpdateProgress::StorageDone);
 
     let summary = UpdateSummary {
-        files_modified: modified.len(),
-        files_added: added.len(),
+        files_modified: successful_modified,
+        files_added: successful_added,
         files_deleted: deleted.len(),
         files_unchanged: unchanged,
         files_with_tree_sitter_errors: file_states
@@ -702,26 +736,6 @@ fn remove_file_chunk_data(
         chunks = chunks.len(),
         "removed file chunk data from index"
     );
-
-    Ok(())
-}
-
-fn remove_modified_chunk_data(
-    metadata_store: &MetadataStore,
-    idx_dir: &Path,
-    stored_dim: usize,
-    modified: &[(String, String, String)],
-) -> Result<()> {
-    let vector_path = idx_dir.join("vectors.db");
-    let vector_store = VectorStore::open(&vector_path, stored_dim)
-        .context("failed to open vector store for modification")?;
-    let bm25_dir = idx_dir.join("bm25");
-    let bm25_index =
-        Bm25Index::open(&bm25_dir).context("failed to open BM25 index for modification")?;
-
-    for (file_path, _, _) in modified {
-        remove_file_chunk_data(metadata_store, &vector_store, &bm25_index, file_path)?;
-    }
 
     Ok(())
 }
