@@ -27,7 +27,7 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     # Job-level groups are repository-global: a manual republish cannot race
     # the release workflow's docker job on the same variant's mutable tag.
-    # Scoped per variant so cpu/cuda/rocm can still publish in parallel.
+    # Scoped per variant so cpu/cuda/rocm/openvino can still publish in parallel.
     concurrency:
       group: docker-image-publication-${{ matrix.variant }}
       cancel-in-progress: false
