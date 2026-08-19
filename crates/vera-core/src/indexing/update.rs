@@ -595,10 +595,10 @@ where
             Bm25Index::open(&bm25_dir).context("failed to open BM25 index for update")?;
 
         // Every path whose BM25 documents have to go is removed in one pass
-        // before any per-file mutation. `delete_by_file` allocates a writer, commits a segment and
-        // joins the merge threads, which costs tens of milliseconds per call
-        // however little is actually deleted. The batch must stay ahead of
-        // the `insert_chunks` below, or it would delete newly written docs.
+        // before any per-file mutation. `delete_by_file` allocates a writer,
+        // commits a segment and joins the merge threads, which costs tens of
+        // milliseconds per call however little is actually deleted. The batch
+        // must stay ahead of `insert_chunks`, or it would delete newly written docs.
         let mut bm25_deletions: Vec<&str> = deleted.iter().map(String::as_str).collect();
         let cleanup_chunk_data: Vec<bool> = prepared_files
             .iter()
@@ -642,7 +642,6 @@ where
                 .delete_file_state(&file.path)
                 .with_context(|| format!("failed to delete file state for {}", file.path))?;
         }
-
         for file in &prepared_files {
             if !file.references.is_empty() {
                 metadata_store

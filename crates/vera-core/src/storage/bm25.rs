@@ -503,6 +503,51 @@ mod tests {
     }
 
     #[test]
+    fn delete_by_files_removes_every_path_and_keeps_the_rest() {
+        let index = Bm25Index::open_in_memory().unwrap();
+        index.insert_batch(&sample_docs()).unwrap();
+        let before = index.doc_count().unwrap();
+
+        // src/main.rs has two documents; deleting it and one other path must
+        // take all of theirs and none of anyone else's.
+        index
+            .delete_by_files(&["src/main.rs", "src/lib.py"])
+            .unwrap();
+
+        assert_eq!(index.doc_count().unwrap(), before - 3);
+        let hits = index.search("fn", 50).unwrap();
+        for path in ["src/main.rs:", "src/lib.py:"] {
+            assert!(
+                hits.iter().all(|hit| !hit.chunk_id.starts_with(path)),
+                "{path} should have no documents left, got {:?}",
+                hits.iter().map(|h| &h.chunk_id).collect::<Vec<_>>()
+            );
+        }
+        // An unrelated path is untouched.
+        let remaining = index.search("server", 50).unwrap();
+        assert!(
+            remaining
+                .iter()
+                .any(|hit| hit.chunk_id.starts_with("src/server.ts:")),
+            "unrelated documents must survive"
+        );
+    }
+
+    #[test]
+    fn delete_by_files_with_no_paths_is_a_no_op() {
+        // The update path calls this unconditionally, so an update with
+        // nothing deleted or modified must not touch the index — and must not
+        // pay for a writer to do nothing.
+        let index = Bm25Index::open_in_memory().unwrap();
+        index.insert_batch(&sample_docs()).unwrap();
+        let before = index.doc_count().unwrap();
+
+        index.delete_by_files(&[]).unwrap();
+
+        assert_eq!(index.doc_count().unwrap(), before);
+    }
+
+    #[test]
     fn delete_by_chunk_id() {
         let index = Bm25Index::open_in_memory().unwrap();
         index.insert_batch(&sample_docs()).unwrap();
