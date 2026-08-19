@@ -106,12 +106,10 @@ struct PreparedFile {
     state: FileIndexState,
 }
 
-fn processed_file_counts(
-    files: impl IntoIterator<Item = (bool, FileIndexStatus)>,
-) -> (usize, usize) {
+fn processed_file_counts(files: impl IntoIterator<Item = bool>) -> (usize, usize) {
     files
         .into_iter()
-        .fold((0, 0), |(modified, added), (is_modified, _status)| {
+        .fold((0, 0), |(modified, added), is_modified| {
             if is_modified {
                 (modified + 1, added)
             } else {
@@ -585,11 +583,8 @@ where
     } else {
         super::truncate_embeddings(&mut embeddings, stored_dim)
     };
-    let (processed_modified, processed_added) = processed_file_counts(
-        prepared_files
-            .iter()
-            .map(|file| (file.modified, file.state.status)),
-    );
+    let (processed_modified, processed_added) =
+        processed_file_counts(prepared_files.iter().map(|file| file.modified));
 
     if !deleted.is_empty() || !prepared_files.is_empty() {
         let vector_path = idx_dir.join("vectors.db");

@@ -156,14 +156,8 @@ fn content_hash_is_hex_sha256() {
 }
 
 #[test]
-fn processed_file_counts_include_parse_errors() {
-    assert_eq!(
-        processed_file_counts([
-            (true, FileIndexStatus::ParseError),
-            (false, FileIndexStatus::Indexed),
-        ]),
-        (1, 1)
-    );
+fn processed_file_counts_cover_modified_and_added_files() {
+    assert_eq!(processed_file_counts([true, false]), (1, 1));
 }
 
 // ── Update: no changes ──────────────────────────────────────────────
