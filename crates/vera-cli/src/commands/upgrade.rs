@@ -61,14 +61,15 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
     // The installer command exiting 0 does not mean the new version landed. A
     // package registry can lag behind a GitHub release, in which case the
     // installer resolves the version already installed and the upgrade
-    // silently no-ops. Compare what the installer recorded against what was
-    // advertised rather than reporting success on the exit code alone.
+    // silently no-ops. Check whether the installed version actually changed
+    // rather than reporting success on the exit code alone.
     report.installed_version = state::load_install_provenance()
         .ok()
         .and_then(|provenance| provenance.version);
 
     match verification_outcome(
         method,
+        &report.current_version,
         report.latest_version.as_deref(),
         report.installed_version.as_deref(),
     ) {
@@ -90,26 +91,33 @@ pub fn run(apply: bool, json_output: bool) -> Result<()> {
     print_report(&report, json_output)
 }
 
-/// Describe the mismatch when an applied upgrade did not produce the advertised
-/// version, or `None` when it did or when there is nothing to compare.
+/// Describe why an applied upgrade did not take effect, or `None` when it did.
 ///
 /// A package registry can lag behind a GitHub release, in which case the
 /// installer keeps resolving the version already installed, every installer
 /// command exits 0, and the upgrade silently no-ops.
+///
+/// The test is whether the installed version *changed*, not whether it equals
+/// the advertised one. The installer resolves from the package registry while
+/// `latest` comes from the GitHub release, and the two can legitimately differ:
+/// a registry that is ahead of the release, or one that resolves an
+/// intermediate version, still performed a real upgrade. Comparing against
+/// `latest` reports those as failures and points the user at an older build.
 fn applied_version_mismatch(
     method: &str,
+    current: &str,
     latest: Option<&str>,
-    installed: Option<&str>,
+    installed: &str,
 ) -> Option<String> {
-    let (latest, installed) = (latest?, installed?);
-    if installed == latest {
+    if installed != current {
         return None;
     }
+    let target = latest.unwrap_or("the new version");
     Some(format!(
-        "upgrade did not take effect: expected {latest}, but the installer recorded {installed}.\n\
-         This usually means the {method} package for {latest} has not been published yet, so the \
+        "upgrade did not take effect: still on {installed}.\n\
+         This usually means the {method} package for {target} has not been published yet, so the \
          installer resolved {installed} again.\n\
-         Hint: retry later, or install the {latest} binary from \
+         Hint: retry later, or install the {target} binary from \
          https://github.com/VeraTools/Vera/releases"
     ))
 }
@@ -123,13 +131,14 @@ enum VerificationOutcome {
 
 fn verification_outcome(
     method: &str,
+    current: &str,
     latest: Option<&str>,
     installed: Option<&str>,
 ) -> VerificationOutcome {
-    if latest.is_none() || installed.is_none() {
+    let Some(installed) = installed else {
         return VerificationOutcome::Unknown;
-    }
-    match applied_version_mismatch(method, latest, installed) {
+    };
+    match applied_version_mismatch(method, current, latest, installed) {
         Some(message) => VerificationOutcome::Mismatch(message),
         None => VerificationOutcome::Confirmed,
     }
@@ -140,37 +149,65 @@ mod tests {
     use super::{VerificationOutcome, applied_version_mismatch, verification_outcome};
 
     #[test]
-    fn reports_nothing_when_the_installed_version_matches() {
-        assert!(applied_version_mismatch("bun", Some("1.0.0"), Some("1.0.0")).is_none());
+    fn reports_nothing_when_the_version_changed() {
+        assert!(applied_version_mismatch("bun", "0.12.13", Some("1.0.0"), "1.0.0").is_none());
     }
 
     #[test]
-    fn reports_mismatch_with_both_versions_and_the_install_method() {
-        let message = applied_version_mismatch("bun", Some("1.0.0"), Some("0.12.13"))
+    fn reports_the_no_op_with_the_version_and_the_install_method() {
+        let message = applied_version_mismatch("bun", "0.12.13", Some("1.0.0"), "0.12.13")
             .expect("a stale registry must be reported, not treated as success");
-        assert!(message.contains("1.0.0"), "{message}");
         assert!(message.contains("0.12.13"), "{message}");
+        assert!(message.contains("1.0.0"), "{message}");
         assert!(message.contains("bun"), "{message}");
     }
 
+    /// The installer resolves from the package registry, `latest` comes from
+    /// the GitHub release, and the two can legitimately disagree. A registry
+    /// that is ahead of the release still performed a real upgrade, so it must
+    /// not be reported as a failure telling the user to install the older
+    /// GitHub build.
     #[test]
-    fn reports_nothing_when_either_version_is_unknown() {
-        assert!(applied_version_mismatch("bun", None, Some("0.12.13")).is_none());
-        assert!(applied_version_mismatch("bun", Some("1.0.0"), None).is_none());
+    fn accepts_a_version_the_registry_resolved_ahead_of_the_release() {
+        assert!(
+            applied_version_mismatch("bun", "1.0.0", Some("1.0.1"), "1.0.2").is_none(),
+            "a registry ahead of the GitHub release is still a real upgrade"
+        );
+        assert_eq!(
+            verification_outcome("bun", "1.0.0", Some("1.0.1"), Some("1.0.2")),
+            VerificationOutcome::Confirmed
+        );
     }
 
+    /// An intermediate version is also a real upgrade.
     #[test]
-    fn confirms_only_when_both_versions_match() {
+    fn accepts_an_intermediate_version_between_current_and_latest() {
         assert_eq!(
-            verification_outcome("bun", Some("1.0.0"), Some("1.0.0")),
+            verification_outcome("pip", "1.0.0", Some("1.2.0"), Some("1.1.0")),
             VerificationOutcome::Confirmed
         );
     }
 
     #[test]
-    fn keeps_mismatched_versions_unapplied() {
+    fn detects_the_no_op_even_when_the_release_version_is_unknown() {
+        assert!(
+            applied_version_mismatch("bun", "0.12.13", None, "0.12.13").is_some(),
+            "the no-op is detectable without knowing the advertised version"
+        );
+    }
+
+    #[test]
+    fn confirms_when_the_installed_version_moved_off_the_current_one() {
+        assert_eq!(
+            verification_outcome("bun", "0.12.13", Some("1.0.0"), Some("1.0.0")),
+            VerificationOutcome::Confirmed
+        );
+    }
+
+    #[test]
+    fn keeps_a_no_op_upgrade_unapplied() {
         assert!(matches!(
-            verification_outcome("bun", Some("1.0.0"), Some("0.12.13")),
+            verification_outcome("bun", "0.12.13", Some("1.0.0"), Some("0.12.13")),
             VerificationOutcome::Mismatch(_)
         ));
     }
@@ -178,7 +215,7 @@ mod tests {
     #[test]
     fn keeps_unknown_versions_unapplied() {
         assert_eq!(
-            verification_outcome("bun", Some("1.0.0"), None),
+            verification_outcome("bun", "0.12.13", Some("1.0.0"), None),
             VerificationOutcome::Unknown
         );
     }
