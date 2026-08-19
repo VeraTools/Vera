@@ -621,6 +621,59 @@ mod tests {
         assert_eq!(results[0].symbol_name.as_deref(), Some("parse_config"));
     }
 
+    /// Structural search over a JSX-bearing `.tsx` file: the real env read is
+    /// found and attributed, the comment and JSX-attribute decoys are not.
+    ///
+    /// This characterises behaviour rather than guarding the grammar switch.
+    /// It passes under both grammars, which is the point: tree-sitter still
+    /// lexes comments and strings inside an error region, and still recognises
+    /// the enclosing `function_declaration`, so swapping `typescript` for `tsx`
+    /// leaves structural results unchanged. Nothing covered `.tsx` structural
+    /// search before, so the coverage is new either way.
+    #[tokio::test]
+    async fn structural_search_works_in_jsx_bearing_tsx() {
+        let dir = index_repo(&[(
+            "src/Panel.tsx",
+            r#"export function Panel() {
+  // const decoy = process.env.FAKE_URL;
+  const real = process.env.API_URL;
+  return <div title="process.env.FAKE_URL">{real}</div>;
+}
+"#,
+        )])
+        .await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        let real = search_structural(
+            &index_dir,
+            StructuralSearchKind::EnvReads,
+            Some("API_URL"),
+            10,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(real.len(), 1, "real env read should be found: {real:?}");
+        assert_eq!(real[0].file_path, "src/Panel.tsx");
+        assert_eq!(
+            real[0].symbol_name.as_deref(),
+            Some("Panel"),
+            "match should be attributed to the enclosing component"
+        );
+
+        let decoy = search_structural(
+            &index_dir,
+            StructuralSearchKind::EnvReads,
+            Some("FAKE_URL"),
+            10,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert!(
+            decoy.is_empty(),
+            "comment and JSX attribute string should be filtered: {decoy:?}"
+        );
+    }
+
     #[tokio::test]
     async fn definitions_find_const_assigned_functions() {
         let dir = index_repo(&[(
