@@ -71,6 +71,38 @@ pub fn reranker_execution_provider(
     }
 }
 
+/// Execution provider the embedding session must use for a given backend and
+/// configured model.
+///
+/// CoreML accelerates embeddings (~39ms) for models it can run, and that
+/// acceleration is worth keeping for the default's alternatives (jina keeps
+/// running on CoreML here). CodeRankEmbed is the exception: the CoreML EP
+/// accepts a fused subgraph for its ONNX graph and then fails at inference
+/// with a static output shape mismatch (observed: CoreML static output shape
+/// `{2,1,1,80}` vs. inferred shape `{1,1,1,-1}`), the same class of bug as the
+/// reranker's CoreML failure (see `reranker_execution_provider`). Session
+/// creation succeeds, so the failure only surfaces once inference runs, deep
+/// inside the indexing pipeline, rather than up front. Pinning CodeRankEmbed
+/// to CPU under CoreML costs indexing throughput on Apple Silicon relative to
+/// a model CoreML could accelerate, but the alternative is a hard indexing
+/// failure, so the CPU cost is strictly better. This does not blanket-pin all
+/// embeddings to CPU: any other model, including a custom override, keeps
+/// whatever provider was selected.
+pub fn embedding_execution_provider(
+    ep: crate::config::OnnxExecutionProvider,
+    config: &LocalEmbeddingModelConfig,
+) -> crate::config::OnnxExecutionProvider {
+    let is_coderankembed = matches!(
+        &config.source,
+        LocalEmbeddingSource::HuggingFace { repo } if repo == CODERANK_EMBEDDING_REPO
+    );
+    if ep == crate::config::OnnxExecutionProvider::CoreMl && is_coderankembed {
+        crate::config::OnnxExecutionProvider::Cpu
+    } else {
+        ep
+    }
+}
+
 /// ONNX Runtime version to auto-download. Using 1.24.4 for CUDA 13 support.
 /// The `ort` crate (rc.11) uses `load-dynamic` so any ABI-compatible ORT works.
 pub(super) const ORT_VERSION: &str = "1.24.4";
@@ -148,7 +180,7 @@ pub struct LocalEmbeddingAssetPaths {
 
 impl Default for LocalEmbeddingModelConfig {
     fn default() -> Self {
-        Self::jina()
+        Self::coderankembed()
     }
 }
 
@@ -323,12 +355,21 @@ impl LocalEmbeddingModelConfig {
         })
     }
 
+    /// Template used to fill in the non-source fields (onnx file, tokenizer,
+    /// pooling, query prefix) for a given source.
+    ///
+    /// This is deliberately not `Self::default()`: `default()` is the
+    /// no-override starting point (CodeRankEmbed), but an arbitrary custom
+    /// HuggingFace repo or directory has no reason to inherit CodeRankEmbed's
+    /// CLS pooling and required query prefix. It falls back to jina's
+    /// mean-pooling, no-prefix shape, same as before CodeRankEmbed became the
+    /// default.
     fn defaults_for_source(source: &LocalEmbeddingSource) -> Self {
         match source {
             LocalEmbeddingSource::HuggingFace { repo } if repo == CODERANK_EMBEDDING_REPO => {
                 Self::coderankembed()
             }
-            _ => Self::default(),
+            _ => Self::jina(),
         }
     }
 
@@ -577,6 +618,45 @@ mod finding_tests {
             jina.onnx_data_file.as_deref(),
             Some(EMBEDDING_ONNX_GPU_DATA_FILE)
         );
+    }
+
+    #[test]
+    fn default_embedding_model_is_coderankembed() {
+        assert_eq!(
+            LocalEmbeddingModelConfig::default(),
+            LocalEmbeddingModelConfig::coderankembed()
+        );
+    }
+
+    #[test]
+    fn embedding_runs_on_cpu_under_coreml_for_coderankembed_only() {
+        // CodeRankEmbed cannot run on the CoreML EP: registering it anyway
+        // lets ORT fuse a subgraph that fails at inference with a static
+        // output shape mismatch.
+        let coderank = LocalEmbeddingModelConfig::coderankembed();
+        assert_eq!(
+            embedding_execution_provider(OnnxExecutionProvider::CoreMl, &coderank),
+            OnnxExecutionProvider::Cpu
+        );
+
+        // jina keeps CoreML acceleration: only CodeRankEmbed is pinned to CPU.
+        let jina = LocalEmbeddingModelConfig::jina();
+        assert_eq!(
+            embedding_execution_provider(OnnxExecutionProvider::CoreMl, &jina),
+            OnnxExecutionProvider::CoreMl
+        );
+
+        // Every non-CoreML EP is unaffected, for either model.
+        for ep in [
+            OnnxExecutionProvider::Cpu,
+            OnnxExecutionProvider::Cuda,
+            OnnxExecutionProvider::Rocm,
+            OnnxExecutionProvider::DirectMl,
+            OnnxExecutionProvider::OpenVino,
+        ] {
+            assert_eq!(embedding_execution_provider(ep, &coderank), ep);
+            assert_eq!(embedding_execution_provider(ep, &jina), ep);
+        }
     }
 
     #[test]

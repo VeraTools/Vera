@@ -355,7 +355,7 @@ impl LocalEmbeddingProvider {
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
-        let _ = build_session(ep, asset_paths.onnx_path, 0)?;
+        let _ = build_session(ep, asset_paths.onnx_path, 0, &config)?;
         Ok(())
     }
 
@@ -365,7 +365,7 @@ impl LocalEmbeddingProvider {
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
-        let mut session = build_session(ep, asset_paths.onnx_path, 0)?;
+        let mut session = build_session(ep, asset_paths.onnx_path, 0, &config)?;
         let tokenizer = load_tokenizer(asset_paths.tokenizer_path, config.max_length)?;
         run_probe_inference(&mut session, &tokenizer)
     }
@@ -605,8 +605,11 @@ async fn load_embedding_components(
     let tokenizer =
         task::spawn_blocking(move || load_tokenizer(tokenizer_path, tokenizer_max_length))
             .await??;
-    let session =
-        task::spawn_blocking(move || build_session(ep, onnx_path, gpu_mem_limit_mb)).await??;
+    let session_config = config.clone();
+    let session = task::spawn_blocking(move || {
+        build_session(ep, onnx_path, gpu_mem_limit_mb, &session_config)
+    })
+    .await??;
 
     Ok((session, tokenizer))
 }
@@ -812,7 +815,9 @@ fn build_session(
     ep: OnnxExecutionProvider,
     onnx_path: std::path::PathBuf,
     gpu_mem_limit_mb: u64,
+    config: &LocalEmbeddingModelConfig,
 ) -> Result<Session> {
+    let ep = crate::local_models::embedding_execution_provider(ep, config);
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
