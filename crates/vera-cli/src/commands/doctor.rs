@@ -464,7 +464,7 @@ fn probe_local_backend(
         let detail = if embedding_on_cpu {
             "the reranker and the configured embedding model both run on CPU under CoreML (no CoreML-compatible reranker ONNX export exists, and this embedding model fails at inference on the CoreML provider), so this backend is not currently GPU-accelerated. If search latency is unacceptable, disable reranking with `vera config set retrieval.reranking_enabled false`"
         } else {
-            "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists); only the embedding model is GPU-accelerated. Reranking will be slower than embedding. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`"
+            "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists). The embedding model is configured for CoreML, but ONNX Runtime can still place nodes on CPU, so active GPU execution cannot be confirmed here. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`"
         };
         checks.push(DoctorCheck {
             name: "probe-reranker-coreml-cpu",

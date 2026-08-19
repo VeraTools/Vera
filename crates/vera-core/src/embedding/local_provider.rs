@@ -272,14 +272,7 @@ impl LocalEmbeddingProvider {
         gpu_mem_limit_mb: u64,
     ) -> Result<Self, EmbeddingError> {
         let base_config = LocalEmbeddingModelConfig::from_env().map_err(api_err)?;
-        // `build_session` pins some models to CPU regardless of the requested
-        // backend (see `embedding_execution_provider`). Resolve that here too:
-        // otherwise a session that actually runs on CPU still gets GPU batch
-        // scaling, GPU provider dependencies, and a CPU "fallback" retry of the
-        // CPU session it already built.
-        let ep = crate::local_models::embedding_execution_provider(ep, &base_config);
-        let mut config = base_config.clone();
-        config.adjust_for_gpu(ep);
+        let (ep, mut config) = resolve_provider_and_config(ep, &base_config);
         let mut batch_scaler = if ep == OnnxExecutionProvider::Cpu {
             None
         } else {
@@ -356,8 +349,7 @@ impl LocalEmbeddingProvider {
     }
 
     pub fn probe_session(ep: OnnxExecutionProvider) -> Result<()> {
-        let mut config = LocalEmbeddingModelConfig::from_env()?;
-        config.adjust_for_gpu(ep);
+        let (ep, config) = resolve_provider_and_config(ep, &LocalEmbeddingModelConfig::from_env()?);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
@@ -366,8 +358,7 @@ impl LocalEmbeddingProvider {
     }
 
     pub fn probe_inference(ep: OnnxExecutionProvider) -> Result<()> {
-        let mut config = LocalEmbeddingModelConfig::from_env()?;
-        config.adjust_for_gpu(ep);
+        let (ep, config) = resolve_provider_and_config(ep, &LocalEmbeddingModelConfig::from_env()?);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
@@ -815,6 +806,27 @@ fn normalize_embedding(embedding: &mut [f32]) {
             *value /= norm;
         }
     }
+}
+
+/// Resolve the execution provider a session will actually run on, and adjust
+/// the model config to match it.
+///
+/// `build_session` pins some models to CPU regardless of the requested backend
+/// (see `embedding_execution_provider`), so everything derived from the
+/// provider has to follow the effective one rather than the requested one.
+/// Adjusting for the requested provider would select the GPU ONNX export for a
+/// session that then runs on CPU, and would give a CPU session GPU batch
+/// scaling, GPU provider dependencies, and a CPU "fallback" retry of the CPU
+/// session it already built. Probe paths must resolve identically or `vera
+/// doctor` reports on a configuration production never loads.
+fn resolve_provider_and_config(
+    ep: OnnxExecutionProvider,
+    config: &LocalEmbeddingModelConfig,
+) -> (OnnxExecutionProvider, LocalEmbeddingModelConfig) {
+    let ep = crate::local_models::embedding_execution_provider(ep, config);
+    let mut resolved = config.clone();
+    resolved.adjust_for_gpu(ep);
+    (ep, resolved)
 }
 
 fn build_session(
