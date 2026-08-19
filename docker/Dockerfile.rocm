@@ -10,7 +10,7 @@
 # copy). Direct Docker Hub pulls of its 5.5GB layer arrived corrupted on our CI
 # runners (4/4 builds, "unexpected commit digest" with a different wrong digest
 # each run). Re-mirror with .github/workflows/rocm-base-mirror.yml if bumping.
-FROM ghcr.io/veratools/vera:rocm-base-6.4.4-complete
+FROM ghcr.io/veratools/vera:rocm-base-6.4.4-complete@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl && \

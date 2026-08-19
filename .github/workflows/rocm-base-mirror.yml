@@ -25,7 +25,9 @@ jobs:
     steps:
       - name: Install crane
         run: |
-          curl -sL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz | sudo tar xz -C /usr/local/bin crane
+          curl -sL -o /tmp/crane.tgz https://github.com/google/go-containerregistry/releases/download/v0.20.6/go-containerregistry_Linux_x86_64.tar.gz
+          echo "c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127  /tmp/crane.tgz" | sha256sum -c -
+          sudo tar xzf /tmp/crane.tgz -C /usr/local/bin crane
           crane version
 
       - name: Log in to GHCR
@@ -44,3 +46,7 @@ jobs:
           DST=$(crane digest "ghcr.io/veratools/vera:rocm-base-${BASE_TAG}")
           echo "source=$SRC mirror=$DST"
           test "$SRC" = "$DST"
+          # The Dockerfile pins FROM by digest so builds always resolve the
+          # manifest verified here, not whatever the mutable tag later holds.
+          echo "Pin this in docker/Dockerfile.rocm:" >> "$GITHUB_STEP_SUMMARY"
+          echo "FROM ghcr.io/veratools/vera:rocm-base-${BASE_TAG}@${DST}" >> "$GITHUB_STEP_SUMMARY"
