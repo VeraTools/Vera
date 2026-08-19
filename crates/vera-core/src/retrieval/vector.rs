@@ -199,7 +199,6 @@ mod tests {
     use super::*;
     use crate::embedding::test_helpers::MockProvider;
     use crate::types::{Chunk, Language, SymbolType};
-    use anyhow::Context;
 
     /// The pool must never ask sqlite-vec for more than it will serve, and must
     /// report the shortfall so a degraded pool is diagnosable rather than silent.
