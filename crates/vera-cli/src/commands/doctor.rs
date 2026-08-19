@@ -452,10 +452,24 @@ fn probe_local_backend(
     // and then fail at inference. The probes above cannot detect this, so
     // surface it deterministically here.
     if ep == vera_core::config::OnnxExecutionProvider::CoreMl {
+        // The embedding model is not unconditionally GPU-accelerated either:
+        // some models are pinned to CPU under CoreML (see
+        // `embedding_execution_provider`). Report what the configured model
+        // actually does rather than asserting embeddings run on the GPU.
+        let embedding_on_cpu = vera_core::local_models::LocalEmbeddingModelConfig::from_env()
+            .is_ok_and(|config| {
+                vera_core::local_models::embedding_execution_provider(ep, &config)
+                    == vera_core::config::OnnxExecutionProvider::Cpu
+            });
+        let detail = if embedding_on_cpu {
+            "the reranker and the configured embedding model both run on CPU under CoreML (no CoreML-compatible reranker ONNX export exists, and this embedding model fails at inference on the CoreML provider), so this backend is not currently GPU-accelerated. If search latency is unacceptable, disable reranking with `vera config set retrieval.reranking_enabled false`"
+        } else {
+            "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists); only the embedding model is GPU-accelerated. Reranking will be slower than embedding. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`"
+        };
         checks.push(DoctorCheck {
             name: "probe-reranker-coreml-cpu",
             status: CheckStatus::Warn,
-            detail: "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists); only the embedding model is GPU-accelerated. Reranking will be slower than embedding. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`".to_string(),
+            detail: detail.to_string(),
         });
     }
 

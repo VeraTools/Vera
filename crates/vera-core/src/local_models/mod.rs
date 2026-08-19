@@ -223,18 +223,18 @@ impl LocalEmbeddingModelConfig {
         )
     }
 
-    pub fn from_huggingface_repo(repo: impl Into<String>) -> Self {
-        let source = LocalEmbeddingSource::HuggingFace { repo: repo.into() };
+    fn from_source(source: LocalEmbeddingSource) -> Self {
         let mut defaults = Self::defaults_for_source(&source);
         defaults.source = source;
         defaults
     }
 
+    pub fn from_huggingface_repo(repo: impl Into<String>) -> Self {
+        Self::from_source(LocalEmbeddingSource::HuggingFace { repo: repo.into() })
+    }
+
     pub fn from_directory(path: PathBuf) -> Self {
-        Self {
-            source: LocalEmbeddingSource::Directory { path },
-            ..Self::default()
-        }
+        Self::from_source(LocalEmbeddingSource::Directory { path })
     }
 
     /// Switch to the FP16 ONNX model when running on a GPU execution provider.

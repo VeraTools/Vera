@@ -272,6 +272,12 @@ impl LocalEmbeddingProvider {
         gpu_mem_limit_mb: u64,
     ) -> Result<Self, EmbeddingError> {
         let base_config = LocalEmbeddingModelConfig::from_env().map_err(api_err)?;
+        // `build_session` pins some models to CPU regardless of the requested
+        // backend (see `embedding_execution_provider`). Resolve that here too:
+        // otherwise a session that actually runs on CPU still gets GPU batch
+        // scaling, GPU provider dependencies, and a CPU "fallback" retry of the
+        // CPU session it already built.
+        let ep = crate::local_models::embedding_execution_provider(ep, &base_config);
         let mut config = base_config.clone();
         config.adjust_for_gpu(ep);
         let mut batch_scaler = if ep == OnnxExecutionProvider::Cpu {

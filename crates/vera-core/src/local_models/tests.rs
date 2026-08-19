@@ -35,6 +35,21 @@ fn coderankembed_repo_uses_coderank_defaults() {
 }
 
 #[test]
+fn custom_sources_do_not_inherit_coderank_pooling_or_query_prefix() {
+    // `default()` is CodeRankEmbed, but an arbitrary repo or a user-supplied
+    // ONNX directory has no reason to inherit its CLS pooling and mandatory
+    // query prefix — that would silently change their embeddings.
+    for config in [
+        LocalEmbeddingModelConfig::from_huggingface_repo("acme/custom-embeddings"),
+        LocalEmbeddingModelConfig::from_directory(PathBuf::from("/models/custom")),
+    ] {
+        assert_eq!(config.pooling, LocalEmbeddingPooling::Mean);
+        assert_eq!(config.query_prefix, None);
+        assert_eq!(config.query_text("find router code"), "find router code");
+    }
+}
+
+#[test]
 fn parse_cuda_major_version_handles_paths_and_versions() {
     assert_eq!(
         parse_cuda_major_version(r#"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"#),
