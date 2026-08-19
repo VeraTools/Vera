@@ -8,7 +8,7 @@ use tree_sitter::Parser;
 
 use crate::types::Language;
 
-use super::languages::tree_sitter_grammar;
+use super::languages::tree_sitter_grammar_for_path;
 
 /// Body node kinds per language family. The first match wins.
 fn body_node_kinds(lang: Language) -> &'static [&'static str] {
@@ -84,8 +84,8 @@ fn body_placeholder(lang: Language) -> &'static str {
 ///
 /// Returns `None` if the language has no grammar, parsing fails, or no
 /// body node is found (caller should use the fallback).
-fn extract_signature_inner(content: &str, lang: Language) -> Option<String> {
-    let grammar = tree_sitter_grammar(lang)?;
+fn extract_signature_inner(content: &str, lang: Language, file_path: &str) -> Option<String> {
+    let grammar = tree_sitter_grammar_for_path(lang, file_path)?;
     let kinds = body_node_kinds(lang);
     if kinds.is_empty() {
         return None;
@@ -149,8 +149,13 @@ fn first_n_lines(content: &str, max_lines: usize) -> String {
 ///
 /// Tries tree-sitter body stripping first. Falls back to first 3 lines
 /// for unsupported languages or non-symbol chunks.
-pub fn extract_signature(content: &str, lang: Language) -> String {
-    extract_signature_inner(content, lang).unwrap_or_else(|| first_n_lines(content, 3))
+///
+/// `file_path` selects the grammar dialect, the same way indexing does: a
+/// `.tsx` file must be parsed with the tsx grammar. Parsing JSX with the plain
+/// TypeScript grammar can fail to locate the body at all, in which case this
+/// silently degrades to the raw first-three-lines fallback.
+pub fn extract_signature(content: &str, lang: Language, file_path: &str) -> String {
+    extract_signature_inner(content, lang, file_path).unwrap_or_else(|| first_n_lines(content, 3))
 }
 
 #[cfg(test)]
@@ -160,21 +165,46 @@ mod tests {
     #[test]
     fn typescript_interface_signature() {
         let code = "export interface Repo extends Base {\n    get(id: string): Item;\n}\n";
-        let sig = extract_signature(code, Language::TypeScript);
+        let sig = extract_signature(code, Language::TypeScript, "");
         assert_eq!(sig, "export interface Repo extends Base { ... }");
+    }
+
+    #[test]
+    fn tsx_signature_uses_the_tsx_grammar() {
+        // JSX ahead of a declaration derails the plain TypeScript grammar
+        // badly enough that no body node is found within the depth limit, so
+        // `extract_signature` silently degrades to the raw first-three-lines
+        // fallback instead of a stripped signature. Selecting the grammar by
+        // path, as indexing does, keeps it working.
+        let code = "const A = <p>{ q }</p>;\nfunction Later(x: number) {\n  return x;\n}\n";
+
+        let tsx = extract_signature(code, Language::TypeScript, "Widget.tsx");
+        assert_eq!(
+            tsx,
+            "const A = <p>{ q }</p>;\nfunction Later(x: number) { ... }"
+        );
+
+        // The same content under a .ts path keeps the old behaviour, which is
+        // correct: there the angle brackets really are type syntax.
+        let ts = extract_signature(code, Language::TypeScript, "Widget.ts");
+        assert_ne!(ts, tsx);
+        assert!(
+            !ts.contains("{ ... }"),
+            "the .ts path should fall back, got: {ts}"
+        );
     }
 
     #[test]
     fn rust_pub_trait_signature() {
         let code = "pub trait Child: Parent + Send {\n    fn child(&self);\n}\n";
-        let sig = extract_signature(code, Language::Rust);
+        let sig = extract_signature(code, Language::Rust, "");
         assert_eq!(sig, "pub trait Child: Parent + Send { ... }");
     }
 
     #[test]
     fn rust_function_signature() {
         let code = "pub fn authenticate(credentials: &Credentials) -> Result<Token> {\n    let user = db.find_user(&credentials.username)?;\n    validate(user)?;\n    Ok(Token::new())\n}";
-        let sig = extract_signature(code, Language::Rust);
+        let sig = extract_signature(code, Language::Rust, "");
         assert!(sig.contains("pub fn authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("find_user"));
@@ -183,7 +213,7 @@ mod tests {
     #[test]
     fn python_function_signature() {
         let code = "def authenticate(credentials: Credentials) -> Token:\n    user = db.find_user(credentials.username)\n    validate(user)\n    return Token()";
-        let sig = extract_signature(code, Language::Python);
+        let sig = extract_signature(code, Language::Python, "");
         assert!(sig.contains("def authenticate"));
         assert!(sig.contains("..."));
         assert!(!sig.contains("find_user"));
@@ -192,7 +222,7 @@ mod tests {
     #[test]
     fn typescript_function_signature() {
         let code = "function authenticate(credentials: Credentials): Token {\n    const user = db.findUser(credentials.username);\n    return new Token();\n}";
-        let sig = extract_signature(code, Language::TypeScript);
+        let sig = extract_signature(code, Language::TypeScript, "");
         assert!(sig.contains("function authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("findUser"));
@@ -201,7 +231,7 @@ mod tests {
     #[test]
     fn go_function_signature() {
         let code = "func authenticate(creds Credentials) (Token, error) {\n\tuser := db.FindUser(creds.Username)\n\treturn Token{}, nil\n}";
-        let sig = extract_signature(code, Language::Go);
+        let sig = extract_signature(code, Language::Go, "");
         assert!(sig.contains("func authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("FindUser"));
@@ -210,7 +240,7 @@ mod tests {
     #[test]
     fn java_method_signature() {
         let code = "public Token authenticate(Credentials creds) {\n    User user = db.findUser(creds.username);\n    return new Token();\n}";
-        let sig = extract_signature(code, Language::Java);
+        let sig = extract_signature(code, Language::Java, "");
         assert!(sig.contains("public Token authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("findUser"));
@@ -219,7 +249,7 @@ mod tests {
     #[test]
     fn c_function_signature() {
         let code = "int authenticate(const char* user, const char* pass) {\n    int result = check_db(user, pass);\n    return result;\n}";
-        let sig = extract_signature(code, Language::C);
+        let sig = extract_signature(code, Language::C, "");
         assert!(sig.contains("int authenticate"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("check_db"));
@@ -228,7 +258,7 @@ mod tests {
     #[test]
     fn fallback_for_unknown_language() {
         let code = "line1\nline2\nline3\nline4\nline5\nline6";
-        let sig = extract_signature(code, Language::Unknown);
+        let sig = extract_signature(code, Language::Unknown, "");
         assert!(sig.contains("line1"));
         assert!(sig.contains("line3"));
         assert!(sig.contains("[... 3 more lines]"));
@@ -238,7 +268,7 @@ mod tests {
     #[test]
     fn short_content_unchanged() {
         let code = "const X: i32 = 42;";
-        let sig = extract_signature(code, Language::Rust);
+        let sig = extract_signature(code, Language::Rust, "");
         // No body to strip, fallback returns as-is since <= 3 lines.
         assert_eq!(sig, code);
     }
@@ -246,7 +276,7 @@ mod tests {
     #[test]
     fn rust_struct_signature() {
         let code = "pub struct Config {\n    pub name: String,\n    pub value: i32,\n}";
-        let sig = extract_signature(code, Language::Rust);
+        let sig = extract_signature(code, Language::Rust, "");
         assert!(sig.contains("pub struct Config"));
         assert!(sig.contains("{ ... }"));
         assert!(!sig.contains("pub name"));

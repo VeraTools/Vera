@@ -341,7 +341,7 @@ pub fn output_results(
     let compacted: Vec<String> = if compact {
         results
             .iter()
-            .map(|r| extract_signature(&r.content, r.language))
+            .map(|r| extract_signature(&r.content, r.language, &r.file_path))
             .collect()
     } else {
         Vec::new()

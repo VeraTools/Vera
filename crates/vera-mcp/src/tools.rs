@@ -42,7 +42,7 @@ fn compact_results_json(
     let signatures: Vec<String> = if signatures_only {
         results
             .iter()
-            .map(|r| extract_signature(&r.content, r.language))
+            .map(|r| extract_signature(&r.content, r.language, &r.file_path))
             .collect()
     } else {
         Vec::new()
