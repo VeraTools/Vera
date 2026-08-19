@@ -244,7 +244,7 @@ fn print_update_summary(summary: &vera_core::indexing::UpdateSummary) {
         + summary.files_added
         + summary.files_deleted
         + summary.files_deferred;
-    if total_pending == 0 {
+    if total_pending == 0 && summary.parse_errors.is_empty() {
         println!();
         println!("  Index is up to date — no changes detected.");
     }

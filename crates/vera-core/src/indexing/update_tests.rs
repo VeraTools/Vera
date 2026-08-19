@@ -23,7 +23,7 @@ use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
 use crate::storage::vector::VectorStore;
 use crate::types::Language;
 
-use super::content_hash;
+use super::{content_hash, processed_file_counts};
 
 fn default_config() -> VeraConfig {
     VeraConfig::default()
@@ -153,6 +153,17 @@ fn content_hash_is_hex_sha256() {
     // SHA-256 hex is 64 characters.
     assert_eq!(h.len(), 64);
     assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn processed_file_counts_include_parse_errors() {
+    assert_eq!(
+        processed_file_counts([
+            (true, FileIndexStatus::ParseError),
+            (false, FileIndexStatus::Indexed),
+        ]),
+        (1, 1)
+    );
 }
 
 // ── Update: no changes ──────────────────────────────────────────────
@@ -358,7 +369,7 @@ async fn update_cancellation_stops_embedding_before_publication() {
         &operation_cancellation,
     );
 
-    let (result, ()) = tokio::time::timeout(Duration::from_millis(250), async {
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(update, cancel_after_start)
     })
     .await

@@ -40,9 +40,9 @@ use super::pipeline::FileError;
 /// Summary of an incremental update run.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UpdateSummary {
-    /// Files that were modified and re-indexed.
+    /// Files that were modified and processed.
     pub files_modified: usize,
-    /// New files that were indexed.
+    /// New files that were processed.
     pub files_added: usize,
     /// Files that were deleted from the index.
     pub files_deleted: usize,
@@ -104,6 +104,20 @@ struct PreparedFile {
     references: Vec<parsing::references::RawReference>,
     type_relations: Vec<parsing::type_relations::RawTypeRelation>,
     state: FileIndexState,
+}
+
+fn processed_file_counts(
+    files: impl IntoIterator<Item = (bool, FileIndexStatus)>,
+) -> (usize, usize) {
+    files
+        .into_iter()
+        .fold((0, 0), |(modified, added), (is_modified, _status)| {
+            if is_modified {
+                (modified + 1, added)
+            } else {
+                (modified, added + 1)
+            }
+        })
 }
 
 /// Compute a SHA-256 content hash for a file's contents.
@@ -571,14 +585,11 @@ where
     } else {
         super::truncate_embeddings(&mut embeddings, stored_dim)
     };
-    let successful_modified = prepared_files
-        .iter()
-        .filter(|file| file.modified && file.state.status == FileIndexStatus::Indexed)
-        .count();
-    let successful_added = prepared_files
-        .iter()
-        .filter(|file| !file.modified && file.state.status == FileIndexStatus::Indexed)
-        .count();
+    let (processed_modified, processed_added) = processed_file_counts(
+        prepared_files
+            .iter()
+            .map(|file| (file.modified, file.state.status)),
+    );
 
     if !deleted.is_empty() || !prepared_files.is_empty() {
         let vector_path = idx_dir.join("vectors.db");
@@ -589,6 +600,7 @@ where
             Bm25Index::open(&bm25_dir).context("failed to open BM25 index for update")?;
 
         // All parsing and embedding work is complete. Writes below publish the prepared update.
+        cancellation.check()?;
         for file_path in &deleted {
             remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
         }
@@ -662,8 +674,8 @@ where
     on_progress(UpdateProgress::StorageDone);
 
     let summary = UpdateSummary {
-        files_modified: successful_modified,
-        files_added: successful_added,
+        files_modified: processed_modified,
+        files_added: processed_added,
         files_deleted: deleted.len(),
         files_unchanged: unchanged,
         files_with_tree_sitter_errors: file_states
