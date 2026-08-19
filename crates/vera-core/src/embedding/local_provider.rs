@@ -353,7 +353,7 @@ impl LocalEmbeddingProvider {
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
-        let _ = build_session(ep, asset_paths.onnx_path, 0, &config)?;
+        let _ = build_session(ep, asset_paths.onnx_path, 0)?;
         Ok(())
     }
 
@@ -362,7 +362,7 @@ impl LocalEmbeddingProvider {
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let asset_paths = config.cached_asset_paths()?;
-        let mut session = build_session(ep, asset_paths.onnx_path, 0, &config)?;
+        let mut session = build_session(ep, asset_paths.onnx_path, 0)?;
         let tokenizer = load_tokenizer(asset_paths.tokenizer_path, config.max_length)?;
         run_probe_inference(&mut session, &tokenizer)
     }
@@ -602,11 +602,8 @@ async fn load_embedding_components(
     let tokenizer =
         task::spawn_blocking(move || load_tokenizer(tokenizer_path, tokenizer_max_length))
             .await??;
-    let session_config = config.clone();
-    let session = task::spawn_blocking(move || {
-        build_session(ep, onnx_path, gpu_mem_limit_mb, &session_config)
-    })
-    .await??;
+    let session =
+        task::spawn_blocking(move || build_session(ep, onnx_path, gpu_mem_limit_mb)).await??;
 
     Ok((session, tokenizer))
 }
@@ -829,13 +826,16 @@ fn resolve_provider_and_config(
     (ep, resolved)
 }
 
+/// Build an ONNX Runtime session on an already-resolved execution provider.
+///
+/// `ep` must come from [`resolve_provider_and_config`], and `onnx_path` from
+/// the config it returned. Resolving again here would duplicate the provider
+/// contract in two places that could drift apart.
 fn build_session(
     ep: OnnxExecutionProvider,
     onnx_path: std::path::PathBuf,
     gpu_mem_limit_mb: u64,
-    config: &LocalEmbeddingModelConfig,
 ) -> Result<Session> {
-    let ep = crate::local_models::embedding_execution_provider(ep, config);
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -1007,6 +1007,63 @@ fn register_execution_provider(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // Asset-free: these exercise the provider/config contract directly, so
+    // they still run when ONNX Runtime is absent (unlike the tests below,
+    // which return early and pass without asserting anything).
+
+    #[test]
+    fn coreml_pins_coderankembed_to_cpu_but_leaves_other_models_alone() {
+        let (ep, _) = resolve_provider_and_config(
+            OnnxExecutionProvider::CoreMl,
+            &LocalEmbeddingModelConfig::coderankembed(),
+        );
+        assert_eq!(ep, OnnxExecutionProvider::Cpu);
+
+        let (ep, _) = resolve_provider_and_config(
+            OnnxExecutionProvider::CoreMl,
+            &LocalEmbeddingModelConfig::jina(),
+        );
+        assert_eq!(ep, OnnxExecutionProvider::CoreMl);
+    }
+
+    #[test]
+    fn config_is_adjusted_for_the_effective_provider_not_the_requested_one() {
+        // A model pinned to CPU must not be handed the GPU ONNX export: the
+        // session would then load fp16 weights it cannot run on CPU.
+        let coderank = LocalEmbeddingModelConfig::coderankembed();
+        let (_, resolved) = resolve_provider_and_config(OnnxExecutionProvider::CoreMl, &coderank);
+        assert_eq!(resolved.onnx_file, coderank.onnx_file);
+
+        // An unpinned model keeps the GPU adjustment it would get anyway.
+        let jina = LocalEmbeddingModelConfig::jina();
+        let (_, resolved) = resolve_provider_and_config(OnnxExecutionProvider::CoreMl, &jina);
+        let mut expected = jina.clone();
+        expected.adjust_for_gpu(OnnxExecutionProvider::CoreMl);
+        assert_eq!(resolved.onnx_file, expected.onnx_file);
+    }
+
+    #[test]
+    fn resolution_is_idempotent_so_build_session_need_not_repeat_it() {
+        // `build_session` no longer re-resolves the provider; it trusts what
+        // the caller passes. Resolving an already-resolved pair must be a
+        // no-op, or a second pass anywhere would change the answer.
+        for config in [
+            LocalEmbeddingModelConfig::coderankembed(),
+            LocalEmbeddingModelConfig::jina(),
+        ] {
+            for requested in [
+                OnnxExecutionProvider::CoreMl,
+                OnnxExecutionProvider::Cpu,
+                OnnxExecutionProvider::Cuda,
+            ] {
+                let (ep, resolved) = resolve_provider_and_config(requested, &config);
+                let (twice_ep, twice_resolved) = resolve_provider_and_config(ep, &resolved);
+                assert_eq!(ep, twice_ep);
+                assert_eq!(resolved.onnx_file, twice_resolved.onnx_file);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_local_embedding_provider() {
