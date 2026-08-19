@@ -621,6 +621,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn definitions_find_const_assigned_functions() {
+        let dir = index_repo(&[(
+            "src/shapes.ts",
+            "export function declaredFn(a: number): number { return a; }\n\
+             export const arrowFn = (a: number): number => a;\n\
+             export const MyButton: React.FC = () => null;\n",
+        )])
+        .await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        for symbol in ["declaredFn", "arrowFn", "MyButton"] {
+            let results = search_structural(
+                &index_dir,
+                StructuralSearchKind::Definitions,
+                Some(symbol),
+                10,
+                &SearchFilters::default(),
+            )
+            .unwrap();
+            assert_eq!(results.len(), 1, "no definition found for {symbol}");
+            assert_eq!(results[0].symbol_name.as_deref(), Some(symbol));
+        }
+    }
+
+    #[tokio::test]
     async fn env_reads_find_common_patterns() {
         let dir = index_repo(&[
             ("src/app.ts", "const db = process.env.DATABASE_URL;\n"),

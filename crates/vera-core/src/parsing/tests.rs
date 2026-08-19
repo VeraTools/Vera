@@ -4,7 +4,7 @@
 //! Tier 0 fallback, large symbol splitting, and edge cases.
 
 use crate::config::IndexingConfig;
-use crate::parsing::test_support::{default_config, parse};
+use crate::parsing::test_support::{default_config, find_chunk, parse};
 use crate::parsing::{parse_and_chunk, parse_file_with_diagnostics};
 use crate::types::{Language, SymbolType};
 
@@ -265,6 +265,61 @@ type Point = { x: number; y: number };
         .iter()
         .find(|c| c.symbol_type == Some(SymbolType::TypeAlias));
     assert!(ta.is_some(), "should have type alias chunk");
+}
+
+#[test]
+fn typescript_const_assigned_functions_are_named() {
+    let source = r#"export function declaredFn(a: number): number { return a; }
+export const arrowFn = (a: number): number => a;
+export const typedArrow: (a: number) => number = (a) => a;
+export const asyncArrow = async () => {};
+export const exprFn = function (a: number) { return a; };
+export const plainConst = 42;
+"#;
+    let chunks = parse(source, "shapes.ts", Language::TypeScript);
+
+    for name in [
+        "declaredFn",
+        "arrowFn",
+        "typedArrow",
+        "asyncArrow",
+        "exprFn",
+    ] {
+        assert_eq!(
+            find_chunk(&chunks, name).symbol_type,
+            Some(SymbolType::Function),
+            "{name} binds a function"
+        );
+    }
+
+    // Whether plain value consts should be indexed as named symbols is a
+    // separate call; this fix deliberately leaves them as they were.
+    assert!(
+        chunks
+            .iter()
+            .all(|c| c.symbol_name.as_deref() != Some("plainConst")),
+        "value consts should keep their existing shape"
+    );
+
+    let arrow = chunks
+        .iter()
+        .find(|c| c.symbol_name.as_deref() == Some("arrowFn"))
+        .unwrap();
+    assert!(
+        arrow.content.contains("export const arrowFn"),
+        "chunk should span the whole declaration: {:?}",
+        arrow.content
+    );
+}
+
+#[test]
+fn typescript_multi_declarator_statements_are_unchanged() {
+    let source = "const a = () => 1, b = () => 2;\n";
+    let chunks = parse(source, "multi.ts", Language::TypeScript);
+    assert!(
+        chunks.iter().all(|c| c.symbol_name.as_deref() != Some("a")),
+        "multi-declarator statements keep their existing chunk shape"
+    );
 }
 
 // =========================================================

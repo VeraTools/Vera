@@ -207,6 +207,43 @@ pub(super) fn get_elixir_do_block<'a>(
         .find(|child| child.kind() == "do_block")
 }
 
+/// Extract `const name = () => {}` and `const name = function () {}` as a named
+/// function symbol.
+///
+/// The name sits on the `variable_declarator`, not on the declaration itself,
+/// so the generic name lookup finds nothing and the symbol is stored unnamed.
+/// That is what makes const-assigned components and utilities unreachable from
+/// `structural definitions`.
+///
+/// Returns `None` for anything else, including multi-declarator statements and
+/// bindings to plain values, so those keep their existing chunk shape. The
+/// symbol spans the whole declaration, keeping the `const` keyword and any
+/// `export` in the chunk.
+pub(super) fn extract_js_function_binding(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<RawSymbol> {
+    let mut cursor = node.walk();
+    let mut declarators = node
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "variable_declarator");
+    let declarator = declarators.next()?;
+    if declarators.next().is_some() {
+        return None;
+    }
+
+    let value = declarator.child_by_field_name("value")?;
+    if !matches!(
+        value.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    ) {
+        return None;
+    }
+
+    let name = extract_name(&declarator, source)?;
+    Some(RawSymbol::at(node, Some(name), SymbolType::Function))
+}
+
 /// Refine a Go type_spec into the correct SymbolType based on the type child.
 pub(super) fn refine_go_type_spec(node: &tree_sitter::Node<'_>, source: &[u8]) -> SymbolType {
     if let Some(type_child) = node.child_by_field_name("type") {

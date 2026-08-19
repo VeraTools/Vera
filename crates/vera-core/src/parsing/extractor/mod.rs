@@ -160,6 +160,17 @@ fn collect_symbols(
         }
     }
 
+    // Handle TS/JS `const name = () => {}`: the name lives on the declarator,
+    // and a function initialiser makes the binding a function, not a variable.
+    if (lang == Language::TypeScript || lang == Language::JavaScript)
+        && matches!(kind, "lexical_declaration" | "variable_declaration")
+    {
+        if let Some(sym) = extract_js_function_binding(&node, source) {
+            symbols.push(sym);
+            return;
+        }
+    }
+
     // Handle Zig variable_declaration -> struct_declaration
     if lang == Language::Zig && kind == "variable_declaration" {
         let mut cursor = node.walk();
