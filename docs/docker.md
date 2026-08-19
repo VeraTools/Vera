@@ -7,7 +7,7 @@ Vera provides Docker images for running the MCP server (or any Vera command) in 
 | `vera:cpu` | `debian:trixie-slim` | ~150 MB | Default, works everywhere |
 | `vera:cuda` | `nvidia/cuda:13.1.1-runtime` | ~4 GB | NVIDIA GPU acceleration |
 | `vera:rocm` | `rocm/dev-ubuntu-24.04:6.4.4` | ~8 GB | AMD GPU acceleration |
-| `vera:openvino` | `debian:trixie-slim` + OpenVINO | ~1 GB | Intel GPU/iGPU acceleration |
+| `vera:openvino` | `ubuntu:24.04` + OpenVINO | ~1 GB | Intel GPU/iGPU acceleration |
 
 ## Running the MCP server
 

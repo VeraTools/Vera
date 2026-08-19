@@ -49,11 +49,12 @@ jobs:
             tag_suffix: openvino
 
     steps:
-      # Checkout the requested tag so the Dockerfiles match what the release
-      # workflow published for it, regardless of which ref was dispatched.
+      # Checkout the dispatched ref (the workflow's own revision), not the
+      # release tag: Dockerfiles evolve to fix build breakage (e.g. the
+      # openvino base-image fix), and a tag created before such a fix would
+      # check out a Dockerfile that no longer builds. The release binary is
+      # still pinned to the requested tag via the asset download below.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
 
       - name: Download release binary
         env:
