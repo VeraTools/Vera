@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use tracing::warn;
 
 use crate::config::IndexingConfig;
@@ -125,25 +126,45 @@ fn count_modified_files(
     metadata_store: &MetadataStore,
     repo_root: &Path,
 ) -> Result<usize> {
-    let mut files_modified = 0usize;
-    for (rel_path, absolute_path) in current_files
+    let tracked_current: Vec<(&String, &PathBuf)> = current_files
         .iter()
         .filter(|(path, _)| tracked_files.contains(path.as_str()))
-    {
-        let content = match crate::discovery::read_source_lossy(absolute_path) {
-            Ok(content) => content,
-            Err(err) => {
-                warn!(
-                    file = %rel_path,
-                    error = %err,
-                    "failed to read file during freshness scan"
-                );
-                files_modified += 1;
-                continue;
-            }
+        .collect();
+
+    // Reading and hashing is I/O and CPU bound, so it runs under rayon. The
+    // metadata lookup that follows stays sequential: `MetadataStore` wraps a
+    // single SQLite connection and is not `Sync`, so it cannot be called from
+    // several rayon threads at once.
+    //
+    // `None` means the file could not be read. It is counted as modified
+    // rather than skipped, so an unreadable tracked file cannot make a stale
+    // index look current (#74).
+    let hashed: Vec<(&String, Option<String>)> = tracked_current
+        .par_iter()
+        .map(|(rel_path, absolute_path)| {
+            let content = match crate::discovery::read_source_lossy(absolute_path) {
+                Ok(content) => content,
+                Err(err) => {
+                    warn!(
+                        file = %rel_path,
+                        error = %err,
+                        "failed to read file during freshness scan"
+                    );
+                    return (*rel_path, None);
+                }
+            };
+            let language = detect_language_for_path(rel_path);
+            let current_hash = hash_for_indexing_source(&content, rel_path, language, repo_root);
+            (*rel_path, Some(current_hash))
+        })
+        .collect();
+
+    let mut files_modified = 0usize;
+    for (rel_path, current_hash) in hashed {
+        let Some(current_hash) = current_hash else {
+            files_modified += 1;
+            continue;
         };
-        let language = detect_language_for_path(rel_path);
-        let current_hash = hash_for_indexing_source(&content, rel_path, language, repo_root);
         let stored_hash = metadata_store
             .get_file_hash(rel_path)
             .with_context(|| format!("failed to read stored hash for {rel_path}"))?;

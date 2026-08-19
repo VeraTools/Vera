@@ -610,29 +610,21 @@ fn store_index(
         .insert_chunks(chunks)
         .context("failed to insert chunk metadata")?;
 
-    // Store file content hashes for incremental indexing.
-    for (file_path, hash) in file_hashes {
-        metadata_store
-            .set_file_hash(file_path, hash)
-            .context("failed to store file hash")?;
-    }
+    // Store file content hashes for incremental indexing, batched into a
+    // single transaction instead of one commit per file.
+    metadata_store
+        .set_file_hashes_batch(file_hashes)
+        .context("failed to store file hashes")?;
 
     metadata_store
         .insert_file_states(metadata.file_states)
         .context("failed to store file index states")?;
 
-    // Store call-site references for call graph analysis.
-    for (file_path, refs) in file_refs {
-        metadata_store
-            .insert_references(file_path, refs)
-            .context("failed to store references")?;
-    }
-
-    for (file_path, relations) in file_type_relations {
-        metadata_store
-            .insert_type_relations(file_path, relations)
-            .context("failed to store type relations")?;
-    }
+    // Store call-site references and type relations for call graph analysis,
+    // batched into a single transaction instead of up to two commits per file.
+    metadata_store
+        .insert_parse_artifacts_batch(file_refs, file_type_relations)
+        .context("failed to store references and type relations")?;
 
     metadata_store
         .set_index_meta("model_name", metadata.model_name)

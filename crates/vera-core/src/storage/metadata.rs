@@ -3,6 +3,8 @@
 //! Stores chunk metadata (file path, line ranges, language, symbol info)
 //! in a SQLite database. Uses WAL mode for concurrent read performance.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -344,6 +346,42 @@ impl MetadataStore {
         }
     }
 
+    /// Get multiple chunks by id in a single query.
+    ///
+    /// Returns a lookup map keyed by chunk id rather than a `Vec`, because
+    /// SQLite does not preserve any particular row order for `IN (...)`
+    /// queries. Callers that need results in a specific order (e.g.
+    /// vector-distance ranking) must re-project from the map themselves.
+    pub fn get_chunks_by_ids(&self, ids: &[String]) -> Result<HashMap<String, Chunk>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, file_path, line_start, line_end, content, language,
+                    symbol_type, symbol_name
+             FROM chunks WHERE id IN ({placeholders})"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("failed to prepare batch chunk query")?;
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                Ok(row_to_chunk(row))
+            })
+            .context("failed to query chunks by id batch")?;
+
+        let chunks: Vec<Chunk> = collect_rows(rows)?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(chunks.into_iter().map(|c| (c.id.clone(), c)).collect())
+    }
+
     /// Get all chunks for a given file path.
     pub fn get_chunks_by_file(&self, file_path: &str) -> Result<Vec<Chunk>> {
         let mut stmt = self
@@ -534,14 +572,7 @@ impl MetadataStore {
 
     /// Store a file content hash for incremental indexing.
     pub fn set_file_hash(&self, file_path: &str, hash: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO file_hashes (file_path, content_hash)
-                 VALUES (?1, ?2)",
-                params![file_path, hash],
-            )
-            .context("failed to set file hash")?;
-        Ok(())
+        self.set_file_hashes_batch(&[(file_path.to_string(), hash.to_string())])
     }
 
     /// Get the stored content hash for a file.
@@ -622,25 +653,7 @@ impl MetadataStore {
         file_path: &str,
         refs: &[crate::parsing::references::RawReference],
     ) -> Result<()> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .context("failed to begin reference transaction")?;
-        {
-            let mut stmt = self
-                .conn
-                .prepare_cached(
-                    "INSERT INTO [references] (file_path, line, callee, caller)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )
-                .context("failed to prepare reference insert")?;
-            for r in refs {
-                stmt.execute(params![file_path, r.line, r.callee, r.caller])
-                    .context("failed to insert reference")?;
-            }
-        }
-        tx.commit().context("failed to commit reference inserts")?;
-        Ok(())
+        self.insert_parse_artifacts_batch(&[(file_path.to_string(), refs.to_vec())], &[])
     }
 
     /// Insert a batch of explicit type relations for a single file.
@@ -649,31 +662,96 @@ impl MetadataStore {
         file_path: &str,
         relations: &[RawTypeRelation],
     ) -> Result<()> {
+        self.insert_parse_artifacts_batch(&[], &[(file_path.to_string(), relations.to_vec())])
+    }
+
+    /// Store content hashes for many files in a single transaction.
+    ///
+    /// Equivalent to calling [`Self::set_file_hash`] once per file, but
+    /// issues one commit for the whole batch instead of one per file.
+    pub fn set_file_hashes_batch(&self, hashes: &[(String, String)]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
         let tx = self
             .conn
             .unchecked_transaction()
-            .context("failed to begin type relation transaction")?;
+            .context("failed to begin file hash batch transaction")?;
         {
-            let mut stmt = self
-                .conn
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO file_hashes (file_path, content_hash)
+                     VALUES (?1, ?2)",
+                )
+                .context("failed to prepare batch file hash insert")?;
+            for (file_path, hash) in hashes {
+                stmt.execute(params![file_path, hash])
+                    .with_context(|| format!("failed to set file hash: {file_path}"))?;
+            }
+        }
+        tx.commit().context("failed to commit file hash batch")?;
+        Ok(())
+    }
+
+    /// Store call-site references and type relations for many files in a
+    /// single transaction.
+    ///
+    /// Equivalent to calling [`Self::insert_references`] and
+    /// [`Self::insert_type_relations`] once per file, but issues one commit
+    /// for the whole batch instead of up to two per file.
+    pub fn insert_parse_artifacts_batch(
+        &self,
+        file_refs: &[(String, Vec<crate::parsing::references::RawReference>)],
+        file_type_relations: &[(String, Vec<RawTypeRelation>)],
+    ) -> Result<()> {
+        if file_refs.is_empty() && file_type_relations.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin parse artifacts batch transaction")?;
+        {
+            let mut ref_stmt = tx
+                .prepare_cached(
+                    "INSERT INTO [references] (file_path, line, callee, caller)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .context("failed to prepare batch reference insert")?;
+            for (file_path, refs) in file_refs {
+                for r in refs {
+                    ref_stmt
+                        .execute(params![file_path, r.line, r.callee, r.caller])
+                        .with_context(|| format!("failed to insert reference for {file_path}"))?;
+                }
+            }
+
+            let mut relation_stmt = tx
                 .prepare_cached(
                     "INSERT INTO type_relations (file_path, line, owner, target, kind)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 )
-                .context("failed to prepare type relation insert")?;
-            for relation in relations {
-                stmt.execute(params![
-                    file_path,
-                    relation.line,
-                    relation.owner,
-                    relation.target,
-                    relation.kind.as_str(),
-                ])
-                .context("failed to insert type relation")?;
+                .context("failed to prepare batch type relation insert")?;
+            for (file_path, relations) in file_type_relations {
+                for relation in relations {
+                    relation_stmt
+                        .execute(params![
+                            file_path,
+                            relation.line,
+                            relation.owner,
+                            relation.target,
+                            relation.kind.as_str(),
+                        ])
+                        .with_context(|| {
+                            format!("failed to insert type relation for {file_path}")
+                        })?;
+                }
             }
         }
         tx.commit()
-            .context("failed to commit type relation inserts")?;
+            .context("failed to commit parse artifacts batch")?;
         Ok(())
     }
 

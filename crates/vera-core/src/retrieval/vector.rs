@@ -84,17 +84,21 @@ pub async fn search_vector_with_stores(
     );
 
     // 3. Hydrate results from metadata store and convert distances to scores.
+    // Fetched in a single batch query instead of one query per candidate
+    // (N+1). SQLite does not preserve `IN (...)` row order, so results are
+    // re-projected back into the original vector-distance order below.
+    let ids: Vec<String> = vector_results
+        .iter()
+        .map(|vr| vr.chunk_id.clone())
+        .collect();
+    let mut chunk_by_id = metadata_store.get_chunks_by_ids(&ids).map_err(|e| {
+        VectorSearchError::StorageError(e.context("failed to batch-fetch chunk metadata"))
+    })?;
+
     let mut results = Vec::with_capacity(vector_results.len());
 
     for vr in &vector_results {
-        let chunk = metadata_store.get_chunk(&vr.chunk_id).map_err(|e| {
-            VectorSearchError::StorageError(e.context(format!(
-                "failed to fetch metadata for chunk: {}",
-                vr.chunk_id
-            )))
-        })?;
-
-        let Some(chunk) = chunk else {
+        let Some(chunk) = chunk_by_id.remove(&vr.chunk_id) else {
             debug!(
                 chunk_id = %vr.chunk_id,
                 "chunk metadata not found, skipping"
@@ -197,8 +201,10 @@ fn distance_to_similarity(distance: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use crate::embedding::test_helpers::MockProvider;
     use crate::types::{Chunk, Language, SymbolType};
+    use std::collections::HashMap;
 
     /// The pool must never ask sqlite-vec for more than it will serve, and must
     /// report the shortfall so a degraded pool is diagnosable rather than silent.
@@ -633,6 +639,123 @@ mod tests {
                 .unwrap();
 
         assert!(results.is_empty(), "empty store should return no results");
+    }
+
+    #[tokio::test]
+    async fn batch_chunk_fetch_preserves_vector_distance_order() {
+        // Regression test for the N+1 -> batch fetch change: insert chunks
+        // in an order different from the requested id order, and assert the
+        // search results come back in vector-distance order (the order `vr`
+        // came in), not whatever order SQLite happens to return for
+        // `IN (...)` (unspecified) or insertion order.
+        let dim = 8;
+        let metadata_store = MetadataStore::open_in_memory().unwrap();
+
+        // Inserted in id order, which is also the order `WHERE id IN (...)`
+        // returns rows in (the chunks table keys on id). The mock provider
+        // ranks these contents c, a, b by distance, so the expected result
+        // order differs from both — which is what makes the assertions below
+        // able to fail.
+        let chunks = vec![
+            Chunk {
+                id: "a".to_string(),
+                file_path: "src/a.rs".to_string(),
+                line_start: 1,
+                line_end: 2,
+                content: "fn a() {}".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("a".to_string()),
+            },
+            Chunk {
+                id: "b".to_string(),
+                file_path: "src/b.rs".to_string(),
+                line_start: 1,
+                line_end: 2,
+                content: "fn b() {}".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("b".to_string()),
+            },
+            Chunk {
+                id: "c".to_string(),
+                file_path: "src/c.rs".to_string(),
+                line_start: 1,
+                line_end: 2,
+                content: "fn c() {}".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("c".to_string()),
+            },
+        ];
+        metadata_store.insert_chunks(&chunks).unwrap();
+
+        let vector_store = VectorStore::open_in_memory(dim).unwrap();
+        let provider = MockProvider::new(dim);
+        crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &chunks)
+            .await;
+
+        // Ground truth: the distance order the vector store itself reports.
+        // Every candidate must come back paired with its own distance.
+        let query_embedding = generate_query_embedding(&provider, "fn", dim)
+            .await
+            .unwrap();
+        let vector_results = vector_store.search(&query_embedding, chunks.len()).unwrap();
+        assert_eq!(vector_results.len(), chunks.len());
+
+        let chunk_by_id: HashMap<&str, &Chunk> =
+            chunks.iter().map(|c| (c.id.as_str(), c)).collect();
+        let expected: Vec<(&str, &str, f64)> = vector_results
+            .iter()
+            .map(|vr| {
+                let chunk = chunk_by_id[vr.chunk_id.as_str()];
+                (
+                    chunk.file_path.as_str(),
+                    chunk.content.as_str(),
+                    distance_to_similarity(vr.distance),
+                )
+            })
+            .collect();
+
+        // Guard that the fixture actually discriminates: if the distance order
+        // happened to equal insertion order or the `IN (...)` primary-key
+        // order, the assertions below would pass without testing anything.
+        let expected_paths: Vec<&str> = expected.iter().map(|(path, _, _)| *path).collect();
+        let insertion_paths: Vec<&str> = chunks.iter().map(|c| c.file_path.as_str()).collect();
+        let mut lexicographic_paths = insertion_paths.clone();
+        lexicographic_paths.sort_unstable();
+        assert_ne!(
+            expected_paths, insertion_paths,
+            "fixture is not discriminating: distance order equals insertion order"
+        );
+        assert_ne!(
+            expected_paths, lexicographic_paths,
+            "fixture is not discriminating: distance order equals primary-key order"
+        );
+
+        let results =
+            search_vector_with_stores(&vector_store, &metadata_store, &provider, "fn", 10)
+                .await
+                .unwrap();
+
+        // Assert the pairing, not just that scores descend. Scores descend for
+        // any implementation that emits one result per candidate in candidate
+        // order, because the vector store already returns rows sorted by
+        // distance — so a monotonicity check cannot catch chunks being paired
+        // with the wrong neighbour's distance.
+        assert_eq!(
+            results.len(),
+            expected.len(),
+            "batch fetch dropped candidates"
+        );
+        let actual: Vec<(&str, &str, f64)> = results
+            .iter()
+            .map(|r| (r.file_path.as_str(), r.content.as_str(), r.score))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "each chunk must come back paired with its own distance, in vector-distance order"
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
@@ -29,6 +30,8 @@ use crate::embedding::{
     EmbeddingError, EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation,
 };
 use crate::parsing;
+use crate::parsing::references::RawReference;
+use crate::parsing::type_relations::RawTypeRelation;
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
 use crate::storage::vector::VectorStore;
@@ -451,18 +454,27 @@ where
     let mut parse_errors = Vec::new();
 
     if !files_to_index.is_empty() {
-        // Parse and chunk new/modified files.
-        for (rel_path, content, hash, is_modified) in &files_to_index {
-            cancellation.check()?;
-            let language = detect_language_for_path(rel_path);
+        // Parse and chunk new/modified files. Tree-sitter parsing is CPU-bound,
+        // so this is parallelized with rayon (mirrors pipeline.rs's full-index
+        // path). Results are still staged in `PreparedFile` and written only
+        // after embedding succeeds. Parallelism here must not move any write
+        // earlier.
+        let parsed: Vec<(PreparedFile, Option<FileError>)> = files_to_index
+            .par_iter()
+            .map(|(rel_path, content, hash, is_modified)| {
+                cancellation.check()?;
+                let language = detect_language_for_path(rel_path);
 
-            // For RST, refs come from raw source; chunks from preprocessed.
-            // For all other languages, parse once for both.
-            let (chunks, refs, file_state) = if language == Language::Rst {
-                let refs = parsing::parse_and_extract_references(content, language);
-                let absolute_path = repo_root.join(rel_path);
-                let normalized_source =
-                    match parsing::sphinx::preprocess_rst(content, &absolute_path, &repo_root) {
+                // For RST, refs come from raw source; chunks from preprocessed.
+                // For all other languages, parse once for both.
+                let (chunks, refs, file_state, parse_error) = if language == Language::Rst {
+                    let refs = parsing::parse_and_extract_references(content, language);
+                    let absolute_path = repo_root.join(rel_path);
+                    let normalized_source = match parsing::sphinx::preprocess_rst(
+                        content,
+                        &absolute_path,
+                        &repo_root,
+                    ) {
                         Ok(preprocessed) => Some(preprocessed),
                         Err(err) => {
                             warn!(
@@ -473,38 +485,45 @@ where
                             None
                         }
                     };
-                let src = normalized_source.as_deref().unwrap_or(content);
-                chunk_file_for_update(
-                    src,
-                    rel_path,
-                    language,
-                    config,
-                    Some(refs),
-                    &mut parse_errors,
-                )
-            } else {
-                chunk_file_for_update(content, rel_path, language, config, None, &mut parse_errors)
-            };
+                    let src = normalized_source.as_deref().unwrap_or(content);
+                    chunk_file_for_update(src, rel_path, language, config, Some(refs))
+                } else {
+                    chunk_file_for_update(content, rel_path, language, config, None)
+                };
 
-            let type_relations = parsing::type_relations::extract_type_relations(&chunks);
+                let type_relations = parsing::type_relations::extract_type_relations(&chunks);
 
-            debug!(
-                file = %rel_path,
-                chunks = chunks.len(),
-                refs = refs.len(),
-                type_relations = type_relations.len(),
-                "parsed file"
-            );
+                debug!(
+                    file = %rel_path,
+                    chunks = chunks.len(),
+                    refs = refs.len(),
+                    type_relations = type_relations.len(),
+                    "parsed file"
+                );
 
-            prepared_files.push(PreparedFile {
-                path: rel_path.clone(),
-                hash: hash.clone(),
-                modified: *is_modified,
-                chunks,
-                references: refs,
-                type_relations,
-                state: file_state,
-            });
+                Ok((
+                    PreparedFile {
+                        path: rel_path.clone(),
+                        hash: hash.clone(),
+                        modified: *is_modified,
+                        chunks,
+                        references: refs,
+                        type_relations,
+                        state: file_state,
+                    },
+                    parse_error,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        cancellation.check()?;
+
+        // `files_to_index` order is preserved by `collect`, so the sequential
+        // and parallel paths produce identical `prepared_files` ordering.
+        for (prepared, parse_error) in parsed {
+            prepared_files.push(prepared);
+            if let Some(parse_error) = parse_error {
+                parse_errors.push(parse_error);
+            }
         }
     }
 
@@ -640,18 +659,23 @@ where
                 .delete_file_state(&file.path)
                 .with_context(|| format!("failed to delete file state for {}", file.path))?;
         }
-        for file in &prepared_files {
-            if !file.references.is_empty() {
-                metadata_store
-                    .insert_references(&file.path, &file.references)
-                    .context("failed to store references")?;
-            }
-            if !file.type_relations.is_empty() {
-                metadata_store
-                    .insert_type_relations(&file.path, &file.type_relations)
-                    .context("failed to store type relations")?;
-            }
-        }
+        // Batched into a single transaction instead of up to two commits per
+        // file. This stays at the same point in the sequence as the per-file
+        // writes it replaces, so the "nothing is replaced until embedding
+        // succeeds" guarantee is unchanged.
+        let file_refs: Vec<(String, Vec<RawReference>)> = prepared_files
+            .iter()
+            .filter(|file| !file.references.is_empty())
+            .map(|file| (file.path.clone(), file.references.clone()))
+            .collect();
+        let file_type_relations: Vec<(String, Vec<RawTypeRelation>)> = prepared_files
+            .iter()
+            .filter(|file| !file.type_relations.is_empty())
+            .map(|file| (file.path.clone(), file.type_relations.clone()))
+            .collect();
+        metadata_store
+            .insert_parse_artifacts_batch(&file_refs, &file_type_relations)
+            .context("failed to store references and type relations")?;
 
         if !all_chunks.is_empty() {
             metadata_store
@@ -674,11 +698,13 @@ where
                 .insert_file_states(&file_states)
                 .context("failed to update file index states")?;
         }
-        for file in &prepared_files {
-            metadata_store
-                .set_file_hash(&file.path, &file.hash)
-                .context("failed to update file hash")?;
-        }
+        let file_hashes: Vec<(String, String)> = prepared_files
+            .iter()
+            .map(|file| (file.path.clone(), file.hash.clone()))
+            .collect();
+        metadata_store
+            .set_file_hashes_batch(&file_hashes)
+            .context("failed to update file hashes")?;
     }
 
     // ── 5. Get final counts ──────────────────────────────────────
@@ -730,11 +756,11 @@ fn chunk_file_for_update(
     language: Language,
     config: &VeraConfig,
     refs_override: Option<Vec<parsing::references::RawReference>>,
-    parse_errors: &mut Vec<FileError>,
 ) -> (
     Vec<crate::types::Chunk>,
     Vec<parsing::references::RawReference>,
     FileIndexState,
+    Option<FileError>,
 ) {
     let state =
         |status: FileIndexStatus, tree_has_error: bool, tier0_fallback: bool, chunk_count: u64| {
@@ -760,6 +786,7 @@ fn chunk_file_for_update(
                     diagnostics.used_tier0_fallback,
                     chunk_count,
                 ),
+                None,
             )
         }
         Err(err) => {
@@ -774,14 +801,14 @@ fn chunk_file_for_update(
                     "failed to chunk rst during update; keeping extracted references"
                 );
             }
-            parse_errors.push(FileError {
-                file_path: rel_path.to_string(),
-                error: err.to_string(),
-            });
             (
                 Vec::new(),
                 refs,
                 state(FileIndexStatus::ParseError, false, false, 0),
+                Some(FileError {
+                    file_path: rel_path.to_string(),
+                    error: err.to_string(),
+                }),
             )
         }
     }
