@@ -309,6 +309,13 @@ impl VectorStore {
     /// This is used for incremental indexing: when a file is re-indexed, all
     /// old chunks for that file (whose IDs start with "filepath:") are removed.
     pub fn delete_by_file_prefix(&self, prefix: &str) -> Result<u64> {
+        self.delete_by_file_prefix_after_scan(prefix, || {})
+    }
+
+    fn delete_by_file_prefix_after_scan<F>(&self, prefix: &str, after_scan: F) -> Result<u64>
+    where
+        F: FnOnce(),
+    {
         // A half-open range rather than `LIKE ?1 ESCAPE '\'`. The ESCAPE
         // clause disqualifies SQLite's LIKE-prefix optimization, so the LIKE
         // form scans `chunk_id_map` in full where a range seeks the index. It
@@ -330,6 +337,7 @@ impl VectorStore {
         .context("failed to begin prefix delete transaction")?;
 
         let rows = rowids_with_prefix(&tx, prefix)?;
+        after_scan();
         let count = rows.len() as u64;
         if count == 0 {
             return Ok(count);
@@ -780,18 +788,6 @@ mod tests {
 
     #[test]
     fn prefix_delete_takes_the_write_lock_before_it_scans() {
-        // Complements the release test above, which shows the transaction is
-        // committed but not when it opens. The race being guarded is
-        // scan-then-delete: a competing writer inserting a matching row
-        // between the two would survive while the method reported success.
-        // What removes it is that the transaction is IMMEDIATE and opened
-        // *before* the scan, so the write lock is held for the whole window.
-        //
-        // That ordering is observable without thread timing. With a competitor
-        // holding the write lock, taking it up front fails at BEGIN, before
-        // any scanning; scanning first and opening a DEFERRED transaction
-        // afterwards gets as far as the first DELETE. Asserting which step
-        // failed pins the ordering.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vectors.db");
         let store = VectorStore::open(&path, 4).unwrap();
@@ -799,31 +795,38 @@ mod tests {
             .insert_batch(&[("src/a.rs:0", &[1.0, 0.0, 0.0, 0.0][..])])
             .unwrap();
 
-        // rusqlite defaults to a 5s busy timeout; the contention here is
-        // deliberate, so fail fast rather than waiting it out.
-        store.conn.execute_batch("PRAGMA busy_timeout=0").unwrap();
-
         let competitor = VectorStore::open(&path, 4).unwrap();
         competitor
             .conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .expect("competing writer should take the write lock");
+            .execute_batch("PRAGMA busy_timeout=0")
+            .unwrap();
 
-        let err = store
-            .delete_by_file_prefix("src/a.rs:")
-            .expect_err("a held write lock must block the delete");
-        let chain = format!("{err:#}");
-        assert!(
-            chain.contains("begin prefix delete transaction"),
-            "should fail acquiring the lock before scanning, got: {chain}"
-        );
+        let deleted = store
+            .delete_by_file_prefix_after_scan("src/a.rs:", || {
+                let err = competitor
+                    .insert_batch(&[("src/a.rs:1", &[0.0, 1.0, 0.0, 0.0][..])])
+                    .expect_err("the prefix transaction must already hold the write lock");
+                assert!(
+                    err.chain().any(|cause| matches!(
+                        cause.downcast_ref::<rusqlite::Error>(),
+                        Some(rusqlite::Error::SqliteFailure(failure, _))
+                            if matches!(
+                                failure.code,
+                                rusqlite::ErrorCode::DatabaseBusy
+                                    | rusqlite::ErrorCode::DatabaseLocked
+                            )
+                    )),
+                    "competing write should fail because the database is locked: {err:#}"
+                );
+            })
+            .unwrap();
 
-        competitor.conn.execute_batch("ROLLBACK").unwrap();
-
-        // Nothing was deleted, and it works once the lock is free.
-        assert_eq!(store.count().unwrap(), 1);
-        assert_eq!(store.delete_by_file_prefix("src/a.rs:").unwrap(), 1);
+        assert_eq!(deleted, 1);
         assert_eq!(store.count().unwrap(), 0);
+        competitor
+            .insert_batch(&[("src/a.rs:1", &[0.0, 1.0, 0.0, 0.0][..])])
+            .unwrap();
+        assert_eq!(competitor.count().unwrap(), 1);
     }
 
     #[test]
