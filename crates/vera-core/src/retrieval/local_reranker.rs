@@ -391,8 +391,10 @@ fn register_execution_provider(
 mod tests {
     use super::*;
 
-    /// Asset-free, so it runs when ONNX Runtime is absent. The test below
-    /// early-returns in that case and passes without asserting anything.
+    /// Loads neither model assets nor ONNX Runtime, so it always runs and
+    /// always asserts. Deliberate: `test_local_reranker` below early-returns
+    /// when ONNX Runtime is not on the default lookup path, and would pass
+    /// without checking anything on a machine that lacks it.
     #[test]
     fn resolution_is_idempotent_so_build_session_need_not_repeat_it() {
         use crate::config::OnnxExecutionProvider as Ep;
