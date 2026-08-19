@@ -100,10 +100,14 @@ fn is_jsx_element_node(kind: &str) -> bool {
 /// and only those are call sites; recording host elements would add an edge per
 /// HTML tag in the repository.
 ///
-/// The test is ASCII-specific on purpose, matching what the transpilers do:
-/// Babel's `isCompatTag` is `/^[a-z]/` and TypeScript's `isIntrinsicJsxName`
-/// compares against `a`..`z`. A Unicode-aware lowercase test would classify
-/// `<éWidget />` as a host element and drop a real component reference.
+/// The rule mirrors TypeScript's `isIntrinsicJsxName`, which is
+/// `first char in a..z || name contains '-'`. Both halves matter:
+///
+/// - the range is ASCII on purpose. A Unicode-aware lowercase test would call
+///   `<éWidget />` a host element and drop a real component reference.
+/// - a hyphen makes the tag intrinsic whatever its case, because that is the
+///   custom-element form and TypeScript emits `<My-element />` as the string
+///   `"My-element"` rather than a value lookup.
 ///
 /// The decision has to come from the tag node, not from the extracted callee.
 /// `extract_callee` returns the rightmost identifier, so `<Icons.arrow />` yields
@@ -120,8 +124,9 @@ fn is_jsx_host_element(node: &tree_sitter::Node, source: &[u8]) -> bool {
     if name.kind() == "member_expression" {
         return false;
     }
-    name.utf8_text(source)
-        .is_ok_and(|text| text.starts_with(|ch: char| ch.is_ascii_lowercase()))
+    name.utf8_text(source).is_ok_and(|text| {
+        text.starts_with(|ch: char| ch.is_ascii_lowercase()) || text.contains('-')
+    })
 }
 
 /// Extract the callee name from a call node.
@@ -369,6 +374,7 @@ export function App() {
             <Panel.Header title="hi"></Panel.Header>
             <Icons.arrow />
             <éWidget />
+            <My-element />
         </div>
     );
 }
@@ -396,6 +402,11 @@ export function App() {
             callees.contains(&"éWidget"),
             "only ASCII a-z marks an intrinsic tag, so <éWidget /> is a \
              component reference: {callees:?}"
+        );
+        assert!(
+            !callees.contains(&"My-element"),
+            "a hyphen makes a tag intrinsic whatever its case, matching \
+             TypeScript's isIntrinsicJsxName: {callees:?}"
         );
         assert_eq!(
             refs.iter().filter(|r| r.callee == "Header").count(),
