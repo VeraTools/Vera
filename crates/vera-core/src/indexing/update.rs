@@ -22,9 +22,12 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+use crate::CancellationToken;
 use crate::config::VeraConfig;
 use crate::discovery;
-use crate::embedding::{EmbeddingProvider, embed_chunks_concurrent_with_progress};
+use crate::embedding::{
+    EmbeddingError, EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation,
+};
 use crate::parsing;
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
@@ -214,7 +217,38 @@ where
     P: EmbeddingProvider,
     F: Fn(UpdateProgress) + Send + Sync,
 {
+    update_repository_with_options_and_progress_and_cancellation(
+        repo_path,
+        provider,
+        config,
+        model_name,
+        options,
+        on_progress,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Incrementally update an index with progress reporting and cooperative cancellation.
+///
+/// Cancellation is observed through discovery, parsing, and embedding. Once publication
+/// starts, all index stores are updated before the operation returns so callers never
+/// receive a cancellation result while writes are still in progress.
+pub async fn update_repository_with_options_and_progress_and_cancellation<P, F>(
+    repo_path: &Path,
+    provider: &P,
+    config: &VeraConfig,
+    model_name: &str,
+    options: &UpdateOptions,
+    on_progress: F,
+    cancellation: &CancellationToken,
+) -> Result<UpdateSummary>
+where
+    P: EmbeddingProvider,
+    F: Fn(UpdateProgress) + Send + Sync,
+{
     let start = Instant::now();
+    cancellation.check()?;
 
     // ── 1. Validate path ─────────────────────────────────────────
     if !repo_path.exists() {
@@ -240,7 +274,8 @@ where
 
     // ── 2. Discover current files on disk ────────────────────────
     let disc =
-        discovery::discover_files(&repo_root, &config.indexing).context("file discovery failed")?;
+        discovery::discover_files_with_cancellation(&repo_root, &config.indexing, cancellation)
+            .context("file discovery failed")?;
     on_progress(UpdateProgress::DiscoveryDone {
         file_count: disc.files.len(),
     });
@@ -301,6 +336,7 @@ where
     // Read file contents and compute hashes for current files.
     let mut current_files: HashMap<String, String> = HashMap::new(); // rel_path → content
     for file in &disc.files {
+        cancellation.check()?;
         match discovery::read_source_lossy(&file.absolute_path) {
             Ok(content) => {
                 current_files.insert(file.relative_path.clone(), content);
@@ -324,6 +360,7 @@ where
     let mut unchanged = 0usize;
 
     for (rel_path, content) in &current_files {
+        cancellation.check()?;
         let language = detect_language_for_path(rel_path);
         let hash = hash_for_indexing_source(content, rel_path, language, &repo_root);
         let stored_hash = metadata_store
@@ -404,6 +441,7 @@ where
     if !files_to_index.is_empty() {
         // Parse and chunk new/modified files.
         for (rel_path, content, hash, is_modified) in &files_to_index {
+            cancellation.check()?;
             let language = detect_language_for_path(rel_path);
 
             // For RST, refs come from raw source; chunks from preprocessed.
@@ -446,17 +484,15 @@ where
                 "parsed file"
             );
 
-            if file_state.status == FileIndexStatus::Indexed {
-                prepared_files.push(PreparedFile {
-                    path: rel_path.clone(),
-                    hash: hash.clone(),
-                    modified: *is_modified,
-                    chunks,
-                    references: refs,
-                    type_relations,
-                    state: file_state,
-                });
-            }
+            prepared_files.push(PreparedFile {
+                path: rel_path.clone(),
+                hash: hash.clone(),
+                modified: *is_modified,
+                chunks,
+                references: refs,
+                type_relations,
+                state: file_state,
+            });
         }
     }
 
@@ -504,29 +540,45 @@ where
         let progress_cb = |done: usize, total: usize| {
             on_progress(UpdateProgress::EmbeddingProgress { done, total });
         };
-        let embeddings = embed_chunks_concurrent_with_progress(
+        let embedding_result = embed_chunks_concurrent_with_progress_and_cancellation(
             provider,
             &all_chunks,
             batch_size,
             max_concurrent_requests,
             config.indexing.max_chunk_bytes,
+            cancellation.as_async_token(),
             progress_cb,
         )
-        .await
-        .context("embedding generation failed")?;
+        .await;
+        let embeddings = match embedding_result {
+            Ok(embeddings) => embeddings,
+            Err(error) => {
+                if matches!(error, EmbeddingError::Cancelled) {
+                    cancellation.check()?;
+                }
+                return Err(error).context("embedding generation failed");
+            }
+        };
         on_progress(UpdateProgress::EmbeddingDone {
             count: embeddings.len(),
         });
         embeddings
     };
+    cancellation.check()?;
 
     let final_stored_dim = if embeddings.is_empty() {
         stored_dim
     } else {
         super::truncate_embeddings(&mut embeddings, stored_dim)
     };
-    let successful_modified = prepared_files.iter().filter(|file| file.modified).count();
-    let successful_added = prepared_files.len() - successful_modified;
+    let successful_modified = prepared_files
+        .iter()
+        .filter(|file| file.modified && file.state.status == FileIndexStatus::Indexed)
+        .count();
+    let successful_added = prepared_files
+        .iter()
+        .filter(|file| !file.modified && file.state.status == FileIndexStatus::Indexed)
+        .count();
 
     if !deleted.is_empty() || !prepared_files.is_empty() {
         let vector_path = idx_dir.join("vectors.db");
@@ -541,9 +593,23 @@ where
             remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
         }
 
-        for file in prepared_files.iter().filter(|file| file.modified) {
+        // A previous attempt may have failed after writing one store but before
+        // committing the file hash. Cleaning every prepared path makes retries
+        // idempotent for both modified and newly added files.
+        for file in &prepared_files {
             remove_file_parse_data(&metadata_store, &file.path)?;
-            remove_file_chunk_data(&metadata_store, &vector_store, &bm25_index, &file.path)?;
+            // Chunk metadata is inserted before vectors and BM25 documents and
+            // removed after them, so it witnesses a partial added-file publish.
+            let has_partial_chunks = !metadata_store
+                .get_chunks_by_file(&file.path)
+                .context("failed to inspect existing chunks before publication")?
+                .is_empty();
+            if file.modified || has_partial_chunks {
+                remove_file_chunk_data(&metadata_store, &vector_store, &bm25_index, &file.path)?;
+            }
+            metadata_store
+                .delete_file_state(&file.path)
+                .with_context(|| format!("failed to delete file state for {}", file.path))?;
         }
 
         for file in &prepared_files {

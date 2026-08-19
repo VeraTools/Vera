@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Args;
 use vera_core::presentation::{CompactResult, truncate_to_budget};
 
@@ -12,24 +13,31 @@ pub async fn wait_for_interrupt() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// Run an operation until it completes or an interrupt signal wins.
+/// Cancel a spawned operation when signalled, then wait for it to stop safely.
 ///
-/// Dropping the operation future propagates cancellation through in-flight
-/// client requests instead of leaving the CLI runtime alive until they finish.
-pub async fn cancel_on_signal<T, Operation, Signal>(
-    operation: Operation,
+/// The operation runs separately so the signal handler is active during synchronous discovery
+/// and parsing. If publication has already started, this waits for and returns its real result.
+pub async fn cancel_task_on_signal<T, Signal>(
+    mut task: tokio::task::JoinHandle<anyhow::Result<T>>,
     signal: Signal,
+    cancellation: vera_core::CancellationToken,
     operation_name: &str,
 ) -> anyhow::Result<T>
 where
-    Operation: std::future::Future<Output = anyhow::Result<T>>,
     Signal: std::future::Future<Output = ()>,
 {
-    tokio::select! {
+    tokio::pin!(signal);
+
+    let result = tokio::select! {
         biased;
-        result = operation => result,
-        _ = signal => anyhow::bail!("{operation_name} cancelled"),
-    }
+        result = &mut task => result,
+        _ = &mut signal => {
+            cancellation.cancel();
+            task.await
+        },
+    };
+
+    result.with_context(|| format!("{operation_name} task failed"))?
 }
 
 /// Load the effective runtime configuration.
@@ -497,8 +505,6 @@ pub fn print_human_summary(summary: &vera_core::indexing::IndexSummary, verbose:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn index_freshness_summary_formats_nonzero_counts() {
@@ -510,20 +516,15 @@ mod tests {
         assert_eq!(freshness.summary(), "2 added, 1 modified, 3 deleted");
     }
 
-    struct DropMarker(Arc<AtomicBool>);
-
-    impl Drop for DropMarker {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
     #[tokio::test]
     async fn ready_operation_error_wins_over_ready_signal() {
         for _ in 0..64 {
-            let error = cancel_on_signal(
-                async { Err::<(), _>(anyhow::anyhow!("provider failed")) },
+            let task = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("provider failed")) });
+            tokio::task::yield_now().await;
+            let error = cancel_task_on_signal(
+                task,
                 std::future::ready(()),
+                vera_core::CancellationToken::new(),
                 "test operation",
             )
             .await
@@ -534,26 +535,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_drops_in_flight_operation() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let dropped_for_operation = dropped.clone();
+    async fn cancellation_waits_for_the_operation_to_stop() {
+        let cancellation = vera_core::CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
 
-        let operation = async move {
-            let _marker = DropMarker(dropped_for_operation);
+        let task = tokio::spawn(async move {
             let _ = started_tx.send(());
-            std::future::pending::<()>().await;
-            Ok::<_, anyhow::Error>(())
-        };
+            while !operation_cancellation.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            Err::<(), _>(anyhow::anyhow!("operation cancelled safely"))
+        });
         let signal = async move {
             let _ = started_rx.await;
         };
 
-        let error = cancel_on_signal(operation, signal, "test operation")
+        let error = cancel_task_on_signal(task, signal, cancellation, "test operation")
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("test operation cancelled"));
-        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(error.to_string(), "operation cancelled safely");
     }
 }

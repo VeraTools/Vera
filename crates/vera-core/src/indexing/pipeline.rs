@@ -297,7 +297,7 @@ where
         Ok(embeddings) => embeddings,
         Err(error) => {
             // A completed provider error outranks a simultaneous cancellation,
-            // mirroring the biased select in the CLI's cancel_on_signal.
+            // mirroring the biased select in the CLI's cancel_task_on_signal.
             if matches!(error, EmbeddingError::Cancelled) {
                 cancellation.check()?;
             }
