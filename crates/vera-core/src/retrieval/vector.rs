@@ -7,11 +7,11 @@
 //! don't appear literally in results (e.g., "memory allocation" finds `alloc`).
 
 use anyhow::Result;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::storage::metadata::MetadataStore;
-use crate::storage::vector::VectorStore;
+use crate::storage::vector::{MAX_KNN_K, VectorStore};
 use crate::types::SearchResult;
 
 /// Errors specific to vector search.
@@ -60,9 +60,16 @@ pub async fn search_vector_with_stores(
     );
 
     // 2. Search the vector store for nearest neighbors.
-    // Fetch extra candidates to account for missing metadata without doubling
-    // large caller-selected candidate pools.
-    let candidates = limit.saturating_add(limit / 2).max(limit + 10);
+    let (requested, candidates) = candidate_pool(limit);
+    if requested > candidates {
+        warn!(
+            query = query,
+            requested,
+            fetched = candidates,
+            "candidate pool exceeds the sqlite-vec KNN cap; the filter and \
+             metadata over-fetch are inert above it"
+        );
+    }
 
     let vector_results = vector_store
         .search(&query_embedding, candidates)
@@ -110,6 +117,25 @@ pub async fn search_vector_with_stores(
     );
 
     Ok(results)
+}
+
+/// Size the KNN request for a caller-selected pool, bounded by the backend cap.
+///
+/// Returns `(requested, fetched)`. Extra candidates are fetched to absorb chunks
+/// whose metadata has gone missing, without doubling an already-large pool.
+///
+/// The two values differ once the compounded over-fetch runs past
+/// [`MAX_KNN_K`]. Callers stack several multipliers before reaching here (query
+/// type, then a filter over-fetch, then this one), so a natural-language query
+/// with an active filter can ask for more than sqlite-vec will serve. Bounding
+/// it here rather than letting the storage layer clamp keeps the ceiling
+/// visible to the one place that can report it; the same `k` reaches sqlite-vec
+/// either way, so ranking is unchanged.
+fn candidate_pool(limit: usize) -> (usize, usize) {
+    let requested = limit
+        .saturating_add(limit / 2)
+        .max(limit.saturating_add(10));
+    (requested, requested.min(MAX_KNN_K))
 }
 
 /// Generate a query embedding, truncating to match stored dimensionality.
@@ -172,6 +198,26 @@ mod tests {
     use crate::embedding::test_helpers::MockProvider;
     use crate::types::{Chunk, Language, SymbolType};
     use anyhow::Context;
+
+    /// The pool must never ask sqlite-vec for more than it will serve, and must
+    /// report the shortfall so a degraded pool is diagnosable rather than silent.
+    #[test]
+    fn candidate_pool_is_bounded_by_the_knn_cap() {
+        // Below the cap the metadata over-fetch is untouched.
+        assert_eq!(candidate_pool(10), (20, 20));
+        assert_eq!(candidate_pool(100), (150, 150));
+
+        // At and above it, the request is reported but not made.
+        let (requested, fetched) = candidate_pool(MAX_KNN_K);
+        assert!(
+            requested > MAX_KNN_K,
+            "over-fetch should exceed the cap here"
+        );
+        assert_eq!(fetched, MAX_KNN_K);
+
+        // No caller can push the fetch past the cap, and none can overflow it.
+        assert_eq!(candidate_pool(usize::MAX).1, MAX_KNN_K);
+    }
 
     /// Create sample chunks with semantic variety for testing.
     fn sample_chunks() -> Vec<Chunk> {

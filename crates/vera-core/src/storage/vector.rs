@@ -16,7 +16,10 @@ pub struct VectorStore {
 
 /// Maximum `k` sqlite-vec accepts in a KNN query. Requesting more is a hard
 /// error from the extension, not a soft limit.
-const MAX_KNN_K: usize = 4096;
+///
+/// Public so callers can size their candidate pools against the real ceiling
+/// instead of scaling past it and relying on [`VectorStore::search`] to clamp.
+pub const MAX_KNN_K: usize = 4096;
 
 /// A single vector search result: chunk ID and distance score.
 #[derive(Debug, Clone)]
@@ -207,11 +210,17 @@ impl VectorStore {
         // it on natural-language queries, and the whole vector arm would then be
         // dropped in favour of BM25-only results. Ask for as many as the backend
         // allows instead.
+        // Warn rather than debug: this is a silent quality reduction, and the
+        // reason #38 was hard to diagnose was a swallowed signal. Vera's own
+        // retrieval path now bounds the pool before it gets here, so reaching
+        // this branch means an external caller asked for more than the backend
+        // can give.
         if limit > MAX_KNN_K {
-            tracing::debug!(
+            tracing::warn!(
                 requested = limit,
                 clamped = MAX_KNN_K,
-                "clamping vector search limit to sqlite-vec KNN cap"
+                "clamping vector search limit to the sqlite-vec KNN cap; \
+                 the extra candidates are not fetched"
             );
         }
         let limit = limit.min(MAX_KNN_K);
