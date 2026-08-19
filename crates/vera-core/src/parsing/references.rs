@@ -95,10 +95,15 @@ fn is_jsx_element_node(kind: &str) -> bool {
 
 /// Whether a JSX tag names a host element rather than a component in scope.
 ///
-/// JSX resolves a *bare* tag beginning with a lowercase letter, such as `<div>`,
-/// to an intrinsic element string. Anything else is a value in scope, and only
-/// those are call sites; recording host elements would add an edge per HTML tag
-/// in the repository.
+/// JSX resolves a *bare* tag beginning with a lowercase ASCII letter, such as
+/// `<div>`, to an intrinsic element string. Anything else is a value in scope,
+/// and only those are call sites; recording host elements would add an edge per
+/// HTML tag in the repository.
+///
+/// The test is ASCII-specific on purpose, matching what the transpilers do:
+/// Babel's `isCompatTag` is `/^[a-z]/` and TypeScript's `isIntrinsicJsxName`
+/// compares against `a`..`z`. A Unicode-aware lowercase test would classify
+/// `<éWidget />` as a host element and drop a real component reference.
 ///
 /// The decision has to come from the tag node, not from the extracted callee.
 /// `extract_callee` returns the rightmost identifier, so `<Icons.arrow />` yields
@@ -116,7 +121,7 @@ fn is_jsx_host_element(node: &tree_sitter::Node, source: &[u8]) -> bool {
         return false;
     }
     name.utf8_text(source)
-        .is_ok_and(|text| text.starts_with(|ch: char| ch.is_lowercase()))
+        .is_ok_and(|text| text.starts_with(|ch: char| ch.is_ascii_lowercase()))
 }
 
 /// Extract the callee name from a call node.
@@ -363,6 +368,7 @@ export function App() {
             <Hello name="world" />
             <Panel.Header title="hi"></Panel.Header>
             <Icons.arrow />
+            <éWidget />
         </div>
     );
 }
@@ -385,6 +391,11 @@ export function App() {
         assert!(
             !callees.contains(&"div"),
             "host elements should not be call sites: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"éWidget"),
+            "only ASCII a-z marks an intrinsic tag, so <éWidget /> is a \
+             component reference: {callees:?}"
         );
         assert_eq!(
             refs.iter().filter(|r| r.callee == "Header").count(),
