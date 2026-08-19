@@ -215,10 +215,17 @@ pub(super) fn get_elixir_do_block<'a>(
 /// That is what makes const-assigned components and utilities unreachable from
 /// `structural definitions`.
 ///
-/// Returns `None` for anything else, including multi-declarator statements and
-/// bindings to plain values, so those keep their existing chunk shape. The
-/// symbol spans the whole declaration, keeping the `const` keyword and any
-/// `export` in the chunk.
+/// `let` and `var` bindings are covered too: the reported symptom was about
+/// `const` because that is the dominant style, but the missing name is a
+/// property of the declarator, not of the keyword, so scoping this to `const`
+/// would leave the same bug in place for the other two.
+///
+/// Returns `None` for anything else, including multi-declarator statements,
+/// destructuring patterns and bindings to plain values, so those keep their
+/// existing chunk shape. The symbol spans the declaration node, which is what
+/// every other declaration kind in this extractor does; an `export` on a
+/// preceding line therefore sits outside the span, as it already does for
+/// `export`-ed functions, classes and interfaces.
 pub(super) fn extract_js_function_binding(
     node: &tree_sitter::Node<'_>,
     source: &[u8],

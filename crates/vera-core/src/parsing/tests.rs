@@ -301,25 +301,47 @@ export const plainConst = 42;
         "value consts should keep their existing shape"
     );
 
-    let arrow = chunks
-        .iter()
-        .find(|c| c.symbol_name.as_deref() == Some("arrowFn"))
-        .unwrap();
-    assert!(
-        arrow.content.contains("export const arrowFn"),
-        "chunk should span the whole declaration: {:?}",
-        arrow.content
+    // The span covers the declaration, initialiser included, not just the name.
+    assert_eq!(
+        find_chunk(&chunks, "arrowFn").content.trim(),
+        "export const arrowFn = (a: number): number => a;"
     );
+}
+
+/// `let` and `var` function bindings are named too. The reported symptom was
+/// about `const` because that is the dominant style, but the cause is the name
+/// living on the declarator, which is identical for all three keywords.
+#[test]
+fn javascript_let_var_and_generator_bindings_are_named() {
+    let source = r#"export const arrowFn = (a) => a;
+let laterFn = function (a) { return a; };
+var oldStyleFn = () => {};
+export const genFn = function* () { yield 1; };
+"#;
+    let chunks = parse(source, "shapes.js", Language::JavaScript);
+
+    for name in ["arrowFn", "laterFn", "oldStyleFn", "genFn"] {
+        assert_eq!(
+            find_chunk(&chunks, name).symbol_type,
+            Some(SymbolType::Function),
+            "{name} binds a function"
+        );
+    }
 }
 
 #[test]
 fn typescript_multi_declarator_statements_are_unchanged() {
     let source = "const a = () => 1, b = () => 2;\n";
     let chunks = parse(source, "multi.ts", Language::TypeScript);
-    assert!(
-        chunks.iter().all(|c| c.symbol_name.as_deref() != Some("a")),
-        "multi-declarator statements keep their existing chunk shape"
-    );
+    for name in ["a", "b"] {
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.symbol_name.as_deref() != Some(name)),
+            "multi-declarator statements keep their existing chunk shape, \
+             but {name} was named"
+        );
+    }
 }
 
 // =========================================================
