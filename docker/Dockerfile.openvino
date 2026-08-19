@@ -5,7 +5,10 @@
 #   cargo build --release -p vera-cli && mkdir -p dist && cp target/release/vera dist/
 #   docker build -f docker/Dockerfile.openvino -t vera:openvino .
 
-FROM debian:trixie-slim
+# Ubuntu 24.04, not debian:trixie-slim like the cpu image: intel-opencl-icd
+# (Intel GPU compute runtime) is not published in Debian trixie at all, but
+# is in Ubuntu noble universe. Noble's glibc 2.39 matches the CI-built binary.
+FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
