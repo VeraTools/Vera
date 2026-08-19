@@ -95,12 +95,28 @@ fn is_jsx_element_node(kind: &str) -> bool {
 
 /// Whether a JSX tag names a host element rather than a component in scope.
 ///
-/// JSX resolves a tag beginning with a lowercase letter, such as `<div>`, to an
-/// intrinsic element string, and any other, such as `<Foo>` or `<Foo.Bar>`, to a
-/// value in scope. Only the latter is a call site; recording the former would
-/// add an edge per HTML tag in the repository.
-fn is_jsx_host_element(kind: &str, name: &str) -> bool {
-    is_jsx_element_node(kind) && name.starts_with(|ch: char| ch.is_lowercase())
+/// JSX resolves a *bare* tag beginning with a lowercase letter, such as `<div>`,
+/// to an intrinsic element string. Anything else is a value in scope, and only
+/// those are call sites; recording host elements would add an edge per HTML tag
+/// in the repository.
+///
+/// The decision has to come from the tag node, not from the extracted callee.
+/// `extract_callee` returns the rightmost identifier, so `<Icons.arrow />` yields
+/// `arrow`, and judging that name alone would discard a real component
+/// reference. A dotted tag is a member expression on a value in scope whatever
+/// the case of its property.
+fn is_jsx_host_element(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if !is_jsx_element_node(node.kind()) {
+        return false;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    if name.kind() == "member_expression" {
+        return false;
+    }
+    name.utf8_text(source)
+        .is_ok_and(|text| text.starts_with(|ch: char| ch.is_lowercase()))
 }
 
 /// Extract the callee name from a call node.
@@ -209,7 +225,7 @@ fn collect_calls(
         let node = cursor.node();
         if is_call_node(lang, node.kind()) {
             if let Some(callee) = extract_callee(&node, source) {
-                if !is_jsx_host_element(node.kind(), &callee) {
+                if !is_jsx_host_element(&node, source) {
                     let caller = find_enclosing_symbol(symbols, node.start_byte());
                     refs.push(RawReference {
                         callee,
@@ -346,6 +362,7 @@ export function App() {
         <div className="wrap">
             <Hello name="world" />
             <Panel.Header title="hi"></Panel.Header>
+            <Icons.arrow />
         </div>
     );
 }
@@ -359,6 +376,11 @@ export function App() {
         assert!(
             callees.contains(&"Header"),
             "dotted JSX element should be a call site: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"arrow"),
+            "a dotted tag is a value in scope whatever the case of its \
+             property, so <Icons.arrow /> is a call site: {callees:?}"
         );
         assert!(
             !callees.contains(&"div"),
