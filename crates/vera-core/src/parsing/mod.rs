@@ -100,7 +100,7 @@ pub fn parse_file_with_diagnostics(
         ));
     }
 
-    let grammar = match languages::tree_sitter_grammar(language) {
+    let grammar = match languages::tree_sitter_grammar_for_path(language, file_path) {
         Some(g) => g,
         None => {
             let chunks = chunker::tier0_line_chunks(source, file_path, language);

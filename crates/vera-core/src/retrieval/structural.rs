@@ -282,7 +282,7 @@ where
         }
 
         let chunks = store.get_chunks_by_file(&file_rel)?;
-        let syntax_filter = SyntaxFilter::new(language, &content);
+        let syntax_filter = SyntaxFilter::new(language, &file_rel, &content);
         for candidate in collect(&file_rel, language, &content, &chunks)? {
             if results.len() >= limit {
                 break;
@@ -376,12 +376,13 @@ struct StructuralMatch {
 struct SyntaxFilter(Option<tree_sitter::Tree>);
 
 impl SyntaxFilter {
-    fn new(language: Language, content: &str) -> Self {
-        let tree = languages::tree_sitter_grammar(language).and_then(|grammar| {
-            let mut parser = Parser::new();
-            parser.set_language(&grammar).ok()?;
-            parser.parse(content, None)
-        });
+    fn new(language: Language, file_path: &str, content: &str) -> Self {
+        let tree =
+            languages::tree_sitter_grammar_for_path(language, file_path).and_then(|grammar| {
+                let mut parser = Parser::new();
+                parser.set_language(&grammar).ok()?;
+                parser.parse(content, None)
+            });
         Self(tree)
     }
 

@@ -370,6 +370,33 @@ fn typescript_multi_declarator_statements_are_unchanged() {
     assert_eq!(chunks[0].content.trim(), "const a = () => 1, b = () => 2;");
 }
 
+#[test]
+fn tsx_files_parse_clean_and_expose_jsx_call_sites() {
+    let source = r#"import { Hello } from "./hello";
+
+export function App() {
+    return <Hello name="world" />;
+}
+"#;
+    let (chunks, refs, diagnostics) = parse_file_with_diagnostics(
+        source,
+        "src/app.tsx",
+        Language::TypeScript,
+        &default_config(),
+    )
+    .unwrap();
+
+    assert!(
+        !diagnostics.tree_has_error,
+        "the tsx grammar should parse JSX without error nodes"
+    );
+    assert!(!chunks.is_empty(), "should produce chunks");
+    assert!(
+        refs.iter().any(|r| r.callee == "Hello"),
+        "JSX usage should be recorded as a call site: {refs:?}"
+    );
+}
+
 // =========================================================
 // Go tests
 // =========================================================

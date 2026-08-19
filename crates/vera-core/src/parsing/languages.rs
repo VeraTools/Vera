@@ -106,6 +106,26 @@ pub fn tree_sitter_grammar(lang: Language) -> Option<TsLanguage> {
     Some(lang_fn)
 }
 
+/// Returns the tree-sitter grammar to use for a specific file.
+///
+/// TypeScript ships as two grammars upstream because JSX is ambiguous with
+/// type assertions, so `.tsx` must be parsed with `tsx`. Parsing it with
+/// `typescript` puts every JSX element in an error node, which hides JSX call
+/// sites from `references` and `dead-code`. All other languages resolve by
+/// language alone.
+pub fn tree_sitter_grammar_for_path(lang: Language, file_path: &str) -> Option<TsLanguage> {
+    if lang == Language::TypeScript && has_tsx_extension(file_path) {
+        return Some(tree_sitter_typescript::LANGUAGE_TSX.into());
+    }
+    tree_sitter_grammar(lang)
+}
+
+fn has_tsx_extension(file_path: &str) -> bool {
+    std::path::Path::new(file_path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tsx"))
+}
+
 /// Returns whether a language has tree-sitter grammar support (Tier 1A).
 pub fn has_grammar(lang: Language) -> bool {
     tree_sitter_grammar(lang).is_some()
@@ -183,6 +203,48 @@ mod tests {
             assert!(
                 !has_grammar(lang),
                 "{lang} should NOT have a tree-sitter grammar"
+            );
+        }
+    }
+
+    /// A `.tsx` file must parse without error nodes; the `typescript` grammar
+    /// puts every JSX element in one, which is what hides JSX call sites.
+    #[test]
+    fn tsx_files_parse_jsx_without_errors() {
+        let source = "export function Hello() {\n  return <div className=\"greet\">hi</div>;\n}\n";
+
+        let tsx = tree_sitter_grammar_for_path(Language::TypeScript, "src/jsx.tsx").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tsx).unwrap();
+        assert!(
+            !parser.parse(source, None).unwrap().root_node().has_error(),
+            "tsx grammar should parse JSX cleanly"
+        );
+
+        let ts = tree_sitter_grammar_for_path(Language::TypeScript, "src/plain.ts").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts).unwrap();
+        assert!(
+            parser.parse(source, None).unwrap().root_node().has_error(),
+            "typescript grammar is the one that errors on JSX; if this stops \
+             holding, the tsx split is no longer needed"
+        );
+    }
+
+    #[test]
+    fn non_tsx_paths_keep_their_language_grammar() {
+        let cases = [
+            ("src/plain.ts", Language::TypeScript),
+            ("src/app.mts", Language::TypeScript),
+            ("noext", Language::TypeScript),
+            ("src/main.rs", Language::Rust),
+        ];
+        for (path, lang) in cases {
+            let by_path = tree_sitter_grammar_for_path(lang, path).unwrap();
+            assert_eq!(
+                by_path,
+                tree_sitter_grammar(lang).unwrap(),
+                "{path} should use the plain {lang} grammar"
             );
         }
     }
