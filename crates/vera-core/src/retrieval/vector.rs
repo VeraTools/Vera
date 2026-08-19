@@ -62,8 +62,10 @@ pub async fn search_vector_with_stores(
     // 2. Search the vector store for nearest neighbors.
     let (requested, candidates) = candidate_pool(limit);
     if requested > candidates {
+        // Deliberately without the query text: the surrounding `debug!` calls
+        // carry it, but this one is on by default, and a search query is user
+        // content that should not be raised into default-visible logs.
         warn!(
-            query = query,
             requested,
             fetched = candidates,
             "candidate pool exceeds the sqlite-vec KNN cap; the filter and \
