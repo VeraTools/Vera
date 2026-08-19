@@ -779,6 +779,54 @@ mod tests {
     }
 
     #[test]
+    fn prefix_delete_takes_the_write_lock_before_it_scans() {
+        // Complements the release test above, which shows the transaction is
+        // committed but not when it opens. The race being guarded is
+        // scan-then-delete: a competing writer inserting a matching row
+        // between the two would survive while the method reported success.
+        // What removes it is that the transaction is IMMEDIATE and opened
+        // *before* the scan, so the write lock is held for the whole window.
+        //
+        // That ordering is observable without thread timing. With a competitor
+        // holding the write lock, taking it up front fails at BEGIN, before
+        // any scanning; scanning first and opening a DEFERRED transaction
+        // afterwards gets as far as the first DELETE. Asserting which step
+        // failed pins the ordering.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.db");
+        let store = VectorStore::open(&path, 4).unwrap();
+        store
+            .insert_batch(&[("src/a.rs:0", &[1.0, 0.0, 0.0, 0.0][..])])
+            .unwrap();
+
+        // rusqlite defaults to a 5s busy timeout; the contention here is
+        // deliberate, so fail fast rather than waiting it out.
+        store.conn.execute_batch("PRAGMA busy_timeout=0").unwrap();
+
+        let competitor = VectorStore::open(&path, 4).unwrap();
+        competitor
+            .conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("competing writer should take the write lock");
+
+        let err = store
+            .delete_by_file_prefix("src/a.rs:")
+            .expect_err("a held write lock must block the delete");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("begin prefix delete transaction"),
+            "should fail acquiring the lock before scanning, got: {chain}"
+        );
+
+        competitor.conn.execute_batch("ROLLBACK").unwrap();
+
+        // Nothing was deleted, and it works once the lock is free.
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(store.delete_by_file_prefix("src/a.rs:").unwrap(), 1);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
     fn prefix_range_seeks_the_index_instead_of_scanning() {
         // The whole point of the range form: `LIKE ... ESCAPE` cannot use the
         // index, so a plan check is what actually guards this.
