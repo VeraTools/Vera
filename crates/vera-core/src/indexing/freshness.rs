@@ -109,6 +109,22 @@ pub fn detect_staleness(
         .filter(|path| !current_files.contains_key(path.as_str()))
         .count();
 
+    let files_modified =
+        count_modified_files(&current_files, &tracked_files, &metadata_store, &repo_root)?;
+
+    Ok(IndexFreshness {
+        files_added,
+        files_modified,
+        files_deleted,
+    })
+}
+
+fn count_modified_files(
+    current_files: &HashMap<String, PathBuf>,
+    tracked_files: &HashSet<String>,
+    metadata_store: &MetadataStore,
+    repo_root: &Path,
+) -> Result<usize> {
     let mut files_modified = 0usize;
     for (rel_path, absolute_path) in current_files
         .iter()
@@ -122,11 +138,12 @@ pub fn detect_staleness(
                     error = %err,
                     "failed to read file during freshness scan"
                 );
+                files_modified += 1;
                 continue;
             }
         };
         let language = detect_language_for_path(rel_path);
-        let current_hash = hash_for_indexing_source(&content, rel_path, language, &repo_root);
+        let current_hash = hash_for_indexing_source(&content, rel_path, language, repo_root);
         let stored_hash = metadata_store
             .get_file_hash(rel_path)
             .with_context(|| format!("failed to read stored hash for {rel_path}"))?;
@@ -135,11 +152,7 @@ pub fn detect_staleness(
         }
     }
 
-    Ok(IndexFreshness {
-        files_added,
-        files_modified,
-        files_deleted,
-    })
+    Ok(files_modified)
 }
 
 fn load_indexing_config(
@@ -228,6 +241,28 @@ mod tests {
 
         let freshness = detect_staleness(dir.path(), &IndexingConfig::default()).unwrap();
         assert_eq!(freshness.files_modified, 1);
+    }
+
+    #[test]
+    fn freshness_scan_marks_tracked_read_failures_as_modified() {
+        let dir = tempdir().unwrap();
+        let read_failure_path = dir.path().join("src/unreadable.rs");
+        // Model a tracked file being replaced by a directory after discovery.
+        std::fs::create_dir_all(&read_failure_path).unwrap();
+
+        let index_dir = dir.path().join(".vera");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let metadata = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        metadata
+            .set_file_hash("src/unreadable.rs", &content_hash("fn indexed() {}\n"))
+            .unwrap();
+
+        let current_files = HashMap::from([("src/unreadable.rs".to_string(), read_failure_path)]);
+        let tracked_files = HashSet::from(["src/unreadable.rs".to_string()]);
+        let files_modified =
+            count_modified_files(&current_files, &tracked_files, &metadata, dir.path()).unwrap();
+
+        assert_eq!(files_modified, 1);
     }
 
     #[test]
