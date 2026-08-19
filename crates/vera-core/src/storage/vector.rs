@@ -8,6 +8,10 @@ use rusqlite::{Connection, OptionalExtension, ffi::sqlite3_auto_extension, param
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::IntoBytes;
 
+const PREFIX_RANGE_SQL: &str =
+    "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2";
+const PREFIX_LOWER_BOUND_SQL: &str = "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1";
+
 /// sqlite-vec backed vector store for embedding search.
 pub struct VectorStore {
     conn: Connection,
@@ -377,14 +381,8 @@ fn rowids_with_prefix(conn: &Connection, prefix: &str) -> Result<Vec<i64>> {
     // SQL would cost the index range plan, which is the point of all this.
     let upper = prefix_upper_bound(prefix);
     let (sql, args): (&str, Vec<&dyn rusqlite::ToSql>) = match &upper {
-        Some(upper) => (
-            "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2",
-            vec![&prefix, upper],
-        ),
-        None => (
-            "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1",
-            vec![&prefix],
-        ),
+        Some(upper) => (PREFIX_RANGE_SQL, vec![&prefix, upper]),
+        None => (PREFIX_LOWER_BOUND_SQL, vec![&prefix]),
     };
 
     let mut stmt = conn
@@ -756,11 +754,9 @@ mod tests {
     }
 
     #[test]
-    fn prefix_delete_scans_and_deletes_in_one_transaction() {
-        // The scan runs inside the transaction, so a second connection cannot
-        // insert a matching row between finding the rowids and deleting them.
-        // An IMMEDIATE transaction takes the write lock up front, which is
-        // what makes the competing writer wait rather than slip in.
+    fn prefix_delete_releases_transaction_for_subsequent_writes() {
+        // A second connection can write after the prefix delete commits, which
+        // confirms that the transaction was committed and released.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vectors.db");
         let store = VectorStore::open(&path, 4).unwrap();
@@ -789,10 +785,9 @@ mod tests {
         let store = VectorStore::open_in_memory(4).unwrap();
         let mut stmt = store
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2",
-            )
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN\n                 {PREFIX_RANGE_SQL}"
+            ))
             .unwrap();
         let plan: Vec<String> = stmt
             .query_map(params!["a", "b"], |row| row.get::<_, String>(3))
@@ -801,8 +796,9 @@ mod tests {
             .collect();
         let plan = plan.join(" | ");
         assert!(
-            plan.contains("USING COVERING INDEX") || plan.contains("USING INDEX"),
-            "prefix range must seek the index: {plan}"
+            plan.contains("SEARCH")
+                && (plan.contains("USING COVERING INDEX") || plan.contains("USING INDEX")),
+            "prefix range must search using an index: {plan}"
         );
     }
 }
