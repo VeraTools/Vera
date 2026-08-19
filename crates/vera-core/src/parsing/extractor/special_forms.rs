@@ -222,10 +222,14 @@ pub(super) fn get_elixir_do_block<'a>(
 ///
 /// Returns `None` for anything else, including multi-declarator statements,
 /// destructuring patterns and bindings to plain values, so those keep their
-/// existing chunk shape. The symbol spans the declaration node, which is what
-/// every other declaration kind in this extractor does; an `export` on a
-/// preceding line therefore sits outside the span, as it already does for
-/// `export`-ed functions, classes and interfaces.
+/// existing chunk shape.
+///
+/// The symbol spans the declaration node, which is what every other declaration
+/// kind in this extractor does. `export` is part of the enclosing
+/// `export_statement`, so it sits outside that span exactly as it already does
+/// for `export`-ed functions, classes and interfaces. Chunk content is expanded
+/// to whole lines afterwards, so a single-line `export const f = …` still reads
+/// with its `export`, while a declaration split across lines does not.
 pub(super) fn extract_js_function_binding(
     node: &tree_sitter::Node<'_>,
     source: &[u8],

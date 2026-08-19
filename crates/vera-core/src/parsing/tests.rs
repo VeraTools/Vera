@@ -302,10 +302,38 @@ export const plainConst = 42;
     );
 
     // The span covers the declaration, initialiser included, not just the name.
+    // `export` is present here because chunk content is expanded to whole lines
+    // and this declaration is on one line; see the multiline case below.
     assert_eq!(
         find_chunk(&chunks, "arrowFn").content.trim(),
         "export const arrowFn = (a: number): number => a;"
     );
+}
+
+/// A declaration split across lines from its `export` keeps the same span shape
+/// as every other declaration kind: the symbol covers the declaration, and the
+/// `export` on the preceding line falls outside it.
+///
+/// Pinned deliberately. Const bindings must not become the only declaration
+/// kind whose span swallows `export`; changing that is a repo-wide decision
+/// about `export_statement`, not something to do for one node kind.
+#[test]
+fn typescript_multiline_export_spans_match_function_declarations() {
+    let source = r#"export
+const arrowFn = (a: number): number => a;
+
+export
+function declaredFn(a: number): number { return a; }
+"#;
+    let chunks = parse(source, "multiline.ts", Language::TypeScript);
+
+    for name in ["arrowFn", "declaredFn"] {
+        let content = find_chunk(&chunks, name).content.trim().to_string();
+        assert!(
+            !content.starts_with("export"),
+            "{name} should span the declaration, not the export: {content:?}"
+        );
+    }
 }
 
 /// `let` and `var` function bindings are named too. The reported symptom was
@@ -333,15 +361,13 @@ export const genFn = function* () { yield 1; };
 fn typescript_multi_declarator_statements_are_unchanged() {
     let source = "const a = () => 1, b = () => 2;\n";
     let chunks = parse(source, "multi.ts", Language::TypeScript);
-    for name in ["a", "b"] {
-        assert!(
-            chunks
-                .iter()
-                .all(|c| c.symbol_name.as_deref() != Some(name)),
-            "multi-declarator statements keep their existing chunk shape, \
-             but {name} was named"
-        );
-    }
+
+    // The whole shape is pinned, not just the absence of names: one unnamed
+    // variable chunk spanning the statement, exactly as before this change.
+    assert_eq!(chunks.len(), 1, "unexpected chunks: {chunks:?}");
+    assert_eq!(chunks[0].symbol_name, None);
+    assert_eq!(chunks[0].symbol_type, Some(SymbolType::Variable));
+    assert_eq!(chunks[0].content.trim(), "const a = () => 1, b = () => 2;");
 }
 
 // =========================================================
