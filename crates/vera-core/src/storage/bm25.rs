@@ -515,7 +515,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(index.doc_count().unwrap(), before - 3);
-        let hits = index.search("fn", 50).unwrap();
+        let hits = index.search("hello", 50).unwrap();
         for path in ["src/main.rs:", "src/lib.py:"] {
             assert!(
                 hits.iter().all(|hit| !hit.chunk_id.starts_with(path)),
