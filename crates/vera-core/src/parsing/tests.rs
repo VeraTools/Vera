@@ -422,6 +422,7 @@ export function Toolbar() {
             <Icons.Arrow />
             <icons.Chevron />
             <span />
+            <My-element />
         </div>
     );
 }
