@@ -808,9 +808,10 @@ fn normalize_embedding(embedding: &mut [f32]) {
 /// Resolve the execution provider a session will actually run on, and adjust
 /// the model config to match it.
 ///
-/// `build_session` pins some models to CPU regardless of the requested backend
-/// (see `embedding_execution_provider`), so everything derived from the
-/// provider has to follow the effective one rather than the requested one.
+/// Some models are pinned to CPU regardless of the requested backend (see
+/// `embedding_execution_provider`), so everything derived from the provider
+/// has to follow the effective one rather than the requested one. This is the
+/// only place that resolution happens; `build_session` trusts what it is given.
 /// Adjusting for the requested provider would select the GPU ONNX export for a
 /// session that then runs on CPU, and would give a CPU session GPU batch
 /// scaling, GPU provider dependencies, and a CPU "fallback" retry of the CPU
