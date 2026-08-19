@@ -1309,6 +1309,12 @@ mod tests {
             store.get_file_hash("src/main.rs").unwrap().as_deref(),
             Some("hash-c")
         );
+        // Guards against a partial write taking out rows the batch never
+        // mentioned: re-checking only src/main.rs would miss that.
+        assert_eq!(
+            store.get_file_hash("src/lib.py").unwrap().as_deref(),
+            Some("hash-b")
+        );
     }
 
     #[test]
@@ -1355,8 +1361,17 @@ mod tests {
             .insert_parse_artifacts_batch(&refs, &relations)
             .unwrap();
 
-        // Both files' references land, not just the first.
-        assert_eq!(store.find_callers("helper").unwrap().len(), 2);
+        // Both files' references land, not just the first. A count of 2 alone
+        // would also pass if both rows were stored under one file path, so
+        // assert the paths themselves.
+        let mut caller_paths: Vec<String> = store
+            .find_callers("helper")
+            .unwrap()
+            .into_iter()
+            .map(|caller_ref| caller_ref.file_path)
+            .collect();
+        caller_paths.sort();
+        assert_eq!(caller_paths, vec!["src/lib.py", "src/main.rs"]);
         assert_eq!(store.find_type_relations("Display").unwrap().len(), 1);
     }
 
