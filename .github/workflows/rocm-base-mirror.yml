@@ -33,19 +33,23 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # Copy to a staging tag first so a failed parity check never leaves a
-      # bad image published under the tag Dockerfile.rocm builds FROM; the
-      # final tag is only applied after verification succeeds.
+      # Resolve the source digest first and copy by digest, so the mirror is
+      # exactly the verified manifest even if the upstream tag moves mid-run.
+      # Copy to a staging tag so a failed parity check never leaves a bad
+      # image under the tag Dockerfile.rocm builds FROM; the final tag is
+      # only applied after verification succeeds.
       - name: Copy ROCm base image to GHCR staging tag
         env:
           BASE_TAG: ${{ inputs.base_tag }}
-        run: crane copy "rocm/dev-ubuntu-24.04:${BASE_TAG}" "ghcr.io/veratools/vera:rocm-base-${BASE_TAG}-unverified"
+        run: |
+          SRC=$(crane digest "rocm/dev-ubuntu-24.04:${BASE_TAG}")
+          echo "src=$SRC" >> "$GITHUB_ENV"
+          crane copy "rocm/dev-ubuntu-24.04@${SRC}" "ghcr.io/veratools/vera:rocm-base-${BASE_TAG}-unverified"
 
       - name: Verify digest parity and promote
         env:
           BASE_TAG: ${{ inputs.base_tag }}
         run: |
-          SRC=$(crane digest "rocm/dev-ubuntu-24.04:${BASE_TAG}")
           DST=$(crane digest "ghcr.io/veratools/vera:rocm-base-${BASE_TAG}-unverified")
           echo "source=$SRC mirror=$DST"
           test "$SRC" = "$DST"
