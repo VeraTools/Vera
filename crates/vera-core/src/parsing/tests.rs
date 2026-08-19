@@ -438,23 +438,17 @@ export function Toolbar() {
         !diagnostics.tree_has_error,
         "tsx should parse without errors"
     );
-    let callees: Vec<&str> = refs.iter().map(|r| r.callee.as_str()).collect();
+    let mut callees: Vec<&str> = refs.iter().map(|r| r.callee.as_str()).collect();
+    callees.sort_unstable();
 
-    assert!(
-        callees.contains(&"Arrow"),
-        "uppercase-rooted dotted component should index as its rightmost segment: {callees:?}"
-    );
-    assert!(
-        callees.contains(&"Chevron"),
-        "lowercase-rooted dotted component is still a value lookup: {callees:?}"
-    );
-    assert!(
-        !callees.iter().any(|c| c.contains('.')),
-        "no callee should carry the full member path: {callees:?}"
-    );
-    assert!(
-        !callees.contains(&"div") && !callees.contains(&"span"),
-        "intrinsic host elements must stay out of the call graph: {callees:?}"
+    // An exact set, not `contains`: a root segment leaking in as its own
+    // reference (`Icons`, `icons`) is precisely the failure mode worth
+    // catching, and a containment check would not see it. `div`/`span` are
+    // intrinsic by the lowercase rule and `My-element` by the hyphen rule.
+    assert_eq!(
+        callees,
+        vec!["Arrow", "Chevron"],
+        "expected exactly the two dotted components, rightmost segment only"
     );
 }
 

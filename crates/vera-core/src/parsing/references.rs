@@ -18,9 +18,14 @@
 //! invisibility that indexing JSX call sites exists to fix.
 //!
 //! A lowercase root does not change this: `<icons.Arrow />` is a member
-//! expression, and a member expression is always a value lookup. Only a bare
-//! lowercase identifier is an intrinsic host element (see
-//! `is_jsx_host_element`).
+//! expression, and a member expression is always a value lookup — the
+//! intrinsic test never applies to one.
+//!
+//! For *bare* tags there are two intrinsic forms, not one: a name starting
+//! with a lowercase ASCII letter (`<div />`), and any name containing a hyphen
+//! whatever its case (`<My-element />`, `<my-element />`), which is the
+//! custom-element form. Both are host elements and stay out of the call graph.
+//! See `is_jsx_host_element`.
 //!
 //! The trade-off is deliberate: two components sharing a final segment
 //! (`Icons.Arrow` and `Shapes.Arrow`) collapse onto one name. Separating them
