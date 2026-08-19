@@ -248,13 +248,30 @@ impl Bm25Index {
 
     /// Delete all documents for a given file path.
     pub fn delete_by_file(&self, file_path: &str) -> Result<()> {
+        self.delete_by_files(std::slice::from_ref(&file_path))
+    }
+
+    /// Delete all documents for every given file path, using one writer.
+    ///
+    /// The per-call cost here is the writer lifecycle, not the deletion:
+    /// allocating a `WRITER_HEAP_SIZE` writer, committing a segment and
+    /// joining the merge threads costs on the order of tens of milliseconds
+    /// regardless of how many terms are deleted. Callers removing many files
+    /// must therefore batch, or they pay that fixed cost per file.
+    pub fn delete_by_files(&self, file_paths: &[&str]) -> Result<()> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+
         let mut writer: IndexWriter = self
             .index
             .writer(WRITER_HEAP_SIZE)
             .context("failed to create BM25 writer for file delete")?;
 
-        let term = tantivy::Term::from_field_text(self.schema.file_path, file_path);
-        writer.delete_term(term);
+        for file_path in file_paths {
+            let term = tantivy::Term::from_field_text(self.schema.file_path, file_path);
+            writer.delete_term(term);
+        }
         writer
             .commit()
             .context("failed to commit BM25 file delete")?;

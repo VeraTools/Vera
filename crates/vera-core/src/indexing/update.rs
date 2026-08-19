@@ -594,25 +594,49 @@ where
         let bm25_index =
             Bm25Index::open(&bm25_dir).context("failed to open BM25 index for update")?;
 
-        // All parsing and embedding work is complete. Writes below publish the prepared update.
+        // Every path whose BM25 documents have to go is removed in one pass
+        // before any per-file mutation. `delete_by_file` allocates a writer, commits a segment and
+        // joins the merge threads, which costs tens of milliseconds per call
+        // however little is actually deleted. The batch must stay ahead of
+        // the `insert_chunks` below, or it would delete newly written docs.
+        let mut bm25_deletions: Vec<&str> = deleted.iter().map(String::as_str).collect();
+        let cleanup_chunk_data: Vec<bool> = prepared_files
+            .iter()
+            .map(|file| {
+                metadata_store
+                    .get_chunks_by_file(&file.path)
+                    .with_context(|| {
+                        format!("failed to inspect existing chunks for {}", file.path)
+                    })
+                    .map(|chunks| file.modified || !chunks.is_empty())
+            })
+            .collect::<Result<_>>()?;
+        bm25_deletions.extend(
+            prepared_files
+                .iter()
+                .zip(&cleanup_chunk_data)
+                .filter(|(_, cleanup)| **cleanup)
+                .map(|(file, _)| file.path.as_str()),
+        );
+
+        // All parsing, embedding, and read-only cleanup discovery is complete.
+        // Writes below publish the prepared update and must run to completion.
         cancellation.check()?;
+        bm25_index
+            .delete_by_files(&bm25_deletions)
+            .context("failed to delete BM25 entries for changed files")?;
+
         for file_path in &deleted {
-            remove_file_from_index(&metadata_store, &vector_store, &bm25_index, file_path)?;
+            remove_file_from_index(&metadata_store, &vector_store, file_path)?;
         }
 
         // A previous attempt may have failed after writing one store but before
         // committing the file hash. Cleaning every prepared path makes retries
         // idempotent for both modified and newly added files.
-        for file in &prepared_files {
+        for (file, cleanup_chunks) in prepared_files.iter().zip(cleanup_chunk_data) {
             remove_file_parse_data(&metadata_store, &file.path)?;
-            // Chunk metadata is inserted before vectors and BM25 documents and
-            // removed after them, so it witnesses a partial added-file publish.
-            let has_partial_chunks = !metadata_store
-                .get_chunks_by_file(&file.path)
-                .context("failed to inspect existing chunks before publication")?
-                .is_empty();
-            if file.modified || has_partial_chunks {
-                remove_file_chunk_data(&metadata_store, &vector_store, &bm25_index, &file.path)?;
+            if cleanup_chunks {
+                remove_file_chunk_data(&metadata_store, &vector_store, &file.path)?;
             }
             metadata_store
                 .delete_file_state(&file.path)
@@ -780,7 +804,6 @@ fn remove_file_parse_data(metadata_store: &MetadataStore, file_path: &str) -> Re
 fn remove_file_chunk_data(
     metadata_store: &MetadataStore,
     vector_store: &VectorStore,
-    bm25_index: &Bm25Index,
     file_path: &str,
 ) -> Result<()> {
     // Get chunk IDs for this file (needed for vector/BM25 deletion).
@@ -793,11 +816,6 @@ fn remove_file_chunk_data(
     vector_store
         .delete_by_file_prefix(&prefix)
         .with_context(|| format!("failed to delete vectors for {file_path}"))?;
-
-    // Delete from BM25 index by file path.
-    bm25_index
-        .delete_by_file(file_path)
-        .with_context(|| format!("failed to delete BM25 entries for {file_path}"))?;
 
     // Delete chunk metadata.
     metadata_store
@@ -817,11 +835,10 @@ fn remove_file_chunk_data(
 fn remove_file_from_index(
     metadata_store: &MetadataStore,
     vector_store: &VectorStore,
-    bm25_index: &Bm25Index,
     file_path: &str,
 ) -> Result<()> {
     remove_file_parse_data(metadata_store, file_path)?;
-    remove_file_chunk_data(metadata_store, vector_store, bm25_index, file_path)?;
+    remove_file_chunk_data(metadata_store, vector_store, file_path)?;
 
     // Delete file hash.
     metadata_store
