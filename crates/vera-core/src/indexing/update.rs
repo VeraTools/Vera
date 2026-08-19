@@ -797,17 +797,14 @@ fn remove_file_parse_data(metadata_store: &MetadataStore, file_path: &str) -> Re
     Ok(())
 }
 
-/// Remove chunk data (chunk metadata, vectors, BM25 entries) for a file.
+/// Remove vector and chunk metadata for a file.
+///
+/// The caller must delete the file's BM25 documents before calling this helper.
 fn remove_file_chunk_data(
     metadata_store: &MetadataStore,
     vector_store: &VectorStore,
     file_path: &str,
 ) -> Result<()> {
-    // Get chunk IDs for this file (needed for vector/BM25 deletion).
-    let chunks = metadata_store
-        .get_chunks_by_file(file_path)
-        .context("failed to get chunks for file deletion")?;
-
     // Delete from vector store using file prefix pattern.
     let prefix = format!("{file_path}:");
     vector_store
@@ -819,11 +816,7 @@ fn remove_file_chunk_data(
         .delete_chunks_by_file(file_path)
         .with_context(|| format!("failed to delete metadata for {file_path}"))?;
 
-    debug!(
-        file = %file_path,
-        chunks = chunks.len(),
-        "removed file chunk data from index"
-    );
+    debug!(file = %file_path, "removed file chunk data from index");
 
     Ok(())
 }
