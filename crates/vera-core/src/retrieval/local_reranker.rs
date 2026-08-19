@@ -20,6 +20,14 @@ pub struct LocalReranker {
 
 impl LocalReranker {
     pub async fn new_with_ep(ep: OnnxExecutionProvider) -> Result<Self, RerankerError> {
+        // Resolve before acquiring anything. No prebuilt reranker export runs
+        // on the CoreML GPU, so `reranker_execution_provider` maps CoreMl to
+        // Cpu; acquiring and dependency-checking the requested provider's
+        // library would validate one library and then build a session that
+        // wants another. `ensure_ort_runtime` is a process-wide OnceLock, so
+        // only the first path passed to it in a process is actually loaded,
+        // which makes that mismatch silent rather than loud.
+        let ep = crate::local_models::reranker_execution_provider(ep);
         let ort_path = crate::local_models::ensure_ort_library_for_ep(ep)
             .await
             .map_err(|e| RerankerError::ApiError {
@@ -74,6 +82,7 @@ impl LocalReranker {
     }
 
     pub fn probe_session(ep: OnnxExecutionProvider) -> Result<()> {
+        let ep = crate::local_models::reranker_execution_provider(ep);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let (onnx_path, _) = default_asset_paths()?;
@@ -82,6 +91,7 @@ impl LocalReranker {
     }
 
     pub fn probe_inference(ep: OnnxExecutionProvider) -> Result<()> {
+        let ep = crate::local_models::reranker_execution_provider(ep);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let (onnx_path, tokenizer_path) = default_asset_paths()?;
@@ -250,8 +260,12 @@ fn load_tokenizer(tokenizer_path: std::path::PathBuf) -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("Tokenizer init failed: {}", e))
 }
 
+/// Build a session on an already-resolved execution provider.
+///
+/// `ep` must come from `reranker_execution_provider`. Resolving again here
+/// would put the same contract in two places that could drift apart; all three
+/// callers resolve at their entry point.
 fn build_session(ep: OnnxExecutionProvider, onnx_path: std::path::PathBuf) -> Result<Session> {
-    let ep = crate::local_models::reranker_execution_provider(ep);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -376,6 +390,29 @@ fn register_execution_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Asset-free, so it runs when ONNX Runtime is absent. The test below
+    /// early-returns in that case and passes without asserting anything.
+    #[test]
+    fn resolution_is_idempotent_so_build_session_need_not_repeat_it() {
+        use crate::config::OnnxExecutionProvider as Ep;
+        use crate::local_models::reranker_execution_provider as resolve;
+
+        // `build_session` no longer re-resolves; it trusts what the entry
+        // points pass. Resolving an already-resolved provider must therefore
+        // be a no-op, or a second pass anywhere would change the answer.
+        for requested in [Ep::CoreMl, Ep::Cpu, Ep::Cuda] {
+            let once = resolve(requested);
+            assert_eq!(once, resolve(once), "resolving {requested} twice differed");
+        }
+
+        // The mapping this exists for: no prebuilt reranker export runs on the
+        // CoreML GPU, so CoreML must resolve to CPU before any library is
+        // acquired. Other providers are left alone.
+        assert_eq!(resolve(Ep::CoreMl), Ep::Cpu);
+        assert_eq!(resolve(Ep::Cuda), Ep::Cuda);
+        assert_eq!(resolve(Ep::Cpu), Ep::Cpu);
+    }
 
     #[tokio::test]
     async fn test_local_reranker() {
