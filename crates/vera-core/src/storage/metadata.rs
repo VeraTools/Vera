@@ -1285,6 +1285,102 @@ mod tests {
     }
 
     #[test]
+    fn set_file_hashes_batch_persists_every_row_and_replaces_on_repeat() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        store
+            .set_file_hashes_batch(&[
+                ("src/main.rs".to_string(), "hash-a".to_string()),
+                ("src/lib.py".to_string(), "hash-b".to_string()),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.get_file_hash("src/main.rs").unwrap().as_deref(),
+            Some("hash-a")
+        );
+        assert_eq!(
+            store.get_file_hash("src/lib.py").unwrap().as_deref(),
+            Some("hash-b")
+        );
+
+        store
+            .set_file_hashes_batch(&[("src/main.rs".to_string(), "hash-c".to_string())])
+            .unwrap();
+        assert_eq!(
+            store.get_file_hash("src/main.rs").unwrap().as_deref(),
+            Some("hash-c")
+        );
+    }
+
+    #[test]
+    fn batch_writes_accept_empty_input() {
+        // The batch methods early-return before opening a transaction. An
+        // update run with nothing to write must not error.
+        let store = MetadataStore::open_in_memory().unwrap();
+        store.set_file_hashes_batch(&[]).unwrap();
+        store.insert_parse_artifacts_batch(&[], &[]).unwrap();
+        assert!(store.get_chunks_by_ids(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_parse_artifacts_batch_persists_both_kinds_across_files() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let refs = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![crate::parsing::references::RawReference {
+                    callee: "helper".to_string(),
+                    caller: Some("main".to_string()),
+                    line: 3,
+                }],
+            ),
+            (
+                "src/lib.py".to_string(),
+                vec![crate::parsing::references::RawReference {
+                    callee: "helper".to_string(),
+                    caller: None,
+                    line: 9,
+                }],
+            ),
+        ];
+        let relations = vec![(
+            "src/main.rs".to_string(),
+            vec![RawTypeRelation {
+                owner: "Config".to_string(),
+                target: "Display".to_string(),
+                line: 12,
+                kind: TypeRelationKind::Conforms,
+            }],
+        )];
+        store
+            .insert_parse_artifacts_batch(&refs, &relations)
+            .unwrap();
+
+        // Both files' references land, not just the first.
+        assert_eq!(store.find_callers("helper").unwrap().len(), 2);
+        assert_eq!(store.find_type_relations("Display").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn get_chunks_by_ids_returns_only_requested_rows() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        store.insert_chunks(&sample_chunks()).unwrap();
+
+        let found = store
+            .get_chunks_by_ids(&["src/main.rs:0".to_string(), "src/lib.py:0".to_string()])
+            .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found["src/main.rs:0"].symbol_name.as_deref(), Some("main"));
+        assert!(!found.contains_key("src/main.rs:1"));
+
+        // A missing id is skipped rather than erroring, which is what the
+        // caller's "chunk metadata not found" branch relies on.
+        let partial = store
+            .get_chunks_by_ids(&["src/main.rs:0".to_string(), "does/not/exist:9".to_string()])
+            .unwrap();
+        assert_eq!(partial.len(), 1);
+    }
+
+    #[test]
     fn get_chunk_by_id() {
         let store = MetadataStore::open_in_memory().unwrap();
         store.insert_chunks(&sample_chunks()).unwrap();

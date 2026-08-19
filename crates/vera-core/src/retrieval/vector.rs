@@ -717,20 +717,17 @@ mod tests {
             })
             .collect();
 
-        // Guard that the fixture actually discriminates: if the distance order
-        // happened to equal insertion order or the `IN (...)` primary-key
-        // order, the assertions below would pass without testing anything.
+        // Guard that the fixture actually discriminates. The chunks are
+        // inserted in id order, so insertion order and the `IN (...)`
+        // primary-key order are the same sequence here; one comparison covers
+        // both. Without this, a fixture whose distance order matched storage
+        // order would satisfy the assertions below without testing anything —
+        // which is exactly what the first version of this test did.
         let expected_paths: Vec<&str> = expected.iter().map(|(path, _, _)| *path).collect();
-        let insertion_paths: Vec<&str> = chunks.iter().map(|c| c.file_path.as_str()).collect();
-        let mut lexicographic_paths = insertion_paths.clone();
-        lexicographic_paths.sort_unstable();
+        let storage_order_paths: Vec<&str> = chunks.iter().map(|c| c.file_path.as_str()).collect();
         assert_ne!(
-            expected_paths, insertion_paths,
-            "fixture is not discriminating: distance order equals insertion order"
-        );
-        assert_ne!(
-            expected_paths, lexicographic_paths,
-            "fixture is not discriminating: distance order equals primary-key order"
+            expected_paths, storage_order_paths,
+            "fixture is not discriminating: distance order equals insertion and primary-key order"
         );
 
         let results =
