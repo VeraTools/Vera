@@ -95,7 +95,12 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
             let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
             checks.push(local_model_assets_check(&model_assets, &repair_hint));
             if probe {
-                checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
+                checks.extend(probe_local_backend(
+                    ep,
+                    &runtime_path,
+                    &model_assets,
+                    &embedding_model,
+                )?);
             }
         }
         vera_core::config::InferenceBackend::PotionCode => {
@@ -299,6 +304,7 @@ fn probe_local_backend(
     ep: vera_core::config::OnnxExecutionProvider,
     runtime_path: &std::path::Path,
     model_assets: &[vera_core::local_models::LocalModelAssetStatus],
+    embedding_model: &vera_core::local_models::LocalEmbeddingModelConfig,
 ) -> anyhow::Result<Vec<DoctorCheck>> {
     let mut checks = Vec::new();
 
@@ -456,24 +462,16 @@ fn probe_local_backend(
         // some models are pinned to CPU under CoreML (see
         // `embedding_execution_provider`). Report what the configured model
         // actually does rather than asserting embeddings run on the GPU.
-        // A config that cannot be read is a third state: it must not be
-        // reported as "configured for CoreML".
-        let embedding_on_cpu = vera_core::local_models::LocalEmbeddingModelConfig::from_env()
-            .ok()
-            .map(|config| {
-                vera_core::local_models::embedding_execution_provider(ep, &config)
-                    == vera_core::config::OnnxExecutionProvider::Cpu
-            });
-        let detail = match embedding_on_cpu {
-            Some(true) => {
-                "the reranker and the configured embedding model both run on CPU under CoreML (no CoreML-compatible reranker ONNX export exists, and this embedding model fails at inference on the CoreML provider), so this backend is not currently GPU-accelerated. If search latency is unacceptable, disable reranking with `vera config set retrieval.reranking_enabled false`"
-            }
-            Some(false) => {
-                "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists). The embedding model is configured for CoreML, but ONNX Runtime can still place nodes on CPU, so active GPU execution cannot be confirmed here. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`"
-            }
-            None => {
-                "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists). The embedding model's placement could not be determined because the local embedding configuration could not be read. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`"
-            }
+        // `run` resolves the embedding config before probing and propagates
+        // any failure, so this is the already-validated config rather than a
+        // second read that could disagree with it.
+        let embedding_on_cpu =
+            vera_core::local_models::embedding_execution_provider(ep, embedding_model)
+                == vera_core::config::OnnxExecutionProvider::Cpu;
+        let detail = if embedding_on_cpu {
+            "the reranker and the configured embedding model both run on CPU under CoreML (no CoreML-compatible reranker ONNX export exists, and this embedding model fails at inference on the CoreML provider), so this backend is not currently GPU-accelerated. If search latency is unacceptable, disable reranking with `vera config set retrieval.reranking_enabled false`"
+        } else {
+            "the reranker runs on CPU under CoreML (no CoreML-compatible reranker ONNX export exists). The embedding model is configured for CoreML, but ONNX Runtime can still place nodes on CPU, so active GPU execution cannot be confirmed here. If reranking latency is unacceptable, disable it with `vera config set retrieval.reranking_enabled false`"
         };
         checks.push(DoctorCheck {
             name: "probe-reranker-coreml-cpu",
