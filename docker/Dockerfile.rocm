@@ -1,6 +1,8 @@
 # Vera ROCm Docker image (AMD GPU)
 # Packages a prebuilt binary. CI builds it once per release; to build locally
-# (must be a Linux x86_64 build; on macOS/Windows use a Linux container, see docs/docker.md):
+# (must be a Linux x86_64 build; on macOS/Windows use a Linux container, see docs/docker.md).
+# Pulling the ghcr.io base image below requires GHCR auth unless the package is
+# made public: docker login ghcr.io -u <github-user> (password: a PAT with read:packages).
 #   ./scripts/bootstrap-vendored-grammars.sh
 #   cargo build --release -p vera-cli && mkdir -p dist && cp target/release/vera dist/
 #   docker build -f docker/Dockerfile.rocm -t vera:rocm .
