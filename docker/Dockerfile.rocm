@@ -6,7 +6,11 @@
 #   docker build -f docker/Dockerfile.rocm -t vera:rocm .
 # Run:   docker run --device=/dev/kfd --device=/dev/dri -i -v $(pwd):/workspace vera:rocm mcp
 
-FROM rocm/dev-ubuntu-24.04:6.4.4-complete
+# Base is our GHCR mirror of rocm/dev-ubuntu-24.04:6.4.4-complete (digest-verified
+# copy). Direct Docker Hub pulls of its 5.5GB layer arrived corrupted on our CI
+# runners (4/4 builds, "unexpected commit digest" with a different wrong digest
+# each run). Re-mirror with .github/workflows/rocm-base-mirror.yml if bumping.
+FROM ghcr.io/veratools/vera:rocm-base-6.4.4-complete
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl && \

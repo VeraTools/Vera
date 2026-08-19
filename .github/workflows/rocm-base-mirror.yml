@@ -1,0 +1,46 @@
+name: Mirror ROCm base
+
+# The ROCm base image's 5.5GB layer arrived corrupted when pulled from Docker
+# Hub on our CI runners ("unexpected commit digest", different wrong digest
+# each run), so Dockerfile.rocm builds FROM a GHCR mirror of it instead. Run
+# this once per base-image bump; it copies registry-to-registry on a
+# GitHub-hosted runner (no Blacksmith network in the path) and verifies the
+# manifest digest matches Docker Hub exactly.
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: 'rocm/dev-ubuntu-24.04 tag to mirror'
+        required: true
+        default: 6.4.4-complete
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install crane
+        run: |
+          curl -sL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz | sudo tar xz -C /usr/local/bin crane
+          crane version
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Copy ROCm base image to GHCR
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+        run: crane copy "rocm/dev-ubuntu-24.04:${BASE_TAG}" "ghcr.io/veratools/vera:rocm-base-${BASE_TAG}"
+
+      - name: Verify digest parity
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+        run: |
+          SRC=$(crane digest "rocm/dev-ubuntu-24.04:${BASE_TAG}")
+          DST=$(crane digest "ghcr.io/veratools/vera:rocm-base-${BASE_TAG}")
+          echo "source=$SRC mirror=$DST"
+          test "$SRC" = "$DST"

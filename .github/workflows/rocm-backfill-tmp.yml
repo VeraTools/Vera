@@ -1,0 +1,55 @@
+name: Backfill 1.0.1-rocm (one-off)
+# Temporary: publishes the missing 1.0.1-rocm image using the mirrored base.
+# Deleted before this branch merges.
+on:
+  push:
+    branches: [ci/rocm-base-mirror]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    concurrency:
+      group: docker-image-publication-rocm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download v1.0.1 --pattern 'vera-x86_64-unknown-linux-gnu.tar.gz' --dir artifacts --clobber
+          mkdir -p dist
+          tar xzf artifacts/vera-x86_64-unknown-linux-gnu.tar.gz -C artifacts
+          cp artifacts/vera-x86_64-unknown-linux-gnu/vera dist/vera
+          chmod +x dist/vera
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: docker-v2-rocm
+
+      - name: Build and push
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: docker/Dockerfile.rocm
+          push: true
+          tags: |
+            ghcr.io/veratools/vera:rocm
+            ghcr.io/veratools/vera:1.0.1-rocm
