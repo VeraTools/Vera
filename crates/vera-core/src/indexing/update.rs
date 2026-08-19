@@ -605,9 +605,7 @@ where
             .map(|file| {
                 metadata_store
                     .get_chunks_by_file(&file.path)
-                    .with_context(|| {
-                        format!("failed to inspect existing chunks for {}", file.path)
-                    })
+                    .with_context(|| format!("failed to inspect existing chunks for {}", file.path))
                     .map(|chunks| file.modified || !chunks.is_empty())
             })
             .collect::<Result<_>>()?;

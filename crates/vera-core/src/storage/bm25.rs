@@ -505,7 +505,15 @@ mod tests {
     #[test]
     fn delete_by_files_removes_every_path_and_keeps_the_rest() {
         let index = Bm25Index::open_in_memory().unwrap();
-        index.insert_batch(&sample_docs()).unwrap();
+        let mut docs = sample_docs();
+        docs.push(Bm25Document {
+            chunk_id: "src/keep.rs:0",
+            file_path: "src/keep.rs",
+            content: "fn hello_survivor() {}",
+            symbol_name: Some("hello_survivor"),
+            language: "rust",
+        });
+        index.insert_batch(&docs).unwrap();
         let before = index.doc_count().unwrap();
 
         // src/main.rs has two documents; deleting it and one other path must
@@ -516,14 +524,13 @@ mod tests {
 
         assert_eq!(index.doc_count().unwrap(), before - 3);
 
-        // The query has to match a surviving document *and* a deleted one, or
-        // the loop below cannot fail: a term present only in the deleted docs
-        // returns zero hits after deletion and `all()` passes trivially.
-        // "name" is in src/main.rs:1 (deleted) and fuzz/Cargo.toml:0 (kept).
-        let hits = index.search("name", 50).unwrap();
+        // "hello" occurs in both deleted paths and in src/keep.rs, so every
+        // path assertion below can fail while the result set stays non-empty.
+        let hits = index.search("hello", 50).unwrap();
         assert!(
-            !hits.is_empty(),
-            "query must match surviving documents, or the assertion is vacuous"
+            hits.iter()
+                .any(|hit| hit.chunk_id.starts_with("src/keep.rs:")),
+            "the unrelated hello document must survive"
         );
         for path in ["src/main.rs:", "src/lib.py:"] {
             assert!(
