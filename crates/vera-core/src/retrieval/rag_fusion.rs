@@ -21,8 +21,8 @@ use crate::types::{SearchFilters, SearchResult};
 
 use super::completion_client::CompletionClient;
 use super::hybrid::fuse_rrf_multi_weighted;
-use super::multi_query_candidate_limit;
 use super::search_service::{SearchContext, SearchTimings};
+use super::{multi_query_candidate_limit, normalize_queries};
 
 /// Execute deep search: RAG-fusion if a completion endpoint is configured,
 /// otherwise fall back to iterative symbol-following search.
@@ -167,30 +167,10 @@ async fn execute_rag_fusion_with_context(
 }
 
 fn dedupe_queries_with_original(original: &str, alternatives: Vec<String>) -> Vec<String> {
-    let mut deduped = Vec::with_capacity(alternatives.len() + 1);
-    let mut seen = std::collections::HashSet::new();
-
-    let original = normalize_query(original);
-    if !original.is_empty() {
-        seen.insert(original.to_ascii_lowercase());
-        deduped.push(original);
-    }
-
-    for alt in alternatives {
-        let normalized = normalize_query(&alt);
-        if normalized.is_empty() {
-            continue;
-        }
-        if seen.insert(normalized.to_ascii_lowercase()) {
-            deduped.push(normalized);
-        }
-    }
-
-    deduped
-}
-
-fn normalize_query(query: &str) -> String {
-    query.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut all = Vec::with_capacity(alternatives.len() + 1);
+    all.push(original.to_string());
+    all.extend(alternatives);
+    normalize_queries(&all)
 }
 
 fn merge_timings(target: &mut SearchTimings, incoming: &SearchTimings) {

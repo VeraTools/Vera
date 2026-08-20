@@ -108,3 +108,32 @@ pub fn multi_query_candidate_limit(result_limit: usize) -> usize {
         .max(result_limit.saturating_add(10))
         .max(20)
 }
+
+/// Merge per-subquery result sets: equally weighted RRF, then exact-match
+/// augmentation, then the cut to `result_limit`.
+///
+/// `fuse_limit` is a parameter rather than a constant because the two callers
+/// disagree on it and are meant to. MCP passes `multi_query_candidate_limit`,
+/// so augmentation still has candidates to displace; `vera search` passes
+/// `result_limit`, truncating before augmenting, which is issue #121 and is
+/// left alone here. Collapsing them would silently change CLI results.
+pub fn fuse_and_augment_multi_query(
+    index_dir: &std::path::Path,
+    queries: &[String],
+    result_sets: &[Vec<SearchResult>],
+    filters: &SearchFilters,
+    rrf_k: f64,
+    fuse_limit: usize,
+    result_limit: usize,
+) -> anyhow::Result<Vec<SearchResult>> {
+    let slices: Vec<&[SearchResult]> = result_sets.iter().map(Vec::as_slice).collect();
+    let weights = vec![1.0; result_sets.len()];
+    let fused = fuse_rrf_multi_weighted(&slices, &weights, rrf_k, fuse_limit);
+    exact_matches::augment_multi_query_exact_matches(
+        index_dir,
+        queries,
+        fused,
+        filters,
+        result_limit,
+    )
+}

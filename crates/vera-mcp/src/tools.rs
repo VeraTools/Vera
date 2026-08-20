@@ -656,20 +656,13 @@ fn fuse_multi_query_results(
     rrf_k: f64,
     result_limit: usize,
 ) -> anyhow::Result<Vec<vera_core::types::SearchResult>> {
-    let slices: Vec<&[vera_core::types::SearchResult]> =
-        result_sets.iter().map(Vec::as_slice).collect();
-    let weights = vec![1.0; result_sets.len()];
-    let fused = vera_core::retrieval::fuse_rrf_multi_weighted(
-        &slices,
-        &weights,
-        rrf_k,
-        vera_core::retrieval::multi_query_candidate_limit(result_limit),
-    );
-    vera_core::retrieval::search_service::augment_multi_query_exact_matches(
+    vera_core::retrieval::fuse_and_augment_multi_query(
         index_dir,
         queries,
-        fused,
+        result_sets,
         filters,
+        rrf_k,
+        vera_core::retrieval::multi_query_candidate_limit(result_limit),
         result_limit,
     )
 }

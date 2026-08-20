@@ -122,7 +122,6 @@ impl SearchRunner<'_> {
         let overall_start = Instant::now();
         let per_query_limit = vera_core::retrieval::multi_query_candidate_limit(self.result_limit);
         let mut timings = SearchTimings::default();
-        let mut weights = Vec::with_capacity(queries.len());
         let mut result_sets = Vec::with_capacity(queries.len());
 
         for query in queries {
@@ -133,21 +132,15 @@ impl SearchRunner<'_> {
             let (results, query_timings) = query_runner.execute_query(query, intent)?;
             merge_timings(&mut timings, &query_timings);
             result_sets.push(results);
-            weights.push(1.0);
         }
 
-        let slices: Vec<&[SearchResult]> = result_sets.iter().map(Vec::as_slice).collect();
-        let fused = vera_core::retrieval::fuse_rrf_multi_weighted(
-            &slices,
-            &weights,
-            self.config.retrieval.rrf_k,
-            self.result_limit,
-        );
-        let fused = vera_core::retrieval::search_service::augment_multi_query_exact_matches(
+        let fused = vera_core::retrieval::fuse_and_augment_multi_query(
             self.index_dir,
             queries,
-            fused,
+            &result_sets,
             self.filters,
+            self.config.retrieval.rrf_k,
+            self.result_limit,
             self.result_limit,
         )?;
         timings.total = Some(overall_start.elapsed());
