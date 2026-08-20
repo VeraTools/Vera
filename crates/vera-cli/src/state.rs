@@ -484,13 +484,14 @@ mod tests {
 
     /// A stored model that prefixes queries only.
     ///
-    /// The repo is jina's on purpose: `defaults_for_source` answers it with a
-    /// preset that *does* carry a document prefix, so a default reinstated for
-    /// the missing field is visible. An unrecognised repo would fall to
-    /// `generic_defaults`, whose document prefix is already `None`, and the
-    /// assertion would pass for want of a default rather than because the
-    /// stored config won. Pooling, dimension and length are still nothing any
-    /// preset produces, so those assertions stay honest too.
+    /// The repo is jina's so that `defaults_for_source` answers it with a preset
+    /// that *does* carry a document prefix. That is not because the resolution
+    /// consults it (the test pins the arm actually taken), but because a preset
+    /// prefix is what gives the `None` assertion something to fail against:
+    /// delete the explicit-model short-circuit and jina's
+    /// `Document:` surfaces. An unrecognised repo would fall to
+    /// `generic_defaults`, whose document prefix is `None` on both sides of that
+    /// change, so nothing could distinguish them.
     const STORED_QUERY_PREFIX_ONLY_CONFIG: &str = r#"{
       "local_embedding_model": {
         "source": {"source": "hugging-face",
@@ -666,8 +667,30 @@ mod tests {
             "Ask:"
         );
 
+        // The force path exports a source and an onnx file together, which is
+        // exactly the pair `model_source_and_onnx_file_are_set` tests, so
+        // `explicit_model_env` is always on downstream of it. That makes
+        // `resolve_optional_env_value` take its `None if explicit_model_env`
+        // arm; the `None => default` arm is unreachable from this entry point,
+        // so no fixture stored through `config.json` can exercise it.
+        assert!(
+            std::env::var_os(vera_core::local_models::LOCAL_EMBEDDING_REPO_ENV).is_some()
+                && std::env::var_os(vera_core::local_models::LOCAL_EMBEDDING_ONNX_FILE_ENV)
+                    .is_some(),
+            "the force path is supposed to make the model explicit through the environment"
+        );
+
         let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
         assert_eq!(model.query_prefix.as_deref(), Some("Ask:"));
+        // What is left to pin is that arm returning nothing rather than the
+        // preset's prefix. There is a preset prefix to return, so `None` below
+        // is a declined default and not an absent one.
+        assert!(
+            vera_core::local_models::LocalEmbeddingModelConfig::jina()
+                .document_prefix
+                .is_some(),
+            "the fixture's repo must have a preset document prefix, or `None` below proves nothing"
+        );
         assert_eq!(model.document_prefix, None);
     }
 
