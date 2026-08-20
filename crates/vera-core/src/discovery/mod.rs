@@ -385,21 +385,27 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     // enumerated; reject the whole path before reading metadata, ignore rules
     // or content through the link. The scan runs on the path as written, since
     // collapsing `..` first erases the very links the kernel would traverse.
-    if let Some(link) = symlinked_ancestor(&root, root_relative)? {
-        return Ok(path_excluded(
-            display_input,
-            absolute_display,
-            relative_path,
-            IgnoreMatchExplanation {
-                reason: PathReason::NonRegularFile,
-                source: Some("discovery".to_string()),
-                pattern: None,
-                details: Some(format!(
-                    "the ancestor {} is a symbolic link, and symbolic links are not followed during indexing",
-                    link.display()
-                )),
-            },
-        ));
+    match scan_ancestors(&root, root_relative)? {
+        AncestorScan::Symlink(link) => {
+            return Ok(path_excluded(
+                display_input,
+                absolute_display,
+                relative_path,
+                IgnoreMatchExplanation {
+                    reason: PathReason::NonRegularFile,
+                    source: Some("discovery".to_string()),
+                    pattern: None,
+                    details: Some(format!(
+                        "the ancestor {} is a symbolic link, and symbolic links are not followed during indexing",
+                        link.display()
+                    )),
+                },
+            ));
+        }
+        AncestorScan::MissingAncestor => {
+            return Ok(path_missing(display_input, absolute_display, relative_path));
+        }
+        AncestorScan::Clear => {}
     }
 
     // Inspect the link itself, not its target, so this diagnostic reports the
@@ -407,16 +413,7 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     let metadata = match std::fs::symlink_metadata(&candidate) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PathExplanation {
-                input_path: display_input,
-                absolute_path: absolute_display,
-                relative_path: Some(relative_path),
-                decision: PathDecision::Missing,
-                reason: PathReason::Missing,
-                source: None,
-                pattern: None,
-                details: Some("path does not exist".to_string()),
-            });
+            return Ok(path_missing(display_input, absolute_display, relative_path));
         }
         Err(err) => {
             return Err(err)
@@ -609,19 +606,30 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     })
 }
 
-/// Return the first repository-relative ancestor of `relative` that is a
-/// symbolic link, ignoring the final component.
+/// What a walk of `relative`'s ancestors found, ignoring the final component.
+enum AncestorScan {
+    /// Every ancestor exists and none of them is a symbolic link.
+    Clear,
+    /// The first ancestor that is a symbolic link, repository-relative.
+    Symlink(PathBuf),
+    /// An ancestor does not exist, so the path cannot resolve at all.
+    MissingAncestor,
+}
+
+/// Walk the ancestors of `relative` under `root`, stopping at the first that is
+/// a symbolic link or does not exist.
 ///
 /// `relative` must be the path as it was written, before `..` segments are
 /// collapsed. The kernel resolves left to right, so `link/../file` traverses
 /// `link`, while collapsing the pair lexically first erases the link and leaves
-/// no ancestor to inspect. The scan therefore keeps its own lexical prefix and
+/// no ancestor to inspect. The walk therefore keeps its own lexical prefix and
 /// treats a `..` as one more component following whatever precedes it.
 ///
-/// A missing ancestor cannot hide a link behind it, because every path below it
-/// is missing too, so the scan continues and the caller still reports the path
-/// as missing rather than as a link.
-fn symlinked_ancestor(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
+/// A missing ancestor is reported separately rather than skipped, because the
+/// kernel cannot resolve through it either: `absent/../link/file` is missing, not
+/// a link, and normalizing `absent/..` away would otherwise leave the caller
+/// inspecting a path the operating system would never reach.
+fn scan_ancestors(root: &Path, relative: &Path) -> Result<AncestorScan> {
     let mut prefix = PathBuf::new();
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
@@ -629,21 +637,23 @@ fn symlinked_ancestor(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
             Component::CurDir => continue,
             Component::ParentDir => {
                 if !prefix.pop() {
-                    return Ok(None);
+                    return Ok(AncestorScan::Clear);
                 }
                 continue;
             }
             Component::Normal(part) => prefix.push(part),
-            Component::RootDir | Component::Prefix(_) => return Ok(None),
+            Component::RootDir | Component::Prefix(_) => return Ok(AncestorScan::Clear),
         }
         if components.peek().is_none() {
             break;
         }
         let ancestor = root.join(&prefix);
         match std::fs::symlink_metadata(&ancestor) {
-            Ok(metadata) if metadata.is_symlink() => return Ok(Some(prefix)),
+            Ok(metadata) if metadata.is_symlink() => return Ok(AncestorScan::Symlink(prefix)),
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AncestorScan::MissingAncestor);
+            }
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!("failed to read metadata for {}", ancestor.display())
@@ -651,7 +661,7 @@ fn symlinked_ancestor(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
             }
         }
     }
-    Ok(None)
+    Ok(AncestorScan::Clear)
 }
 
 /// Resolve `path` against `root`, returning both the root-relative path as it
@@ -931,6 +941,23 @@ fn path_excluded(
         source: explanation.source,
         pattern: explanation.pattern,
         details: explanation.details,
+    }
+}
+
+fn path_missing(
+    input_path: String,
+    absolute_path: String,
+    relative_path: String,
+) -> PathExplanation {
+    PathExplanation {
+        input_path,
+        absolute_path,
+        relative_path: Some(relative_path),
+        decision: PathDecision::Missing,
+        reason: PathReason::Missing,
+        source: None,
+        pattern: None,
+        details: Some("path does not exist".to_string()),
     }
 }
 
@@ -1748,7 +1775,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn explain_path_scans_past_a_missing_segment_for_a_symlinked_ancestor() {
+    fn explain_path_reports_a_missing_ancestor_as_missing() {
         let outside = TempDir::new().unwrap();
         let secrets = outside.path().join("secrets");
         fs::create_dir_all(secrets.join("nested")).unwrap();
@@ -1757,17 +1784,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::os::unix::fs::symlink(&secrets, dir.path().join("link")).unwrap();
 
-        // A missing segment cancels itself out lexically, so the scan has to
-        // keep going: stopping at `absent` would hand the checks below a
-        // candidate that reaches through `link` and report it as indexed.
+        // The kernel cannot resolve through `absent`, so the path is missing.
+        // Collapsing `absent/..` away instead would leave the checks below
+        // inspecting a candidate that reaches through `link`.
         let explanation = explain_path(
             dir.path(),
             Path::new("absent/../link/nested/secret.rs"),
             &default_config(),
         )
         .unwrap();
-        assert_eq!(explanation.decision, PathDecision::Excluded);
-        assert_eq!(explanation.reason, PathReason::NonRegularFile);
+        assert_eq!(explanation.decision, PathDecision::Missing);
+        assert_eq!(explanation.reason, PathReason::Missing);
     }
 
     #[test]
