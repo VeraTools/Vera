@@ -478,3 +478,146 @@ fn resolve_macos_rpath_executable_path_with_slash() {
         expected
     );
 }
+
+#[test]
+fn pooling_display_and_from_str_round_trip() {
+    // `state.rs` writes pooling to the environment via Display and reads it
+    // back through FromStr, so any spelling those two disagree on silently
+    // fails to reload a saved config.
+    for mode in [
+        LocalEmbeddingPooling::Mean,
+        LocalEmbeddingPooling::Cls,
+        LocalEmbeddingPooling::LastToken,
+    ] {
+        let rendered = mode.to_string();
+        assert_eq!(
+            rendered.parse::<LocalEmbeddingPooling>(),
+            Ok(mode),
+            "Display emitted `{rendered}`, which FromStr does not accept"
+        );
+    }
+}
+
+#[test]
+fn pooling_from_str_accepts_last_token_spellings() {
+    for spelling in [
+        "last-token",
+        "lasttoken",
+        "last_token",
+        "LAST-TOKEN",
+        " last-token ",
+    ] {
+        assert_eq!(
+            spelling.parse::<LocalEmbeddingPooling>(),
+            Ok(LocalEmbeddingPooling::LastToken),
+            "rejected `{spelling}`"
+        );
+    }
+}
+
+#[test]
+fn pooling_from_str_error_lists_every_accepted_mode() {
+    let err = "bogus".parse::<LocalEmbeddingPooling>().unwrap_err();
+    for mode in [
+        LocalEmbeddingPooling::Mean,
+        LocalEmbeddingPooling::Cls,
+        LocalEmbeddingPooling::LastToken,
+    ] {
+        assert!(
+            err.contains(&mode.to_string()),
+            "error `{err}` omits `{mode}`, so the CLI cannot advertise it"
+        );
+    }
+}
+
+#[test]
+fn jina_preset_pools_on_the_last_token() {
+    // jina-embeddings-v5-text-nano-retrieval declares `pooling_mode_lasttoken`
+    // in 1_Pooling/config.json. Mean pooling of its last_hidden_state scores
+    // cos 0.59-0.66 against the graph's own `sentence_embedding` output;
+    // last-token pooling reproduces it exactly.
+    assert_eq!(
+        LocalEmbeddingModelConfig::jina().pooling,
+        LocalEmbeddingPooling::LastToken
+    );
+    assert_eq!(
+        LocalEmbeddingModelConfig::default().pooling,
+        LocalEmbeddingPooling::LastToken
+    );
+    assert_eq!(
+        LocalEmbeddingModelConfig::from_huggingface_repo(EMBEDDING_REPO).pooling,
+        LocalEmbeddingPooling::LastToken
+    );
+}
+
+#[test]
+fn unknown_repo_still_defaults_to_mean_pooling() {
+    // Fixing jina's pooling must not reach through the shared fallback and
+    // repool every custom model.
+    let config = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+    assert_eq!(config.pooling, LocalEmbeddingPooling::Mean);
+    assert_eq!(
+        LocalEmbeddingModelConfig::coderankembed().pooling,
+        LocalEmbeddingPooling::Cls
+    );
+}
+
+#[test]
+fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
+    // Vectors pooled two ways are not comparable. If the preset identity
+    // ignored pooling, upgrading would query mean-pooled rows with last-token
+    // vectors and silently return worse results instead of asking for a
+    // re-index.
+    let jina = LocalEmbeddingModelConfig::jina();
+    let mut mean_pooled = jina.clone();
+    mean_pooled.pooling = LocalEmbeddingPooling::Mean;
+
+    assert_ne!(jina.model_identity(), mean_pooled.model_identity());
+    assert_ne!(jina.model_identity(), jina.display_name());
+    assert!(jina.model_identity().contains("last-token"));
+    // The repo still has to be recognisable in the stored name.
+    assert!(jina.model_identity().starts_with(&jina.display_name()));
+}
+
+#[test]
+fn stored_legacy_jina_config_is_repaired_to_last_token() {
+    // What `vera setup` wrote to config.json before the pooling fix.
+    let stored: LocalEmbeddingModelConfig = serde_json::from_str(
+        r#"{
+            "source": {"source": "hugging-face",
+                       "repo": "jinaai/jina-embeddings-v5-text-nano-retrieval"},
+            "onnx_file": "onnx/model_quantized.onnx",
+            "onnx_data_file": "onnx/model_quantized.onnx_data",
+            "tokenizer_file": "tokenizer.json",
+            "embedding_dim": 768,
+            "pooling": "mean",
+            "max_length": 512
+        }"#,
+    )
+    .expect("legacy config should still deserialize");
+    assert_eq!(stored.pooling, LocalEmbeddingPooling::Mean);
+
+    let repaired = stored.repair_stored_defaults();
+    assert_eq!(repaired.pooling, LocalEmbeddingPooling::LastToken);
+    assert_eq!(repaired, LocalEmbeddingModelConfig::jina());
+}
+
+#[test]
+fn repair_leaves_customised_and_unrelated_configs_alone() {
+    // A deliberate non-default choice on the same repo must survive.
+    let mut customised = LocalEmbeddingModelConfig::jina();
+    customised.pooling = LocalEmbeddingPooling::Mean;
+    customised.max_length = 256;
+    assert_eq!(customised.clone().repair_stored_defaults(), customised);
+
+    // A different repo that happens to be mean-pooled must survive.
+    let other = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+    assert_eq!(other.pooling, LocalEmbeddingPooling::Mean);
+    assert_eq!(other.clone().repair_stored_defaults(), other);
+
+    // Repair is idempotent and does not touch the other preset.
+    let jina = LocalEmbeddingModelConfig::jina();
+    assert_eq!(jina.clone().repair_stored_defaults(), jina);
+    let coderank = LocalEmbeddingModelConfig::coderankembed();
+    assert_eq!(coderank.clone().repair_stored_defaults(), coderank);
+}

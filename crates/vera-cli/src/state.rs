@@ -59,7 +59,14 @@ pub struct ApiSetupInput {
 }
 
 pub fn load_saved_config() -> Result<StoredConfig> {
-    load_json_file(&config_path()?)
+    let mut config: StoredConfig = load_json_file(&config_path()?)?;
+    // `setup` freezes the resolved model config here, and this copy outranks
+    // the preset. Without repair, an install created before jina's pooling was
+    // corrected keeps mean-pooling it indefinitely.
+    config.local_embedding_model = config
+        .local_embedding_model
+        .map(vera_core::local_models::LocalEmbeddingModelConfig::repair_stored_defaults);
+    Ok(config)
 }
 
 pub fn load_saved_secrets() -> Result<StoredSecrets> {

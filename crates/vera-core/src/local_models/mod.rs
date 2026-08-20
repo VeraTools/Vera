@@ -92,6 +92,9 @@ pub(super) static MODEL_DOWNLOAD_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 pub enum LocalEmbeddingPooling {
     Mean,
     Cls,
+    /// Take the final unpadded token. Required by decoder-style embedding
+    /// models (Qwen3-Embedding, F2LLM) and by jina-embeddings-v5.
+    LastToken,
 }
 
 impl fmt::Display for LocalEmbeddingPooling {
@@ -99,6 +102,7 @@ impl fmt::Display for LocalEmbeddingPooling {
         match self {
             Self::Mean => write!(f, "mean"),
             Self::Cls => write!(f, "cls"),
+            Self::LastToken => write!(f, "last-token"),
         }
     }
 }
@@ -110,8 +114,9 @@ impl std::str::FromStr for LocalEmbeddingPooling {
         match value.trim().to_ascii_lowercase().as_str() {
             "mean" => Ok(Self::Mean),
             "cls" => Ok(Self::Cls),
+            "last-token" | "lasttoken" | "last_token" => Ok(Self::LastToken),
             other => Err(format!(
-                "invalid pooling mode: {other} (expected `mean` or `cls`)"
+                "invalid pooling mode: {other} (expected `mean`, `cls` or `last-token`)"
             )),
         }
     }
@@ -173,11 +178,15 @@ impl LocalEmbeddingModelConfig {
         }
     }
 
+    /// `jina-embeddings-v5-text-nano-retrieval` pools on the final token, not
+    /// the mean: `1_Pooling/config.json` sets `pooling_mode_lasttoken`, and the
+    /// ONNX graph carries a matching `lasttoken_squeeze` + normalize path whose
+    /// result it exposes as a second `sentence_embedding` output.
     pub fn jina() -> Self {
         Self::preset(
             EMBEDDING_REPO,
             Some(EMBEDDING_ONNX_DATA_FILE),
-            LocalEmbeddingPooling::Mean,
+            LocalEmbeddingPooling::LastToken,
             None,
         )
     }
@@ -189,6 +198,31 @@ impl LocalEmbeddingModelConfig {
             LocalEmbeddingPooling::Cls,
             Some(CODERANK_QUERY_PREFIX),
         )
+    }
+
+    /// Repair a stored config that froze jina's old mean-pooling default.
+    ///
+    /// `vera setup` writes the resolved model config to `config.json` and that
+    /// copy wins over the preset, so an install created before this fix would
+    /// keep mean-pooling jina forever. Only the exact old preset is upgraded;
+    /// a config differing in any field is treated as deliberate and left
+    /// alone.
+    ///
+    /// The literal below coincides with `generic_defaults()` today, but the
+    /// two express different things: this one is a historical value that must
+    /// stay pinned even if the fallback shape changes.
+    pub fn repair_stored_defaults(self) -> Self {
+        let legacy_jina = Self::preset(
+            EMBEDDING_REPO,
+            Some(EMBEDDING_ONNX_DATA_FILE),
+            LocalEmbeddingPooling::Mean,
+            None,
+        );
+        if self == legacy_jina {
+            Self::jina()
+        } else {
+            self
+        }
     }
 
     pub fn from_huggingface_repo(repo: impl Into<String>) -> Self {
@@ -277,8 +311,12 @@ impl LocalEmbeddingModelConfig {
     }
 
     pub fn model_identity(&self) -> String {
+        // Presets keep a readable identity, but pooling has to stay in it.
+        // Vectors pooled two different ways are not comparable, so a pooling
+        // change must invalidate an existing index rather than silently query
+        // mean-pooled rows with last-token vectors.
         if self == &Self::jina() || self == &Self::coderankembed() {
-            return self.display_name();
+            return format!("{}|pooling={}", self.display_name(), self.pooling);
         }
 
         let source = match &self.source {
@@ -328,8 +366,24 @@ impl LocalEmbeddingModelConfig {
             LocalEmbeddingSource::HuggingFace { repo } if repo == CODERANK_EMBEDDING_REPO => {
                 Self::coderankembed()
             }
-            _ => Self::default(),
+            LocalEmbeddingSource::HuggingFace { repo } if repo == EMBEDDING_REPO => Self::jina(),
+            _ => Self::generic_defaults(),
         }
+    }
+
+    /// Asset shape for a repo Vera has no preset for: jina's file layout and
+    /// dimensions, with mean pooling.
+    ///
+    /// Held separate from `jina()` so that jina's own pooling can be correct
+    /// without changing how every custom repo is pooled. `from_source`
+    /// overwrites `source`, so only the non-source fields are inherited.
+    fn generic_defaults() -> Self {
+        Self::preset(
+            EMBEDDING_REPO,
+            Some(EMBEDDING_ONNX_DATA_FILE),
+            LocalEmbeddingPooling::Mean,
+            None,
+        )
     }
 
     fn apply_env_overrides(defaults: Self) -> Result<Self> {
