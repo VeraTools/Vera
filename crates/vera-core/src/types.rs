@@ -303,8 +303,12 @@ impl Chunk {
 }
 
 /// Programming language of a source file or chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// `Serialize`/`Deserialize` are implemented in terms of `Display`/`FromStr`
+/// rather than derived, so the JSON wire name is always the same string
+/// `--lang` accepts. A derived `rename_all` lowercases the Rust variant name,
+/// which silently diverges for any variant not named after its own wire name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
     TypeScript,
@@ -654,6 +658,29 @@ impl std::str::FromStr for Language {
             "unknown" => Ok(Self::Unknown),
             _ => Err(()),
         }
+    }
+}
+
+impl Serialize for Language {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Language {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(|()| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&name),
+                &"a language name accepted by --lang",
+            )
+        })
     }
 }
 
