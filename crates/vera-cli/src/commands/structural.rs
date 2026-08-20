@@ -18,6 +18,16 @@ pub enum StructuralIntent {
     Impls,
 }
 
+fn kind_for(intent: StructuralIntent) -> vera_core::retrieval::StructuralSearchKind {
+    match intent {
+        StructuralIntent::Definitions => vera_core::retrieval::StructuralSearchKind::Definitions,
+        StructuralIntent::Env => vera_core::retrieval::StructuralSearchKind::EnvReads,
+        StructuralIntent::Routes => vera_core::retrieval::StructuralSearchKind::RouteHandlers,
+        StructuralIntent::Sql => vera_core::retrieval::StructuralSearchKind::SqlQueries,
+        StructuralIntent::Impls => vera_core::retrieval::StructuralSearchKind::Implementations,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     intent: StructuralIntent,
@@ -34,22 +44,7 @@ pub fn run(
     let (index_dir, filters) =
         prepare_indexed_search(&config.indexing, filters, git_scope.as_ref())?;
 
-    let (kind, query) = match intent {
-        StructuralIntent::Definitions => (
-            vera_core::retrieval::StructuralSearchKind::Definitions,
-            query,
-        ),
-        StructuralIntent::Env => (vera_core::retrieval::StructuralSearchKind::EnvReads, query),
-        StructuralIntent::Routes => (
-            vera_core::retrieval::StructuralSearchKind::RouteHandlers,
-            None,
-        ),
-        StructuralIntent::Sql => (vera_core::retrieval::StructuralSearchKind::SqlQueries, None),
-        StructuralIntent::Impls => (
-            vera_core::retrieval::StructuralSearchKind::Implementations,
-            query,
-        ),
-    };
+    let kind = kind_for(intent);
 
     let started_at = Instant::now();
     let results = vera_core::retrieval::search_structural(

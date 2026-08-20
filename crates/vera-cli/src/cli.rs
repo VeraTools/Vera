@@ -342,7 +342,7 @@ pub enum Commands {
         /// Structural intent to run.
         #[arg(value_enum)]
         intent: crate::commands::structural::StructuralIntent,
-        /// Optional query term. Required for definitions and impls.
+        /// Query term. Required for definitions and impls, optional for env, rejected by routes and sql.
         query: Option<String>,
         #[command(flatten)]
         filters: crate::helpers::SearchFilterArgs,

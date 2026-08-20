@@ -136,6 +136,8 @@ This makes parser regressions and partial indexing visible instead of silent.
 - `sql` finds common SQL execution sites
 - `impls <symbol>` finds explicit implementations, conformances, and inheritance declarations
 
+`routes` and `sql` take no query term and reject one rather than ignoring it. Narrow those two with `--path`, `--lang`, or `--scope`.
+
 `impls` only returns explicit declarations. It does not guess implicit interface satisfaction in languages where that would require semantic analysis.
 
 Use this as the default structural workflow. Use `vera references` for exact caller/callee questions.

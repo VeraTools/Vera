@@ -292,7 +292,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "query": {
                         "type": "string",
-                        "description": "Required for definitions and implementation lookups. Optional for env_reads to narrow to one env var."
+                        "description": "Required for definitions and implementation lookups. Optional for env_reads to narrow to one env var. Rejected by route_handlers and sql_queries, which cannot narrow by term."
                     },
                     "lang": {
                         "type": "string",
