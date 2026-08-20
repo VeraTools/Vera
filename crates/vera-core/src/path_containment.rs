@@ -28,9 +28,16 @@ pub(crate) enum Containment {
 /// canonicalized root, so the root itself has to be canonical for files under a
 /// symlinked root to match.
 pub(crate) fn canonical_project_root(index_dir: &Path) -> Result<PathBuf> {
-    let root = index_dir
+    let parent = index_dir
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from index dir"))?;
+    // A relative index dir such as `.vera` has an empty parent, which names the
+    // current directory rather than nothing.
+    let root = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     root.canonicalize()
         .with_context(|| format!("failed to canonicalize project root: {}", root.display()))
 }
@@ -147,5 +154,23 @@ mod tests {
         let f = fixture();
         let root = canonical_project_root(&f.root.join(".vera")).unwrap();
         assert_eq!(root, f.root);
+    }
+
+    #[test]
+    fn relative_index_dir_takes_the_current_directory_as_the_root() {
+        // `Path::new(".vera").parent()` is `""`, not `None`, and a trailing
+        // slash is normalized away before the parent is taken, so both spellings
+        // have to land on the current directory.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(canonical_project_root(Path::new(".vera")).unwrap(), cwd);
+        assert_eq!(canonical_project_root(Path::new(".vera/")).unwrap(), cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_out_of_the_root_is_rejected_before_it_is_read() {
+        let f = fixture();
+        std::os::unix::fs::symlink(&f.canary, f.root.join("src/leak.rs")).unwrap();
+        assert_eq!(resolve_indexed_path(&f.root, "src/leak.rs"), None);
     }
 }
