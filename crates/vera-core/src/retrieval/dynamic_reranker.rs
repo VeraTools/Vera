@@ -81,28 +81,19 @@ pub async fn create_dynamic_reranker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-
-    const RERANKER_ENV_KEYS: [&str; 4] = [
-        "RERANKER_MODEL_BASE_URL",
-        "RERANKER_MODEL_ID",
-        "RERANKER_MODEL_API_KEY",
-        "VERA_MAX_RERANK_BATCH",
-    ];
+    use crate::test_env::EnvVarGuard;
 
     #[tokio::test]
     async fn api_reranker_batches_by_the_configured_value_not_the_environment() {
-        let saved: Vec<(&str, Option<OsString>)> = RERANKER_ENV_KEYS
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        unsafe {
-            std::env::set_var("RERANKER_MODEL_BASE_URL", "http://127.0.0.1:19998/v1");
-            std::env::set_var("RERANKER_MODEL_ID", "test-model");
-            std::env::set_var("RERANKER_MODEL_API_KEY", "test-key");
+        // Held across the await and dropped on any unwind, so the credentials
+        // and the batch value never outlive the test.
+        let _env = EnvVarGuard::set(&[
+            ("RERANKER_MODEL_BASE_URL", "http://127.0.0.1:19998/v1"),
+            ("RERANKER_MODEL_ID", "test-model"),
+            ("RERANKER_MODEL_API_KEY", "test-key"),
             // The value the old second env lookup would have produced.
-            std::env::set_var("VERA_MAX_RERANK_BATCH", "20");
-        }
+            ("VERA_MAX_RERANK_BATCH", "20"),
+        ]);
 
         let mut config = VeraConfig::default();
         config.retrieval.reranking_enabled = true;
@@ -111,15 +102,6 @@ mod tests {
         let reranker = create_dynamic_reranker(&config, InferenceBackend::Api)
             .await
             .unwrap();
-
-        unsafe {
-            for (key, value) in saved {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
 
         let Some(DynamicReranker::Api(api)) = reranker else {
             panic!("expected an API reranker for InferenceBackend::Api");

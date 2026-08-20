@@ -42,3 +42,6 @@ pub mod local_models;
 
 /// Index statistics collection.
 pub mod stats;
+
+#[cfg(test)]
+mod test_env;

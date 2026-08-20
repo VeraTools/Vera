@@ -439,10 +439,8 @@ mod tests {
     use crate::types::Language;
     use crate::types::{Chunk, SymbolType};
     use std::ffi::OsString;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
     const EMBEDDING_ENV_KEYS: [&str; 3] = [
         "EMBEDDING_MODEL_BASE_URL",
         "EMBEDDING_MODEL_ID",
@@ -476,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_dimension_mismatch_and_inference() {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env_guard = crate::test_env::env_lock();
         let dir = tempdir().unwrap();
         let index_dir = dir.path();
 
@@ -547,7 +545,7 @@ mod tests {
 
     #[test]
     fn model_metadata_mismatch_falls_back_to_bm25() {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env_guard = crate::test_env::env_lock();
         let saved_env = set_test_embedding_env("active-api-model");
         let dir = tempdir().unwrap();
         let index_dir = dir.path();

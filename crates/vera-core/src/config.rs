@@ -631,12 +631,7 @@ fn parse_model_alias_groups(value: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::test_env::env_lock;
 
     fn set_env(key: &str, value: &str) {
         unsafe {
@@ -667,7 +662,7 @@ mod tests {
 
     #[test]
     fn graph_augmentation_env_accepts_only_truthy_values() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock();
         let previous = std::env::var_os("VERA_GRAPH_AUGMENT");
 
         for value in ["1", "true", "TRUE", "yes", "YeS"] {
@@ -721,7 +716,7 @@ mod tests {
 
     #[test]
     fn max_in_flight_environment_value_normalizes_zero_to_one() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock();
         let previous = std::env::var_os("VERA_MAX_IN_FLIGHT_INPUTS");
         set_env("VERA_MAX_IN_FLIGHT_INPUTS", "0");
 
@@ -788,7 +783,7 @@ mod tests {
 
     #[test]
     fn resolve_backend_prefers_saved_backend_env() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock();
         set_env("VERA_BACKEND", "onnx-jina-cuda");
         set_env("VERA_LOCAL", "1");
 
@@ -803,7 +798,7 @@ mod tests {
 
     #[test]
     fn resolve_backend_falls_back_to_legacy_local_env() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock();
         remove_env("VERA_BACKEND");
         set_env("VERA_LOCAL", "1");
 
@@ -870,7 +865,7 @@ mod tests {
 
     #[test]
     fn model_names_match_env_alias_group() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock();
         set_env(
             "VERA_EMBEDDING_MODEL_ALIASES",
             "text-embedding-3-large,text-embedding-3-large-2;other,other-prod",
