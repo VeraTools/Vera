@@ -95,6 +95,10 @@ fn classify_with(table: &[(&[&str], SymbolType)], kind: &str) -> Option<SymbolTy
 ///   different construct family and want their own change.
 pub(crate) fn container_body_kinds(lang: Language) -> &'static [&'static str] {
     match lang {
+        // `file_scoped_namespace_declaration` ends at its semicolon rather than
+        // spanning the file, so recursing into it finds nothing. It is kept
+        // because the case this replaced listed it; a test pins that its
+        // members are siblings rather than children.
         Language::CSharp => &["namespace_declaration", "file_scoped_namespace_declaration"],
         Language::Ruby => &["class", "module"],
         Language::Kotlin => &["class_declaration", "object_declaration"],
