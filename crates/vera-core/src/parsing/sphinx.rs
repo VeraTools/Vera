@@ -13,6 +13,8 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use regex::Regex;
 
+use crate::path_containment::{self, Containment};
+
 const MAX_INCLUDE_DEPTH: usize = 16;
 
 /// Preprocess RST text for chunking and embedding.
@@ -127,20 +129,16 @@ fn resolve_include_path(
         current_file.parent().unwrap_or(repo_root).join(include_ref)
     };
 
-    let canonical = match candidate.canonicalize() {
-        Ok(path) => path,
-        Err(_) => return Ok(None),
-    };
-
     let canonical_repo_root = repo_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize repo root: {}", repo_root.display()))?;
 
-    if !canonical.starts_with(&canonical_repo_root) {
-        return Ok(None);
-    }
-
-    Ok(Some(canonical))
+    Ok(
+        match path_containment::resolve_within(&canonical_repo_root, &candidate) {
+            Containment::Inside(path) => Some(path),
+            Containment::Escaped | Containment::Unresolved => None,
+        },
+    )
 }
 
 fn normalize_roles(text: &str) -> String {

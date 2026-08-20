@@ -10,6 +10,7 @@ use tree_sitter::Parser;
 
 use crate::corpus::{ContentClass, classify_content};
 use crate::parsing::languages;
+use crate::path_containment::{canonical_project_root, resolve_indexed_path};
 use crate::retrieval::apply_filters;
 use crate::retrieval::file_scan::{
     allows_class, bounded_byte_snippet, language_for_path, smallest_symbol_chunk_for_line,
@@ -56,9 +57,7 @@ pub fn search_structural(
 
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
-    let repo_root = index_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from index dir"))?;
+    let repo_root = canonical_project_root(index_dir)?;
     let filters = structural_filters(filters);
 
     match kind {
@@ -67,12 +66,12 @@ pub fn search_structural(
             search_definitions(&store, symbol, limit, &filters)
         }
         StructuralSearchKind::EnvReads => {
-            search_env_reads(repo_root, &store, query, limit, &filters)
+            search_env_reads(&repo_root, &store, query, limit, &filters)
         }
         StructuralSearchKind::RouteHandlers => {
-            search_route_handlers(repo_root, &store, limit, &filters)
+            search_route_handlers(&repo_root, &store, limit, &filters)
         }
-        StructuralSearchKind::SqlQueries => search_sql_queries(repo_root, &store, limit, &filters),
+        StructuralSearchKind::SqlQueries => search_sql_queries(&repo_root, &store, limit, &filters),
         StructuralSearchKind::Implementations => {
             let target = required_query(kind, query)?;
             search_implementations(index_dir, target, limit, &filters)
@@ -263,7 +262,9 @@ where
             continue;
         }
 
-        let file_abs = repo_root.join(&file_rel);
+        let Some(file_abs) = resolve_indexed_path(repo_root, &file_rel) else {
+            continue;
+        };
         let content = match crate::discovery::read_source_lossy(&file_abs) {
             Ok(content) => content,
             Err(e) => {

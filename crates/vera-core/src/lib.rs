@@ -28,6 +28,7 @@ pub fn init_tls() {
 
 pub mod indexing;
 pub mod parsing;
+pub(crate) mod path_containment;
 pub mod presentation;
 pub mod retrieval;
 pub mod storage;
