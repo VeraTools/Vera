@@ -279,6 +279,27 @@ struct Holder {
 }
 
 #[test]
+fn hlsl_class_and_struct_keep_their_members() {
+    let symbols = extracted(
+        r#"
+class Widget {
+  int render() { return 1; }
+};
+
+struct Holder {
+  int fetch() { return 2; }
+};
+"#,
+        Language::Hlsl,
+    );
+
+    let class = require(&symbols, "Widget", SymbolType::Class);
+    let structure = require(&symbols, "Holder", SymbolType::Struct);
+    assert_nested(class, require(&symbols, "render", SymbolType::Function));
+    assert_nested(structure, require(&symbols, "fetch", SymbolType::Function));
+}
+
+#[test]
 fn groovy_class_and_interface_keep_their_members() {
     let symbols = extracted(
         r#"

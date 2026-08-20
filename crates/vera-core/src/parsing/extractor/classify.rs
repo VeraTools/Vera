@@ -87,7 +87,12 @@ fn classify_with(table: &[(&[&str], SymbolType)], kind: &str) -> Option<SymbolTy
 ///   D `module_declaration`, Clojure `ns`, Common Lisp `defpackage`.
 /// - Whole-unit chunks whose contents are markup or data rather than callables:
 ///   CSS `rule_set`, HTML/XML `element`, INI `section`, GraphQL type
-///   definitions, Nix `let_expression`.
+///   definitions, Nix `let_expression`, HCL `block`.
+/// - Constructs that do span classified children but are neither containers of
+///   callables nor part of this change: Protobuf `message` (nested messages and
+///   enums) and CMake `if_condition`/`foreach_loop`/`while_loop` (a
+///   conditionally defined `function_def`). Both swallow today; both are a
+///   different construct family and want their own change.
 pub(crate) fn container_body_kinds(lang: Language) -> &'static [&'static str] {
     match lang {
         Language::CSharp => &["namespace_declaration", "file_scoped_namespace_declaration"],
@@ -102,6 +107,9 @@ pub(crate) fn container_body_kinds(lang: Language) -> &'static [&'static str] {
             "class_specifier",
             "struct_specifier",
         ],
+        // HLSL is a C++-family grammar and spells member functions the same
+        // way. GLSL is not listed: its `struct_specifier` holds no callables.
+        Language::Hlsl => &["class_specifier", "struct_specifier"],
         Language::Groovy => &[
             "class_definition",
             "class_declaration",
