@@ -11,9 +11,12 @@ pub(crate) mod names;
 mod special_forms;
 
 #[cfg(test)]
+mod container_tests;
+
+#[cfg(test)]
 mod tests;
 
-use classify::classify_node;
+use classify::{classify_node, container_body_kinds};
 use names::extract_name;
 use special_forms::*;
 
@@ -131,6 +134,14 @@ fn collect_symbols(
     depth: usize,
 ) {
     if depth > 6 {
+        return;
+    }
+
+    // Anonymous nodes are punctuation and keywords, never symbols. Several
+    // classification tables use a bare keyword as the node kind of the
+    // construct it introduces (Ruby `class`, Fortran `module`), so walking into
+    // a container would otherwise record its own keyword token a second time.
+    if !node.is_named() {
         return;
     }
 
@@ -321,10 +332,11 @@ fn collect_symbols(
             return;
         }
 
-        // For C# namespace, we want to recurse inside.
-        if lang == Language::CSharp
-            && (kind == "namespace_declaration" || kind == "file_scoped_namespace_declaration")
-        {
+        // A container spans its body, so stopping here would swallow every
+        // symbol declared inside it. Record the container under its own
+        // `sym_type`, then keep walking so the items in its body become
+        // symbols of their own.
+        if container_body_kinds(lang).contains(&kind) {
             let name = extract_name(&node, source);
             symbols.push(RawSymbol::at(&node, name, sym_type));
             let mut cursor = node.walk();

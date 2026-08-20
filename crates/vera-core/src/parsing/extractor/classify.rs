@@ -73,6 +73,57 @@ fn classify_with(table: &[(&[&str], SymbolType)], kind: &str) -> Option<SymbolTy
         .find_map(|(kinds, ty)| kinds.contains(&kind).then_some(*ty))
 }
 
+/// Node kinds that [`classify_node`] recognises *and* whose span covers a body
+/// holding further symbols.
+///
+/// The extractor stops at the first classified node, so a container listed here
+/// would otherwise swallow everything declared inside it: one chunk for the
+/// whole class, module or namespace and no symbol for any method in it. The
+/// extractor records the container itself and then keeps walking into it.
+///
+/// Deliberately absent:
+/// - Header nodes that end at the declaration and never span a body: Perl
+///   `package_statement`, Erlang `module_attribute`, Elm `module_declaration`,
+///   D `module_declaration`, Clojure `ns`, Common Lisp `defpackage`.
+/// - Whole-unit chunks whose contents are markup or data rather than callables:
+///   CSS `rule_set`, HTML/XML `element`, INI `section`, GraphQL type
+///   definitions, Nix `let_expression`.
+pub(crate) fn container_body_kinds(lang: Language) -> &'static [&'static str] {
+    match lang {
+        Language::CSharp => &["namespace_declaration", "file_scoped_namespace_declaration"],
+        Language::Ruby => &["class", "module"],
+        Language::Kotlin => &["class_declaration", "object_declaration"],
+        // Swift spells `struct`, `enum` and `extension` as `class_declaration`
+        // too, so all four are covered by the one kind.
+        Language::Swift => &["class_declaration"],
+        Language::Scala => &["class_definition", "trait_definition", "object_definition"],
+        Language::Cpp => &[
+            "namespace_definition",
+            "class_specifier",
+            "struct_specifier",
+        ],
+        Language::Groovy => &[
+            "class_definition",
+            "class_declaration",
+            "interface_definition",
+            "interface_declaration",
+        ],
+        Language::PowerShell => &["class_statement"],
+        Language::Matlab => &["class_definition"],
+        Language::DLang => &[
+            "class_declaration",
+            "struct_declaration",
+            "interface_declaration",
+            "template_declaration",
+        ],
+        Language::OCaml => &["module_definition"],
+        Language::FSharp => &["module_defn"],
+        Language::Julia => &["module_definition"],
+        Language::Fortran => &["module", "program"],
+        _ => &[],
+    }
+}
+
 const SQL_KINDS: &[(&[&str], SymbolType)] = &[
     (
         &["create_table", "create_table_statement", "table_definition"],
@@ -309,17 +360,22 @@ const FORTRAN_KINDS: &[(&[&str], SymbolType)] = &[
         ],
         SymbolType::Function,
     ),
-    (&["module", "module_statement"], SymbolType::Module),
+    (&["module"], SymbolType::Module),
     (
         &["derived_type_definition", "type_statement"],
         SymbolType::Struct,
     ),
-    (&["program", "program_statement"], SymbolType::Block),
+    (&["program"], SymbolType::Block),
+    // "module_statement" and "program_statement" intentionally unmapped: they
+    // are the name-bearing header lines of the enclosing `module`/`program`,
+    // which is itself recorded, so mapping them yields a duplicate symbol
+    // spanning only the header.
 ];
 
 const POWERSHELL_KINDS: &[(&[&str], SymbolType)] = &[
     (&["function_statement"], SymbolType::Function),
     (&["class_statement"], SymbolType::Class),
+    (&["class_method_definition"], SymbolType::Method),
     (&["enum_statement"], SymbolType::Enum),
 ];
 
