@@ -72,7 +72,7 @@ pub fn search_explicit_implementations(
         if let Some(chunk) = smallest_symbol_chunk_for_line(&chunks, line) {
             line_start = chunk.line_start;
             line_end = chunk.line_end;
-            snippet = Some(signatures::extract_signature(
+            snippet = Some(signatures::extract_signature_for_path(
                 &chunk.content,
                 language,
                 &chunk.file_path,
