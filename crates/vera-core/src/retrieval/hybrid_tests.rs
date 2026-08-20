@@ -485,6 +485,14 @@ impl crate::embedding::EmbeddingProvider for SlowProvider {
 // there is no tolerance to choose, and a machine slow enough to stretch the
 // storage work stretches the outer time with it, so load widens the bound
 // instead of tightening it.
+//
+// Containment only decides the split while the outer time is the vector arm's.
+// BM25 runs concurrently and is awaited after it, so a BM25 arm that outlasts
+// the vector arm carries the outer time past the span the two stages are cut
+// from and leaves room for a doubled pair to fit inside it: measured, a 748 ms
+// BM25 against a 334 ms vector span lets the pre-fix code report 334 ms twice
+// and pass containment on 668 ms. The guard below rejects such a run rather
+// than deciding the split on it.
 #[tokio::test]
 async fn search_hybrid_charges_embedding_delay_to_embedding_not_vector() {
     let tmp = tempfile::tempdir().unwrap();
@@ -514,6 +522,7 @@ async fn search_hybrid_charges_embedding_delay_to_embedding_not_vector() {
 
     let embedding = timings.embedding.expect("embedding stage must be reported");
     let vector = timings.vector.expect("vector stage must be reported");
+    let bm25 = timings.bm25.expect("bm25 stage must be reported");
 
     // `sleep` never returns early, so this is a property of the provider rather
     // than of the machine: the model cost is charged to `embedding` in full.
@@ -522,7 +531,21 @@ async fn search_hybrid_charges_embedding_delay_to_embedding_not_vector() {
         "embedding must carry the provider cost: {embedding:?} < {delay:?}"
     );
 
-    // Together with the bound above this pins `vector` under `total - delay`,
+    // Both arms start together, so a BM25 arm that fits inside the reported
+    // pair finished no later than the vector arm and the await that follows it
+    // returned immediately, leaving `total` equal to the vector arm plus setup
+    // and fusion. That is what makes the containment below a statement about
+    // the split rather than about how long BM25 took. Rejecting the run is the
+    // right outcome here: the measurement cannot decide the property, and a
+    // pass would be the vacuous one.
+    assert!(
+        bm25 <= embedding + vector,
+        "BM25 outlasted the stages it overlaps, so the {total:?} the search \
+         took is BM25's wall time and cannot decide the split: bm25 {bm25:?} > \
+         embedding {embedding:?} + vector {vector:?}"
+    );
+
+    // Together with the bounds above this pins `vector` under `total - delay`,
     // leaving it only the cost outside the span to hide in, a few milliseconds
     // against this fixture. So a split that misattributes a material part of
     // the embedding fails too, not only one that charges the whole of it twice.
