@@ -554,9 +554,15 @@ mod tests {
         // reverse of distance order, then assert the pairing — not just that
         // distances ascend, which holds for any implementation that emits one
         // result per hit in hit order.
+        // Distances must be strictly increasing, or the KNN order between two
+        // equidistant vectors is unspecified and the assertion below would be
+        // decided by tie-breaking rather than by distance.
+        //   near 0.0   mid ~0.894   far ~1.414   (L2 from the query)
+        // Inserted in reverse of that order, so rowid order is not distance
+        // order and a SQL-ordered result cannot pass by accident.
         let store = VectorStore::open_in_memory(4).unwrap();
         store.insert("far", &[0.0, 0.0, 1.0, 0.0]).unwrap();
-        store.insert("mid", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        store.insert("mid", &[0.6, 0.8, 0.0, 0.0]).unwrap();
         store.insert("near", &[1.0, 0.0, 0.0, 0.0]).unwrap();
 
         let results = store.search(&[1.0, 0.0, 0.0, 0.0], 3).unwrap();
@@ -575,8 +581,8 @@ mod tests {
         );
         for pair in results.windows(2) {
             assert!(
-                pair[0].distance <= pair[1].distance,
-                "distances must ascend: {:?}",
+                pair[0].distance < pair[1].distance,
+                "distances must strictly ascend, or the order is a tie-break: {:?}",
                 results.iter().map(|r| r.distance).collect::<Vec<_>>()
             );
         }
