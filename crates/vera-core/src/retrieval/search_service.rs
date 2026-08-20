@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tokio::sync::OnceCell;
 use tracing::warn;
 
 use crate::config::{InferenceBackend, VeraConfig};
@@ -61,7 +62,15 @@ pub struct SearchContext {
     provider: Option<CachedEmbeddingProvider<DynamicProvider>>,
     model_name: Option<String>,
     provider_error: Option<String>,
-    reranker: Option<DynamicReranker>,
+    backend: InferenceBackend,
+    /// Cross-encoder session, built on first query that actually reranks.
+    ///
+    /// `None` inside the cell means "unavailable": either reranking is off in
+    /// config, or construction failed. See `reranker` for why that outcome is
+    /// cached.
+    reranker: OnceCell<Option<DynamicReranker>>,
+    #[cfg(test)]
+    reranker_builds: std::sync::atomic::AtomicUsize,
 }
 
 impl SearchContext {
@@ -86,22 +95,14 @@ impl SearchContext {
                 }
             };
 
-        let reranker = if provider.is_some() {
-            crate::retrieval::create_dynamic_reranker(config, backend)
-                .await
-                .unwrap_or_else(|err| {
-                    warn!("Failed to create reranker ({})", err);
-                    None
-                })
-        } else {
-            None
-        };
-
         Self {
             provider,
             model_name,
             provider_error,
-            reranker,
+            backend,
+            reranker: OnceCell::new(),
+            #[cfg(test)]
+            reranker_builds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -110,8 +111,69 @@ impl SearchContext {
             provider: None,
             model_name: None,
             provider_error: None,
-            reranker: None,
+            // Unused: with no embedding provider `search` returns on the
+            // BM25-only path before any reranker is resolved.
+            backend: InferenceBackend::Api,
+            reranker: OnceCell::new(),
+            #[cfg(test)]
+            reranker_builds: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Resolve the cross-encoder for one query, or `None` when this query does
+    /// not rerank or no reranker is available.
+    ///
+    /// The heuristic is evaluated before the build, so a query that skips
+    /// reranking never touches the session.
+    async fn reranker_for_query(
+        &self,
+        config: &VeraConfig,
+        has_intent: bool,
+        query: &str,
+        filters: &SearchFilters,
+    ) -> Option<&DynamicReranker> {
+        if !reranking_wanted(has_intent, query, filters) {
+            return None;
+        }
+        self.reranker(config).await
+    }
+
+    /// Number of times the reranker build actually ran. `OnceCell` caps it at
+    /// one; the interesting assertion is that it stays zero.
+    #[cfg(test)]
+    fn reranker_build_count(&self) -> usize {
+        self.reranker_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolve the cross-encoder, building it the first time one is needed.
+    ///
+    /// The local ONNX session is roughly a gigabyte of resident memory, and the
+    /// majority of queries never reach the reranker, so it must not be built
+    /// before the query is known (issue #100).
+    ///
+    /// Construction is cached on the context, not per query: MCP keeps one
+    /// `SearchContext` for the life of the session, so a long session pays the
+    /// load once. A failed build is cached the same way, deliberately. Retrying
+    /// per query would turn one missing model or unusable execution provider
+    /// into a multi-second stall on every subsequent search, and the failure
+    /// causes are static for a process (absent asset, bad EP, unset API key).
+    /// The cache is per context, so a new process or a rebuilt context retries.
+    async fn reranker(&self, config: &VeraConfig) -> Option<&DynamicReranker> {
+        self.reranker
+            .get_or_init(|| async {
+                #[cfg(test)]
+                self.reranker_builds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::retrieval::create_dynamic_reranker(config, self.backend)
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!("Failed to create reranker ({})", err);
+                        None
+                    })
+            })
+            .await
+            .as_ref()
     }
 
     pub fn embedding_provider(&self) -> Option<&CachedEmbeddingProvider<DynamicProvider>> {
@@ -211,10 +273,15 @@ impl SearchContext {
             }
         }
 
-        // Create optional reranker. An explicit intent is a semantic signal
-        // only the reranker/embedding side can use, so it forces reranking on.
-        let reranker_enabled =
-            reranking_enabled(self.reranker.is_some(), has_intent, query, filters);
+        // Decide before building: only a query that will actually be reranked
+        // pays for the cross-encoder session. An explicit intent is a semantic
+        // signal only the reranker/embedding side can use, so it forces
+        // reranking on. A reranker that is unavailable degrades to plain hybrid
+        // search, as it did when the build happened up front.
+        let reranker = self
+            .reranker_for_query(config, has_intent, query, filters)
+            .await;
+        let reranker_enabled = reranker.is_some();
 
         // Classify query to adapt fusion parameters.
         let query_type = classify_query(query);
@@ -230,11 +297,7 @@ impl SearchContext {
             RankingStage::Initial
         };
 
-        let (results, hybrid_timings) = if reranker_enabled {
-            let reranker = self
-                .reranker
-                .as_ref()
-                .expect("reranker_enabled requires an initialized reranker");
+        let (results, hybrid_timings) = if let Some(reranker) = reranker {
             search_hybrid_reranked_with_augmentation(
                 index_dir,
                 provider,
@@ -369,20 +432,18 @@ fn effective_rerank_candidates(configured: usize, result_limit: usize) -> usize 
     configured.max(result_limit)
 }
 
-/// Decide whether the cross-encoder reranker should run.
+/// Decide whether this query wants the cross-encoder reranker.
 ///
 /// Skip heuristics (short identifier / path-weighted / exact-path or
 /// symbol-type filtered lookups) are based on the raw query. But when the user
 /// supplies an `--intent`, they are asking for semantic ranking, so the
 /// reranker must run even for short raw queries — otherwise the intent-enriched
 /// query would never reach the cross-encoder. See issue #20.
-fn reranking_enabled(
-    reranker_present: bool,
-    has_intent: bool,
-    query: &str,
-    filters: &SearchFilters,
-) -> bool {
-    reranker_present && (has_intent || !should_skip_reranking(query, filters))
+///
+/// This answers only "does this query want reranking", never "is a reranker
+/// available": it is what gates the session build, so it must not need one.
+fn reranking_wanted(has_intent: bool, query: &str, filters: &SearchFilters) -> bool {
+    has_intent || !should_skip_reranking(query, filters)
 }
 
 fn should_skip_reranking(query: &str, filters: &SearchFilters) -> bool {
@@ -458,6 +519,25 @@ mod tests {
             std::env::set_var("EMBEDDING_MODEL_BASE_URL", "http://127.0.0.1:0");
             std::env::set_var("EMBEDDING_MODEL_ID", model_id);
             std::env::set_var("EMBEDDING_MODEL_API_KEY", "dummy-key");
+        }
+        saved
+    }
+
+    const RERANKER_ENV_KEYS: [&str; 3] = [
+        "RERANKER_MODEL_BASE_URL",
+        "RERANKER_MODEL_ID",
+        "RERANKER_MODEL_API_KEY",
+    ];
+
+    fn set_test_reranker_env() -> Vec<(&'static str, Option<OsString>)> {
+        let saved = RERANKER_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        unsafe {
+            std::env::set_var("RERANKER_MODEL_BASE_URL", "http://127.0.0.1:0");
+            std::env::set_var("RERANKER_MODEL_ID", "dummy-reranker-model");
+            std::env::set_var("RERANKER_MODEL_API_KEY", "dummy-key");
         }
         saved
     }
@@ -692,19 +772,73 @@ mod tests {
         // A short identifier query alone is skipped by the rerank heuristic.
         assert!(should_skip_reranking("authenticate", &filters));
         // Without intent that means reranking is off...
-        assert!(!reranking_enabled(true, false, "authenticate", &filters));
+        assert!(!reranking_wanted(false, "authenticate", &filters));
         // ...but an intent forces the cross-encoder to run so it sees the
         // intent-enriched query (issue #20 regression guard).
-        assert!(reranking_enabled(true, true, "authenticate", &filters));
-        // No reranker present: always off regardless of intent.
-        assert!(!reranking_enabled(false, true, "authenticate", &filters));
+        assert!(reranking_wanted(true, "authenticate", &filters));
         // Natural-language query without intent still reranks normally.
-        assert!(reranking_enabled(
-            true,
-            false,
-            "how does auth work",
-            &filters
-        ));
+        assert!(reranking_wanted(false, "how does auth work", &filters));
+    }
+
+    /// The cross-encoder session must not be built for queries that skip
+    /// reranking (issue #100), and must be built once, not per query, for those
+    /// that need it.
+    ///
+    /// The result sets are identical either way, so this asserts construction
+    /// directly via the build counter rather than any search output.
+    #[tokio::test]
+    async fn reranker_is_built_only_for_queries_that_rerank() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let saved_embedding = set_test_embedding_env("dummy-api-model");
+        let saved_reranker = set_test_reranker_env();
+
+        let config = VeraConfig::default();
+        let filters = SearchFilters::default();
+        let context = SearchContext::new(&config, crate::config::InferenceBackend::Api).await;
+
+        // Nothing is built up front, which is the whole point.
+        assert_eq!(context.reranker_build_count(), 0);
+
+        // Short identifier query: skipped by the heuristic, so no session.
+        assert!(!reranking_wanted(false, "Bm25Index", &filters));
+        assert!(
+            context
+                .reranker_for_query(&config, false, "Bm25Index", &filters)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            context.reranker_build_count(),
+            0,
+            "a query that skips reranking must not construct the reranker"
+        );
+
+        // Natural-language query: needs the cross-encoder, so build it now.
+        assert!(
+            context
+                .reranker_for_query(
+                    &config,
+                    false,
+                    "how are embeddings batched during indexing",
+                    &filters
+                )
+                .await
+                .is_some()
+        );
+        assert_eq!(context.reranker_build_count(), 1);
+
+        // A second reranking query reuses the cached session: laziness is per
+        // context, so a long MCP session does not pay repeatedly.
+        assert!(
+            context
+                .reranker_for_query(&config, false, "how does auth work", &filters)
+                .await
+                .is_some()
+        );
+        assert_eq!(context.reranker_build_count(), 1);
+
+        restore_test_env(saved_reranker);
+        restore_test_env(saved_embedding);
     }
 
     #[test]
