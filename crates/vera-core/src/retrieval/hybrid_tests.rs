@@ -284,6 +284,83 @@ fn rrf_distinct_results_no_overlap() {
 }
 
 #[test]
+fn rrf_ties_break_on_file_path_then_line_range() {
+    // Equal weights make the ties bit-identical: a result found only in BM25 at rank r
+    // and one found only in the vector list at rank r both score 1/(k + r). Fusion
+    // collects into a HashMap, so without an explicit tie-break the order of each pair
+    // is the HashMap seed, which is fresh per process.
+    let bm25 = vec![
+        make_result("z_bm25.rs", 1, 10, 5.0, None),
+        make_result("a_bm25.rs", 1, 10, 4.0, None),
+        make_result("shared.rs", 200, 210, 3.0, None),
+    ];
+    let vector = vec![
+        make_result("m_vec.rs", 1, 10, 0.9, None),
+        make_result("b_vec.rs", 1, 10, 0.8, None),
+        make_result("shared.rs", 30, 40, 0.7, None),
+    ];
+
+    // Each call builds a fresh HashMap, and std gives every HashMap in a thread its own
+    // hash keys, so repeating the call samples several orders within this one process.
+    for _ in 0..8 {
+        let results = fuse_rrf(&bm25, &vector, 60.0, 10);
+
+        let order: Vec<(&str, u32)> = results
+            .iter()
+            .map(|result| (result.file_path.as_str(), result.line_start))
+            .collect();
+
+        assert_eq!(
+            order,
+            vec![
+                // rank 1 tie, ascending file_path
+                ("m_vec.rs", 1),
+                ("z_bm25.rs", 1),
+                // rank 2 tie, ascending file_path
+                ("a_bm25.rs", 1),
+                ("b_vec.rs", 1),
+                // rank 3 tie, same file, ascending line_start numerically (a lexicographic
+                // compare of the "path:start:end" key would put 200 before 30)
+                ("shared.rs", 30),
+                ("shared.rs", 200),
+            ],
+            "tied RRF scores must order by (file_path, line_start, line_end)"
+        );
+    }
+}
+
+#[test]
+fn rrf_multi_source_ties_break_on_file_path() {
+    // The multi-query path fuses more than two lists, so a single rank can carry a tie
+    // as wide as the number of sources. Six disjoint sets, one hit each at rank 1, give
+    // a six-way bit-identical tie whose order is otherwise the HashMap seed.
+    let sets: Vec<Vec<SearchResult>> = ["e.rs", "c.rs", "f.rs", "a.rs", "d.rs", "b.rs"]
+        .iter()
+        .map(|file| vec![make_result(file, 1, 10, 1.0, None)])
+        .collect();
+    let refs: Vec<&[SearchResult]> = sets.iter().map(|set| set.as_slice()).collect();
+
+    let results = fuse_rrf_multi_weighted(&refs, &[1.0; 6], 60.0, 10);
+
+    let order: Vec<&str> = results
+        .iter()
+        .map(|result| result.file_path.as_str())
+        .collect();
+
+    assert_eq!(
+        order,
+        vec!["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f.rs"],
+        "a tie across all sources must order by file_path, not by insertion or hash order"
+    );
+    for result in &results {
+        assert!(
+            (result.score - 1.0 / 61.0).abs() < 1e-10,
+            "all six must tie"
+        );
+    }
+}
+
+#[test]
 fn rrf_different_chunks_same_file_are_separate() {
     // Two different chunks from the same file should be treated as separate.
     let bm25 = vec![

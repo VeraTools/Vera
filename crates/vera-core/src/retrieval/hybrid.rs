@@ -410,6 +410,9 @@ pub fn fuse_rrf_weighted(
 ///
 /// Each result set has an associated weight that scales its RRF contribution.
 /// A weight of 2.0 means that set's scores count double in the final ranking.
+///
+/// Equal scores are broken by `(file_path, line_start, line_end)` ascending, so the
+/// output is a function of the inputs alone and does not vary between processes.
 pub fn fuse_rrf_multi_weighted(
     result_sets: &[&[SearchResult]],
     weights: &[f64],
@@ -432,7 +435,23 @@ pub fn fuse_rrf_multi_weighted(
     }
 
     let mut ranked: Vec<(f64, SearchResult)> = fused.into_values().collect();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Ties are structural, not incidental: with equal source weights a result found only
+    // in set A at rank r and one found only in set B at rank r score bit-identically.
+    // `into_values` yields a per-process-random order, so a score-only sort would make the
+    // output depend on the HashMap seed rather than on the index. Break ties on the same
+    // (file_path, line_start, line_end) triple that keys the map, which is distinct for
+    // every surviving entry and therefore a total order.
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                (&a.1.file_path, a.1.line_start, a.1.line_end).cmp(&(
+                    &b.1.file_path,
+                    b.1.line_start,
+                    b.1.line_end,
+                ))
+            })
+    });
 
     ranked
         .into_iter()
