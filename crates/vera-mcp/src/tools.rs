@@ -86,6 +86,15 @@ fn compact_results_json(
     serde_json::to_string(&compact)
 }
 
+/// Wrap serialized results in a tool result, attaching a stale-index notice
+/// when the working tree has drifted from the index.
+///
+/// The notice rides in its own content block, so it stays outside
+/// `MCP_OUTPUT_BUDGET` and cannot silently evict results.
+fn results_with_staleness(cwd: &std::path::Path, json: String) -> ToolCallResult {
+    ToolCallResult::success_with_notice(json, crate::staleness::notice_for_repo(cwd))
+}
+
 /// Git-scope filter properties shared by tool schemas: `changed`, `since`,
 /// `base`. `what` names the restricted operation (e.g. "search").
 fn git_scope_properties(what: &str) -> serde_json::Map<String, Value> {
@@ -624,7 +633,7 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
         .unwrap_or(false);
 
     match compact_results_json(&all_results, MCP_OUTPUT_BUDGET, signatures_only) {
-        Ok(json) => ToolCallResult::success(json),
+        Ok(json) => results_with_staleness(&cwd, json),
         Err(e) => ToolCallResult::error(format!("Failed to serialize results: {e}")),
     }
 }
@@ -767,7 +776,7 @@ fn handle_get_overview(args: &Value) -> ToolCallResult {
     };
     match vera_core::stats::collect_overview_filtered(&repo_path, exact_paths.as_ref()) {
         Ok(overview) => match serde_json::to_string_pretty(&overview) {
-            Ok(json) => ToolCallResult::success(json),
+            Ok(json) => results_with_staleness(&repo_path, json),
             Err(e) => ToolCallResult::error(format!("Failed to serialize overview: {e}")),
         },
         Err(e) => ToolCallResult::error(format!("Failed to collect overview: {e}")),
@@ -828,7 +837,7 @@ fn handle_regex_search(args: &Value) -> ToolCallResult {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             match compact_results_json(&results, MCP_OUTPUT_BUDGET, signatures_only) {
-                Ok(json) => ToolCallResult::success(json),
+                Ok(json) => results_with_staleness(&cwd, json),
                 Err(e) => ToolCallResult::error(format!("Failed to serialize results: {e}")),
             }
         }
@@ -880,7 +889,7 @@ fn handle_structural_search(args: &Value) -> ToolCallResult {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             match compact_results_json(&results, MCP_OUTPUT_BUDGET, signatures_only) {
-                Ok(json) => ToolCallResult::success(json),
+                Ok(json) => results_with_staleness(&cwd, json),
                 Err(e) => ToolCallResult::error(format!("Failed to serialize results: {e}")),
             }
         }
@@ -926,7 +935,7 @@ fn handle_find_references(args: &Value) -> ToolCallResult {
                 }
                 results.truncate(limit);
                 match serde_json::to_string(&results) {
-                    Ok(json) => ToolCallResult::success(json),
+                    Ok(json) => results_with_staleness(&cwd, json),
                     Err(err) => {
                         ToolCallResult::error(format!("Failed to serialize references: {err}"))
                     }
@@ -948,7 +957,7 @@ fn handle_find_references(args: &Value) -> ToolCallResult {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 match compact_results_json(&results, MCP_OUTPUT_BUDGET, signatures_only) {
-                    Ok(json) => ToolCallResult::success(json),
+                    Ok(json) => results_with_staleness(&cwd, json),
                     Err(err) => {
                         ToolCallResult::error(format!("Failed to serialize references: {err}"))
                     }
@@ -1002,6 +1011,57 @@ fn handle_explain_path(args: &Value) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a repo holding `source`, indexed under the hash of `indexed_source`.
+    /// Passing the same text twice yields a fresh index.
+    fn repo_indexed_as(source: &str, indexed_source: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), source).unwrap();
+        std::fs::create_dir_all(dir.path().join(".vera")).unwrap();
+        let db_path = dir.path().join(".vera/metadata.db");
+        let metadata = vera_core::storage::metadata::MetadataStore::open(&db_path).unwrap();
+        metadata
+            .set_file_hash(
+                "src/lib.rs",
+                &vera_core::indexing::content_hash(indexed_source),
+            )
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn stale_index_result_carries_the_warning_after_the_results() {
+        let dir = repo_indexed_as("pub fn current() {}\n", "pub fn previous() {}\n");
+        let results = r#"[{"file_path":"src/lib.rs"}]"#;
+
+        let result = results_with_staleness(dir.path(), results.to_string());
+
+        assert!(!result.is_error);
+        assert_eq!(
+            result.content.len(),
+            2,
+            "stale index must add a notice block, got {:?}",
+            result.content
+        );
+        assert_eq!(result.content[0].text, results);
+        assert_eq!(
+            result.content[1].text,
+            "warning: index may be stale: 1 modified. \
+             Search and grep only cover indexed files. \
+             Run `vera update .` or `vera watch .`."
+        );
+    }
+
+    #[test]
+    fn fresh_index_result_is_a_single_results_block() {
+        let dir = repo_indexed_as("pub fn current() {}\n", "pub fn current() {}\n");
+        let results = r#"[{"file_path":"src/lib.rs"}]"#;
+        let result = results_with_staleness(dir.path(), results.to_string());
+
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].text, results);
+    }
 
     #[test]
     fn tool_definitions_has_seven_tools() {

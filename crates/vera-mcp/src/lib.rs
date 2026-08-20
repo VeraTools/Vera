@@ -15,5 +15,6 @@
 pub mod protocol;
 pub mod saved_config;
 pub mod server;
+pub mod staleness;
 pub mod tools;
 pub mod watcher;

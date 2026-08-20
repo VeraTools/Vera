@@ -156,6 +156,22 @@ impl ToolCallResult {
         }
     }
 
+    /// Create a success result carrying an optional advisory notice.
+    ///
+    /// The notice is a separate trailing content block, so `content[0]` stays
+    /// byte-identical to what [`ToolCallResult::success`] would have produced
+    /// and clients that parse it as JSON are unaffected.
+    pub fn success_with_notice(text: impl Into<String>, notice: Option<String>) -> Self {
+        let mut result = Self::success(text);
+        if let Some(notice) = notice {
+            result.content.push(TextContent {
+                r#type: "text",
+                text: notice,
+            });
+        }
+        result
+    }
+
     /// Create an error result with text content.
     pub fn error(text: impl Into<String>) -> Self {
         Self {
@@ -195,6 +211,22 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.content[0].text, "hello world");
         assert_eq!(result.content[0].r#type, "text");
+    }
+
+    #[test]
+    fn tool_call_result_notice_is_a_trailing_block() {
+        let result = ToolCallResult::success_with_notice("[]", Some("warning: stale".to_string()));
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.content[0].text, "[]");
+        assert_eq!(result.content[1].text, "warning: stale");
+    }
+
+    #[test]
+    fn tool_call_result_without_notice_has_one_block() {
+        let result = ToolCallResult::success_with_notice("[]", None);
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].text, "[]");
     }
 
     #[test]
