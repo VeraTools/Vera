@@ -402,7 +402,7 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
                 },
             ));
         }
-        AncestorScan::MissingAncestor => {
+        AncestorScan::UnresolvableAncestor => {
             return Ok(path_missing(display_input, absolute_display, relative_path));
         }
         AncestorScan::Clear => {}
@@ -612,12 +612,13 @@ enum AncestorScan {
     Clear,
     /// The first ancestor that is a symbolic link, repository-relative.
     Symlink(PathBuf),
-    /// An ancestor does not exist, so the path cannot resolve at all.
-    MissingAncestor,
+    /// An ancestor is absent or is not a directory, so the path cannot resolve
+    /// at all.
+    UnresolvableAncestor,
 }
 
 /// Walk the ancestors of `relative` under `root`, stopping at the first that is
-/// a symbolic link or does not exist.
+/// a symbolic link or that the kernel could not resolve through.
 ///
 /// `relative` must be the path as it was written, before `..` segments are
 /// collapsed. The kernel resolves left to right, so `link/../file` traverses
@@ -625,10 +626,12 @@ enum AncestorScan {
 /// no ancestor to inspect. The walk therefore keeps its own lexical prefix and
 /// treats a `..` as one more component following whatever precedes it.
 ///
-/// A missing ancestor is reported separately rather than skipped, because the
-/// kernel cannot resolve through it either: `absent/../link/file` is missing, not
-/// a link, and normalizing `absent/..` away would otherwise leave the caller
-/// inspecting a path the operating system would never reach.
+/// An unresolvable ancestor is reported separately rather than skipped, because
+/// the kernel cannot resolve through it either: `absent/../link/file` is missing,
+/// not a link, and normalizing `absent/..` away would otherwise leave the caller
+/// inspecting a path the operating system would never reach. An ancestor that
+/// exists but is not a directory is the same outcome by a different errno, since
+/// `regular/../file` stops at `regular` with `ENOTDIR`.
 fn scan_ancestors(root: &Path, relative: &Path) -> Result<AncestorScan> {
     let mut prefix = PathBuf::new();
     let mut components = relative.components().peekable();
@@ -650,9 +653,12 @@ fn scan_ancestors(root: &Path, relative: &Path) -> Result<AncestorScan> {
         let ancestor = root.join(&prefix);
         match std::fs::symlink_metadata(&ancestor) {
             Ok(metadata) if metadata.is_symlink() => return Ok(AncestorScan::Symlink(prefix)),
+            Ok(metadata) if !metadata.is_dir() => {
+                return Ok(AncestorScan::UnresolvableAncestor);
+            }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(AncestorScan::MissingAncestor);
+                return Ok(AncestorScan::UnresolvableAncestor);
             }
             Err(err) => {
                 return Err(err).with_context(|| {
@@ -1790,6 +1796,35 @@ mod tests {
         let explanation = explain_path(
             dir.path(),
             Path::new("absent/../link/nested/secret.rs"),
+            &default_config(),
+        )
+        .unwrap();
+        assert_eq!(explanation.decision, PathDecision::Missing);
+        assert_eq!(explanation.reason, PathReason::Missing);
+    }
+
+    // Windows collapses `..` lexically before the filesystem sees the path, so
+    // the `ENOTDIR` this pins is POSIX resolution order.
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_reports_a_non_directory_ancestor_as_missing() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("regular"), "not a directory\n").unwrap();
+        fs::write(dir.path().join("target.rs"), "fn target() {}\n").unwrap();
+
+        // The kernel stops at `regular` with `ENOTDIR` and never reaches
+        // `target.rs`, so the path as written cannot resolve. Collapsing
+        // `regular/..` away instead would report on the unrelated `target.rs`.
+        assert_eq!(
+            std::fs::symlink_metadata(dir.path().join("regular/../target.rs"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        let explanation = explain_path(
+            dir.path(),
+            Path::new("regular/../target.rs"),
             &default_config(),
         )
         .unwrap();
