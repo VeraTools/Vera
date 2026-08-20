@@ -278,6 +278,8 @@ Key flags:
 - `--idle-timeout <SECS>`: seconds of inactivity before unloading a model from memory (default: 300). `-1` keeps models loaded for the lifetime of the process. `0` disables the cache, rebuilding the model on every request and holding one live model per concurrent request; it exists to pick up model files replaced under a running server, and makes indexing through the server far slower.
 - Backend flags: `--potion-code`, `--onnx-jina-cuda`, `--onnx-jina-rocm`, `--onnx-jina-coreml`, `--onnx-jina-openvino`, `--onnx-jina-directml`, or `--api`
 
+The embedding model is loaded before the server accepts connections and stays resident from then on, so the first request does not pay for a load. The reranker is loaded on the first `/v1/rerank` request instead, because a server that only serves embeddings would otherwise hold it for nothing.
+
 ### Diagnostics
 
 `vera doctor` reports the saved and active backend, installed version, checks GitHub for newer releases, and detects missing, corrupt, or truncated ONNX model caches. If model assets are damaged, it suggests running `vera repair --<backend>`; runtime embedding load errors provide the same repair hint. `--probe` adds a deeper read-only local backend check. `--json` outputs machine-readable diagnostics. `vera repair` re-fetches missing or corrupt local assets.

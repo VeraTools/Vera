@@ -49,8 +49,10 @@ pub struct AppState {
 /// Start the Vera HTTP server.
 ///
 /// Probes the embedding model and reranker at startup to validate the config,
-/// then listens for connections on `host:port`, loading each model on its first
-/// request and holding it as `cache_mode` dictates.
+/// then listens for connections on `host:port`. The embedding probe is kept and
+/// becomes the first resident model; the reranker is loaded on its first request,
+/// since holding it costs memory a server that only embeds never uses. Each model
+/// is then held as `cache_mode` dictates.
 ///
 /// - `config`     — vera retrieval/embedding config
 /// - `backend`    — compute backend (API, CPU, GPU)
@@ -71,14 +73,25 @@ pub async fn run_server(
         backend_label(backend)
     );
 
-    // Probe-load to validate config and obtain the model name, then release immediately.
+    // Probe-load to validate the config and obtain the model name.
     let (probe, model_name) = vera_core::embedding::create_dynamic_provider(&config, backend)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load embedding model: {e}"))?;
-    drop(probe);
 
     eprintln!("vera serve: embedding model ready ({})", model_name);
 
+    let embedding = Arc::new(ModelSlot::new(cache_mode));
+    let reranker: Arc<ModelSlot<DynamicReranker>> = Arc::new(ModelSlot::new(cache_mode));
+
+    // The probe already paid for a full load, so hand it to the slot rather than
+    // dropping it and making the first request load the same model again. Seeded
+    // here, before the reranker probe, so `PerRequest` — where `seed` is a no-op —
+    // still releases it before anything else is loaded.
+    embedding.seed(Arc::new(probe)).await;
+
+    // The reranker probe is deliberately not seeded. It costs ~670 MB resident,
+    // and a server that only answers /v1/embeddings would hold it for nothing;
+    // it is loaded on the first /v1/rerank instead.
     let reranker_available = vera_core::retrieval::create_dynamic_reranker(&config, backend)
         .await
         .unwrap_or_else(|e| {
@@ -109,9 +122,6 @@ pub async fn run_server(
             d.as_secs()
         ),
     }
-
-    let embedding = Arc::new(ModelSlot::new(cache_mode));
-    let reranker = Arc::new(ModelSlot::new(cache_mode));
 
     // Background task: unload each model after `cache_mode`'s idle timeout.
     if let CacheMode::Idle(timeout) = cache_mode {

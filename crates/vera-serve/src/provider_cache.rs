@@ -92,6 +92,22 @@ impl<T> ModelSlot<T> {
         Ok(Some(model))
     }
 
+    /// Put an already-loaded model into the slot.
+    ///
+    /// `run_server` probe-loads the embedding model to validate the config
+    /// before it listens; seeding hands that model to the slot so the first
+    /// request does not pay for a second load of a model already in memory.
+    /// A no-op in `PerRequest` mode, which must rebuild per request.
+    pub(crate) async fn seed(&self, model: Arc<T>) {
+        if matches!(self.mode, CacheMode::PerRequest) {
+            return;
+        }
+        *self.resident.lock().await = Some(Resident {
+            model,
+            last_used: Instant::now(),
+        });
+    }
+
     /// Drop the model if it has been idle past the configured timeout and no
     /// request still holds it. Returns whether it evicted.
     pub(crate) async fn evict_if_idle(&self) -> bool {
@@ -217,6 +233,76 @@ mod tests {
         let again = slot.get_or_load(load).await.unwrap();
         assert_eq!(*again.unwrap(), 1);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(builds.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_is_not_cached_and_a_later_load_succeeds() {
+        let slot: ModelSlot<usize> = ModelSlot::new(CacheMode::Forever);
+        let attempts = AtomicUsize::new(0);
+        let builds = Builds::new();
+
+        let load = || async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The shape `create_dynamic_provider` failures take on the
+                // embedding path: surfaced as an error, not as "unavailable".
+                return Err("cold start failed");
+            }
+            Ok(builds.load().await.unwrap())
+        };
+
+        assert_eq!(
+            slot.get_or_load(load).await.unwrap_err(),
+            "cold start failed"
+        );
+        assert_eq!(builds.count(), 0);
+
+        let model = slot.get_or_load(load).await.unwrap();
+        assert_eq!(*model.expect("retried after the errored load"), 1);
+
+        // And the recovered model is the cached one from here on.
+        let again = slot.get_or_load(load).await.unwrap();
+        assert_eq!(*again.unwrap(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(builds.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_seeded_model_is_served_without_loading() {
+        let slot: ModelSlot<usize> = ModelSlot::new(CacheMode::Forever);
+        let builds = Builds::new();
+
+        slot.seed(Arc::new(9usize)).await;
+
+        for _ in 0..3 {
+            let model = slot.get_or_load(|| builds.load()).await.unwrap();
+            assert_eq!(*model.unwrap(), 9);
+        }
+        assert_eq!(builds.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn per_request_mode_ignores_a_seed() {
+        let slot: ModelSlot<usize> = ModelSlot::new(CacheMode::PerRequest);
+        let builds = Builds::new();
+
+        slot.seed(Arc::new(9usize)).await;
+
+        let model = slot.get_or_load(|| builds.load()).await.unwrap();
+        assert_eq!(*model.unwrap(), 1);
+        assert_eq!(builds.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_seeded_model_is_evicted_when_idle_like_a_loaded_one() {
+        let slot: ModelSlot<usize> = ModelSlot::new(CacheMode::Idle(Duration::ZERO));
+        let builds = Builds::new();
+
+        slot.seed(Arc::new(9usize)).await;
+        assert!(slot.evict_if_idle().await);
+
+        let model = slot.get_or_load(|| builds.load()).await.unwrap();
+        assert_eq!(*model.unwrap(), 1);
         assert_eq!(builds.count(), 1);
     }
 
