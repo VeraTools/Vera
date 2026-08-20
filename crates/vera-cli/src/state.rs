@@ -58,15 +58,14 @@ pub struct ApiSetupInput {
     pub api_key: String,
 }
 
+/// Load `config.json` verbatim. Every save helper re-reads through here and
+/// writes the result back, so anything this function changes is persisted as a
+/// side effect of unrelated commands. In particular a repaired `pooling` would
+/// be written to disk and then refuse to parse under an older Vera on the same
+/// machine, whose `FromStr` only knows `mean` and `cls`. Repairs therefore
+/// belong at the points of use, not here.
 pub fn load_saved_config() -> Result<StoredConfig> {
-    let mut config: StoredConfig = load_json_file(&config_path()?)?;
-    // `setup` freezes the resolved model config here, and this copy outranks
-    // the preset. Without repair, an install created before jina's pooling was
-    // corrected keeps mean-pooling it indefinitely.
-    config.local_embedding_model = config
-        .local_embedding_model
-        .map(vera_core::local_models::LocalEmbeddingModelConfig::repair_stored_defaults);
-    Ok(config)
+    load_json_file(&config_path()?)
 }
 
 pub fn load_saved_secrets() -> Result<StoredSecrets> {
@@ -92,9 +91,17 @@ pub fn save_local_embedding_model(
     save_config(&config)
 }
 
+/// The stored model config as runtime should see it.
+///
+/// `setup` freezes the resolved model config into `config.json` and that copy
+/// outranks the preset, so an install created before jina's pooling was
+/// corrected would keep mean-pooling it indefinitely. The repair is applied in
+/// memory only; the file keeps whatever `setup` wrote.
 pub fn saved_local_embedding_model()
 -> Result<Option<vera_core::local_models::LocalEmbeddingModelConfig>> {
-    Ok(load_saved_config()?.local_embedding_model)
+    Ok(load_saved_config()?
+        .local_embedding_model
+        .map(vera_core::local_models::LocalEmbeddingModelConfig::repair_stored_defaults))
 }
 
 pub fn saved_backend() -> Result<Option<vera_core::config::InferenceBackend>> {
@@ -222,7 +229,12 @@ fn apply_saved_env_impl(force: bool) -> Result<()> {
         set_env_value("RERANKER_MODEL_API_KEY", api_key, force);
     }
 
-    apply_local_embedding_env(config.local_embedding_model.as_ref(), force);
+    // Repaired in memory on the way to the process environment; see
+    // `saved_local_embedding_model`.
+    let local_embedding_model = config
+        .local_embedding_model
+        .map(vera_core::local_models::LocalEmbeddingModelConfig::repair_stored_defaults);
+    apply_local_embedding_env(local_embedding_model.as_ref(), force);
 
     Ok(())
 }
@@ -410,6 +422,129 @@ const LOCAL_EMBEDDING_SOURCE_ENV_KEYS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `VERA_HOME` is process-global, so the tests that redirect it at the
+    /// config directory must not overlap with each other.
+    static VERA_HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    /// What `vera setup` wrote to `config.json` before the pooling fix.
+    const LEGACY_JINA_CONFIG: &str = r#"{
+      "local_embedding_model": {
+        "source": {"source": "hugging-face",
+                   "repo": "jinaai/jina-embeddings-v5-text-nano-retrieval"},
+        "onnx_file": "onnx/model_quantized.onnx",
+        "onnx_data_file": "onnx/model_quantized.onnx_data",
+        "tokenizer_file": "tokenizer.json",
+        "embedding_dim": 768,
+        "pooling": "mean",
+        "max_length": 512
+      }
+    }"#;
+
+    /// Everything `apply_saved_env_impl` can write, plus the redirect itself.
+    const RESTORED_ENV_KEYS: &[&str] = &[
+        "VERA_HOME",
+        "VERA_BACKEND",
+        "VERA_LOCAL",
+        "EMBEDDING_MODEL_BASE_URL",
+        "EMBEDDING_MODEL_ID",
+        "EMBEDDING_MODEL_API_KEY",
+        "RERANKER_MODEL_BASE_URL",
+        "RERANKER_MODEL_ID",
+        "RERANKER_MODEL_API_KEY",
+        vera_core::local_models::LOCAL_EMBEDDING_REPO_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_DIR_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_ONNX_FILE_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_ONNX_DATA_FILE_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_TOKENIZER_FILE_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_DIM_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_POOLING_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_MAX_LENGTH_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_QUERY_PREFIX_ENV,
+        vera_core::local_models::LEGACY_EMBEDDING_QUERY_PREFIX_ENV,
+    ];
+
+    struct VeraHomeGuard {
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<Option<std::ffi::OsString>>,
+    }
+
+    impl Drop for VeraHomeGuard {
+        fn drop(&mut self) {
+            for (key, value) in RESTORED_ENV_KEYS.iter().zip(&self.previous) {
+                match value {
+                    Some(value) => set_process_env(key, &value.to_string_lossy()),
+                    None => clear_process_env(key),
+                }
+            }
+        }
+    }
+
+    /// Point `VERA_HOME` at a temp dir seeded with `contents` so no test can
+    /// reach the developer's real `~/.vera/config.json`.
+    fn with_stored_config(contents: &str) -> VeraHomeGuard {
+        let lock = VERA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = RESTORED_ENV_KEYS.iter().map(std::env::var_os).collect();
+        let dir = tempfile::tempdir().unwrap();
+        set_process_env("VERA_HOME", dir.path().to_str().unwrap());
+        fs::write(config_path().unwrap(), contents).unwrap();
+        VeraHomeGuard {
+            _dir: dir,
+            _lock: lock,
+            previous,
+        }
+    }
+
+    fn stored_pooling_on_disk() -> String {
+        let raw = fs::read(config_path().unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value["local_embedding_model"]["pooling"]
+            .as_str()
+            .expect("stored config should still carry a pooling field")
+            .to_string()
+    }
+
+    #[test]
+    fn unrelated_save_does_not_rewrite_stored_pooling() {
+        let _guard = with_stored_config(LEGACY_JINA_CONFIG);
+        assert_eq!(stored_pooling_on_disk(), "mean");
+
+        // Every save helper is a load-mutate-save cycle over the same struct,
+        // so a repair applied at load time would be persisted from here.
+        save_backend(vera_core::config::InferenceBackend::OnnxJina(
+            vera_core::config::OnnxExecutionProvider::Cpu,
+        ))
+        .unwrap();
+
+        // A Vera older than `last-token` still has to be able to parse this
+        // file; its `FromStr` accepts only `mean` and `cls`.
+        assert_eq!(stored_pooling_on_disk(), "mean");
+    }
+
+    #[test]
+    fn runtime_readers_repair_stored_pooling_in_memory() {
+        let _guard = with_stored_config(LEGACY_JINA_CONFIG);
+
+        let model = saved_local_embedding_model()
+            .unwrap()
+            .expect("stored config carries a local embedding model");
+        assert_eq!(
+            model.pooling,
+            vera_core::local_models::LocalEmbeddingPooling::LastToken
+        );
+
+        apply_saved_env_force().unwrap();
+        assert_eq!(
+            std::env::var(vera_core::local_models::LOCAL_EMBEDDING_POOLING_ENV).unwrap(),
+            "last-token"
+        );
+
+        assert_eq!(stored_pooling_on_disk(), "mean");
+    }
 
     #[test]
     fn stored_config_defaults_are_empty() {
