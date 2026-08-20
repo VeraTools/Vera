@@ -819,15 +819,32 @@ fn document_prefix_is_independent_of_query_prefix() {
 #[test]
 fn prefixes_are_part_of_the_model_identity() {
     // Prefixes change the embedded text, so they change the vector space and
-    // must invalidate an index the same way pooling does.
-    let jina = LocalEmbeddingModelConfig::jina();
-    let mut no_doc_prefix = jina.clone();
-    no_doc_prefix.document_prefix = None;
-    assert_ne!(jina.model_identity(), no_doc_prefix.model_identity());
+    // must invalidate an index the same way pooling does. Mutating a preset
+    // would only prove that the identity switches to its custom-config form,
+    // so the comparison is between configs that already take that form and
+    // differ in nothing but a prefix.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
 
-    let mut other_query_prefix = jina.clone();
-    other_query_prefix.query_prefix = Some("Search:".to_string());
-    assert_ne!(jina.model_identity(), other_query_prefix.model_identity());
+    let mut query_prefixed = base.clone();
+    query_prefixed.query_prefix = Some("Query:".to_string());
+    assert_ne!(base.model_identity(), query_prefixed.model_identity());
+
+    let mut document_prefixed = base.clone();
+    document_prefixed.document_prefix = Some("Document:".to_string());
+    assert_ne!(base.model_identity(), document_prefixed.model_identity());
+
+    // The two sides are recorded separately, so swapping which one is set is
+    // not the same model.
+    assert_ne!(
+        query_prefixed.model_identity(),
+        document_prefixed.model_identity()
+    );
+
+    // The preset form has to name both too, or jina's own identity would not
+    // move when the prefixes were introduced.
+    let jina = LocalEmbeddingModelConfig::jina();
+    assert!(jina.model_identity().contains("qp=Query:"));
+    assert!(jina.model_identity().contains("dp=Document:"));
 }
 
 #[test]

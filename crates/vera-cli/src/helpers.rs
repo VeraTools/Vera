@@ -299,6 +299,7 @@ impl LocalEmbeddingModelFlags {
             || self.embedding_pooling.is_some()
             || self.embedding_max_length.is_some()
             || self.embedding_query_prefix.is_some()
+            || self.embedding_document_prefix.is_some()
     }
 }
 
@@ -527,6 +528,55 @@ pub fn print_human_summary(summary: &vera_core::indexing::IndexSummary, verbose:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_local_embedding_flag_on_its_own_counts_as_set() {
+        // `any_set` decides whether `vera setup` runs unattended and whether a
+        // non-ONNX backend rejects the flags. A flag missing from it is
+        // silently ignored when it is the only one passed, so each one is
+        // checked alone rather than in combination.
+        let mutators: Vec<(&str, fn(&mut LocalEmbeddingModelFlags))> = vec![
+            ("--code-rank-embed", |f| f.code_rank_embed = true),
+            ("--embedding-repo", |f| {
+                f.embedding_repo = Some("org/repo".to_string())
+            }),
+            ("--embedding-dir", |f| {
+                f.embedding_dir = Some("/models".to_string())
+            }),
+            ("--embedding-onnx-file", |f| {
+                f.embedding_onnx_file = Some("onnx/model.onnx".to_string())
+            }),
+            ("--embedding-onnx-data-file", |f| {
+                f.embedding_onnx_data_file = Some("onnx/model.onnx_data".to_string())
+            }),
+            ("--embedding-no-onnx-data", |f| {
+                f.embedding_no_onnx_data = true
+            }),
+            ("--embedding-tokenizer-file", |f| {
+                f.embedding_tokenizer_file = Some("tokenizer.json".to_string())
+            }),
+            ("--embedding-dim", |f| f.embedding_dim = Some(768)),
+            ("--embedding-pooling", |f| {
+                f.embedding_pooling = Some("cls".to_string())
+            }),
+            ("--embedding-max-length", |f| {
+                f.embedding_max_length = Some(512)
+            }),
+            ("--embedding-query-prefix", |f| {
+                f.embedding_query_prefix = Some("Query:".to_string())
+            }),
+            ("--embedding-document-prefix", |f| {
+                f.embedding_document_prefix = Some("Document:".to_string())
+            }),
+        ];
+
+        assert!(!LocalEmbeddingModelFlags::default().any_set());
+        for (flag, set_it) in mutators {
+            let mut flags = LocalEmbeddingModelFlags::default();
+            set_it(&mut flags);
+            assert!(flags.any_set(), "{flag} alone was not treated as set");
+        }
+    }
 
     #[test]
     fn index_freshness_summary_formats_nonzero_counts() {
