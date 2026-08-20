@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -170,6 +171,20 @@ pub struct SkillLocationReport {
     installed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     up_to_date: Option<bool>,
+    /// Only set on the removal path: whether a skill was actually present and
+    /// deleted, as opposed to the location merely having been checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<bool>,
+}
+
+impl SkillLocationReport {
+    pub(crate) fn was_removed(&self) -> bool {
+        self.removed == Some(true)
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +459,7 @@ fn do_install(locations: &[SkillLocation], json_output: bool) -> anyhow::Result<
             path: location.path.display().to_string(),
             installed: true,
             up_to_date: Some(true),
+            removed: None,
         })
         .collect();
 
@@ -542,11 +558,25 @@ fn do_remove(locations: &[SkillLocation], json_output: bool) -> anyhow::Result<(
         return Ok(());
     }
 
+    let reports = remove_skill_locations(locations)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else {
+        write_removed_skill_locations(&reports, &mut std::io::stdout().lock())?;
+    }
+
+    Ok(())
+}
+
+/// Delete the skill directory at each location, reporting per location whether
+/// anything was actually there to delete.
+fn remove_skill_locations(locations: &[SkillLocation]) -> anyhow::Result<Vec<SkillLocationReport>> {
     let mut reports = Vec::with_capacity(locations.len());
 
     for location in locations {
-        let installed = location.path.join("SKILL.md").exists();
-        if installed {
+        let removed = location.path.join("SKILL.md").exists();
+        if removed {
             fs::remove_dir_all(&location.path).with_context(|| {
                 format!(
                     "failed to remove installed skill at {}",
@@ -560,26 +590,51 @@ fn do_remove(locations: &[SkillLocation], json_output: bool) -> anyhow::Result<(
             path: location.path.display().to_string(),
             installed: false,
             up_to_date: None,
+            removed: Some(removed),
         });
     }
 
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&reports)?);
-    } else {
-        let red = console::Style::new().red();
-        let dim = console::Style::new().dim();
-        println!("Removed Vera skill from:");
-        println!();
-        for report in &reports {
-            let name = format!("{:?}", report.client).to_lowercase();
-            let scope = format!("{:?}", report.scope).to_lowercase();
-            println!(
-                "  {} {:<7} {}",
-                red.apply_to(format!("{:<14}", name)),
-                scope,
-                dim.apply_to(&report.path)
-            );
-        }
+    Ok(reports)
+}
+
+/// Remove every supported client/scope skill install under the given roots,
+/// without printing anything. Used by `vera uninstall`, which folds the result
+/// into its own single output document.
+pub(crate) fn remove_all_skills(
+    cwd: &Path,
+    home: &Path,
+) -> anyhow::Result<Vec<SkillLocationReport>> {
+    let locations = resolve_locations_with_roots(AgentClient::All, AgentScope::All, cwd, home)?;
+    remove_skill_locations(&locations)
+}
+
+pub(crate) fn write_removed_skill_locations(
+    reports: &[SkillLocationReport],
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let removed: Vec<&SkillLocationReport> = reports
+        .iter()
+        .filter(|report| report.was_removed())
+        .collect();
+    if removed.is_empty() {
+        writeln!(out, "No Vera skill installations found.")?;
+        return Ok(());
+    }
+
+    let red = console::Style::new().red();
+    let dim = console::Style::new().dim();
+    writeln!(out, "Removed Vera skill from:")?;
+    writeln!(out)?;
+    for report in removed {
+        let name = format!("{:?}", report.client).to_lowercase();
+        let scope = format!("{:?}", report.scope).to_lowercase();
+        writeln!(
+            out,
+            "  {} {:<7} {}",
+            red.apply_to(format!("{:<14}", name)),
+            scope,
+            dim.apply_to(&report.path)
+        )?;
     }
 
     Ok(())
@@ -605,6 +660,7 @@ fn status(client: AgentClient, scope: AgentScope, json_output: bool) -> anyhow::
                     path: path.display().to_string(),
                     installed: scope_status.installed,
                     up_to_date: scope_status.installed.then_some(scope_status.up_to_date),
+                    removed: None,
                 }
             })
         })
