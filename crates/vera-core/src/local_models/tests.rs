@@ -646,6 +646,58 @@ fn stored_legacy_jina_config_is_repaired_to_last_token() {
 }
 
 #[test]
+fn legacy_jina_literal_stays_pinned_when_the_constants_move() {
+    // Half one: the literal itself. It describes a config.json an older Vera
+    // already wrote, so editing it changes which installs the migration
+    // reaches.
+    let legacy = LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix();
+    assert_eq!(
+        legacy,
+        LocalEmbeddingModelConfig {
+            source: LocalEmbeddingSource::HuggingFace {
+                repo: "jinaai/jina-embeddings-v5-text-nano-retrieval".to_string(),
+            },
+            onnx_file: "onnx/model_quantized.onnx".to_string(),
+            onnx_data_file: Some("onnx/model_quantized.onnx_data".to_string()),
+            tokenizer_file: "tokenizer.json".to_string(),
+            embedding_dim: 768,
+            pooling: LocalEmbeddingPooling::Mean,
+            max_length: 512,
+            query_prefix: None,
+        }
+    );
+
+    // Half two: the tripwire. Today's constants still happen to describe that
+    // same file. When one of them moves, this fails and the reader decides.
+    const GUIDANCE: &str = "A live EMBEDDING_* constant no longer matches the pre-fix \
+         config.json that `repair_stored_defaults` migrates. Leave \
+         `legacy_jina_before_pooling_fix` exactly as it is — it is a historical value, not a \
+         preset — and update this assertion to record the divergence. Only edit the frozen \
+         literal if you have confirmed real pre-fix installs carried the new value: making it \
+         follow the constant stops it matching any of them, and every pre-fix install then \
+         stays mean-pooled with no error.";
+    assert_eq!(
+        legacy.source,
+        LocalEmbeddingSource::HuggingFace {
+            repo: EMBEDDING_REPO.to_string(),
+        },
+        "{GUIDANCE}"
+    );
+    assert_eq!(legacy.onnx_file, EMBEDDING_ONNX_FILE, "{GUIDANCE}");
+    assert_eq!(
+        legacy.onnx_data_file.as_deref(),
+        Some(EMBEDDING_ONNX_DATA_FILE),
+        "{GUIDANCE}"
+    );
+    assert_eq!(
+        legacy.tokenizer_file, EMBEDDING_TOKENIZER_FILE,
+        "{GUIDANCE}"
+    );
+    assert_eq!(legacy.embedding_dim, EMBEDDING_DIM, "{GUIDANCE}");
+    assert_eq!(legacy.max_length, EMBEDDING_MAX_LENGTH, "{GUIDANCE}");
+}
+
+#[test]
 fn repair_leaves_customised_and_unrelated_configs_alone() {
     // A deliberate non-default choice on the same repo must survive.
     let mut customised = LocalEmbeddingModelConfig::jina();

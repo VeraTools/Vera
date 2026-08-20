@@ -200,6 +200,32 @@ impl LocalEmbeddingModelConfig {
         )
     }
 
+    /// The exact model config `vera setup` froze into `config.json` for jina
+    /// before the pooling fix.
+    ///
+    /// Frozen literals, never the `EMBEDDING_*` constants. This describes a
+    /// file already sitting on someone's disk, so it must not follow the live
+    /// preset: deriving it from the constants means the day one of them moves
+    /// — raising `EMBEDDING_MAX_LENGTH` for #67, renaming an ONNX export — the
+    /// literal stops matching any real pre-fix config and the migration
+    /// silently never fires again, leaving every such install mean-pooled with
+    /// no error. `legacy_jina_literal_stays_pinned_when_the_constants_move` is
+    /// the tripwire for that.
+    fn legacy_jina_before_pooling_fix() -> Self {
+        Self {
+            source: LocalEmbeddingSource::HuggingFace {
+                repo: "jinaai/jina-embeddings-v5-text-nano-retrieval".to_string(),
+            },
+            onnx_file: "onnx/model_quantized.onnx".to_string(),
+            onnx_data_file: Some("onnx/model_quantized.onnx_data".to_string()),
+            tokenizer_file: "tokenizer.json".to_string(),
+            embedding_dim: 768,
+            pooling: LocalEmbeddingPooling::Mean,
+            max_length: 512,
+            query_prefix: None,
+        }
+    }
+
     /// Repair a stored config that froze jina's old mean-pooling default.
     ///
     /// `vera setup` writes the resolved model config to `config.json` and that
@@ -207,18 +233,8 @@ impl LocalEmbeddingModelConfig {
     /// keep mean-pooling jina forever. Only the exact old preset is upgraded;
     /// a config differing in any field is treated as deliberate and left
     /// alone.
-    ///
-    /// The literal below coincides with `generic_defaults()` today, but the
-    /// two express different things: this one is a historical value that must
-    /// stay pinned even if the fallback shape changes.
     pub fn repair_stored_defaults(self) -> Self {
-        let legacy_jina = Self::preset(
-            EMBEDDING_REPO,
-            Some(EMBEDDING_ONNX_DATA_FILE),
-            LocalEmbeddingPooling::Mean,
-            None,
-        );
-        if self == legacy_jina {
+        if self == Self::legacy_jina_before_pooling_fix() {
             Self::jina()
         } else {
             self
