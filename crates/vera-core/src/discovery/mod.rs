@@ -195,6 +195,43 @@ pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
     }
 }
 
+/// The directory exclusions discovery applies, reusable without walking a tree.
+///
+/// Built from the same [`build_overrides`] patterns `discover_files` installs on
+/// its walker, so a caller that has to classify a single path (the MCP file
+/// watcher deciding whether an event is worth an update cycle) cannot drift from
+/// what indexing actually skips.
+pub struct ExclusionMatcher {
+    root: PathBuf,
+    overrides: Override,
+}
+
+impl ExclusionMatcher {
+    /// Build a matcher rooted at `root` for the given indexing configuration.
+    pub fn new(root: &Path, config: &IndexingConfig) -> Result<Self> {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("failed to resolve path: {}", root.display()))?;
+        let overrides = build_overrides(&root, config)?;
+        Ok(Self { root, overrides })
+    }
+
+    /// True if `path` lies in, or is, a directory discovery excludes.
+    ///
+    /// Paths outside the root are reported as not excluded: the caller cannot
+    /// classify them against these patterns, and treating them as excluded would
+    /// silently drop work.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if !self.overrides.matched(relative, true).is_none() {
+            return true;
+        }
+        override_matches_path_or_any_parents(&self.overrides, relative)
+    }
+}
+
 /// Discover source files in a directory tree.
 ///
 /// Walks the directory respecting .gitignore patterns and default exclusions.
