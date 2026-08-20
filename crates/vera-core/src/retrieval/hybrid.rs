@@ -170,9 +170,7 @@ pub async fn search_hybrid(
         .as_ref()
         .ok()
         .map(|(_, embed_elapsed)| *embed_elapsed);
-    let (embedding_stage, vector_stage) = split_vector_span(vector_start.elapsed(), embed_elapsed);
-    timings.embedding = embedding_stage;
-    timings.vector = Some(vector_stage);
+    charge_vector_span(&mut timings, vector_start.elapsed(), embed_elapsed);
     let vector_results = vector_outcome.map(|(results, _)| results);
 
     // Await the BM25 result (should already be done or nearly done).
@@ -449,7 +447,7 @@ pub fn fuse_rrf_multi_weighted(
         .collect()
 }
 
-/// Cut the one wall-clock span that covers the vector arm into the two stages
+/// Charge the one wall-clock span that covers the vector arm to the two stages
 /// `--timing` reports.
 ///
 /// The query embedding runs inside the vector search, so both stages come out
@@ -460,15 +458,16 @@ pub fn fuse_rrf_multi_weighted(
 ///
 /// The two must partition the span rather than each be given all of it, which
 /// is what issue #105 was: the same value reported twice made either stage
-/// unattributable.
-fn split_vector_span(
+/// unattributable. Both fields are written here rather than at the call site so
+/// that partition is decided in one place a test can reach: a caller that only
+/// received the two values could still charge the span twice.
+fn charge_vector_span(
+    timings: &mut HybridTimings,
     vector_span: Duration,
     embed_elapsed: Option<Duration>,
-) -> (Option<Duration>, Duration) {
-    (
-        embed_elapsed,
-        vector_span.saturating_sub(embed_elapsed.unwrap_or_default()),
-    )
+) {
+    timings.embedding = embed_elapsed;
+    timings.vector = Some(vector_span.saturating_sub(embed_elapsed.unwrap_or_default()));
 }
 
 #[cfg(test)]

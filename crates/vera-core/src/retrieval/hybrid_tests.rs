@@ -478,7 +478,7 @@ impl crate::embedding::EmbeddingProvider for SlowProvider {
 // span that covers the embedding, the store opens, the KNN query and
 // hydration, so `--timing` printed one measurement twice.
 //
-// The split itself is asserted by `split_vector_span_partitions_the_span`
+// The split itself is asserted by `charge_vector_span_partitions_the_span`
 // below, on values rather than on a clock. It has to be, because the span the
 // two stages are cut from is internal to `search_hybrid` and no measurement
 // available to this test stands in for it. The wall time of the whole call
@@ -556,22 +556,36 @@ async fn search_hybrid_charges_embedding_delay_to_embedding_not_vector() {
 // so this asserts the cut where it is decidable: given a span and the embedding
 // measurement taken inside it, the two stages must partition the span. Under
 // the bug each stage got the whole span, which this rejects without a clock.
+//
+// `charge_vector_span` writes both `HybridTimings` fields rather than returning
+// two values for the caller to assign, so this test covers the assignment as
+// well as the arithmetic. That is deliberate. While the caller did the
+// assigning, a caller that kept the remainder on `vector` but charged the whole
+// span to `embedding` passed this test and the one above together, which is a
+// second way to make `embedding` unattributable. The three durations here are
+// distinct so neither field can hold the whole span by coincidence.
 #[test]
-fn split_vector_span_partitions_the_span() {
+fn charge_vector_span_partitions_the_span() {
     let span = std::time::Duration::from_millis(500);
     let embed = std::time::Duration::from_millis(300);
 
+    let mut timings = HybridTimings::default();
+    charge_vector_span(&mut timings, span, Some(embed));
+
     assert_eq!(
-        split_vector_span(span, Some(embed)),
-        (Some(embed), std::time::Duration::from_millis(200)),
+        (timings.embedding, timings.vector),
+        (Some(embed), Some(std::time::Duration::from_millis(200))),
         "embedding takes the model cost and vector takes the remainder"
     );
 
     // A vector search that failed reports no embedding, so the whole span is
     // storage cost rather than being dropped.
+    let mut failed = HybridTimings::default();
+    charge_vector_span(&mut failed, span, None);
+
     assert_eq!(
-        split_vector_span(span, None),
-        (None, span),
+        (failed.embedding, failed.vector),
+        (None, Some(span)),
         "an unmeasured embedding leaves the whole span on vector"
     );
 }
