@@ -74,14 +74,21 @@ fn run_at(
     let mut removed = Vec::new();
 
     // 1. Remove agent skill files (all clients, all scopes).
-    let skill_reports = match agent::remove_all_skills(cwd, home) {
-        Ok(reports) => reports,
+    let skill_removal = match agent::remove_all_skills(cwd, home) {
+        Ok(removal) => removal,
         Err(e) => {
-            tracing::warn!("failed to remove agent skills: {e:#}");
-            Vec::new()
+            tracing::warn!("failed to resolve agent skill locations: {e:#}");
+            agent::SkillRemoval::default()
         }
     };
-    let removed_skills: Vec<&str> = skill_reports
+    // Uninstall continues past a skill that cannot be deleted, so the failure is
+    // only visible if it is reported here. stderr keeps it out of the JSON
+    // document on stdout.
+    for error in &skill_removal.failures {
+        writeln!(stderr, "  {error:#}")?;
+    }
+    let removed_skills: Vec<&str> = skill_removal
+        .reports
         .iter()
         .filter(|report| report.was_removed())
         .map(|report| report.path())
@@ -90,7 +97,7 @@ fn run_at(
         removed.push("agent skills");
     }
     if !json_output {
-        agent::write_removed_skill_locations(&skill_reports, stdout)?;
+        agent::write_removed_skill_locations(&skill_removal, stdout)?;
     }
 
     // 2. Remove Vera data directory (binary cache, models, libs, config, credentials).
@@ -257,6 +264,101 @@ mod tests {
         );
         // Heading, blank line, and exactly one row.
         assert_eq!(stdout.lines().count(), 3, "{stdout}");
+    }
+
+    /// A skill directory that cannot be deleted, ordered after Claude's so an
+    /// earlier location is already gone by the time it fails.
+    #[cfg(unix)]
+    fn install_unremovable_gemini_global_skill(home: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = home.join(".gemini").join("skills").join("vera");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), "test").unwrap();
+        let parent = home.join(".gemini").join("skills");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        parent
+    }
+
+    #[cfg(unix)]
+    fn allow_cleanup(parent: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_json_reports_skills_removed_before_a_later_removal_failed() {
+        let roots = roots();
+        let claude = install_claude_global_skill(&roots.home);
+        let locked = install_unremovable_gemini_global_skill(&roots.home);
+
+        let (stdout, _) = uninstall(&roots, true);
+        let claude_was_deleted = !claude.exists();
+        allow_cleanup(&locked);
+
+        assert!(
+            claude_was_deleted,
+            "fixture does not discriminate: the earlier skill was never deleted"
+        );
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            document["skills"],
+            serde_json::json!([claude.display().to_string()]),
+            "{stdout}"
+        );
+        assert_eq!(
+            document["removed"],
+            serde_json::json!(["agent skills"]),
+            "{stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_human_output_names_skills_removed_before_a_later_removal_failed() {
+        let roots = roots();
+        let claude = install_claude_global_skill(&roots.home);
+        let locked = install_unremovable_gemini_global_skill(&roots.home);
+
+        let (stdout, stderr) = uninstall(&roots, false);
+        let claude_was_deleted = !claude.exists();
+        allow_cleanup(&locked);
+
+        assert!(
+            claude_was_deleted,
+            "fixture does not discriminate: the earlier skill was never deleted"
+        );
+        assert!(stdout.contains(&claude.display().to_string()), "{stdout}");
+        assert!(
+            !stdout.contains("No Vera skill installations found."),
+            "claimed nothing was installed after deleting {}: {stdout}",
+            claude.display()
+        );
+        assert!(
+            stderr.contains("failed to remove installed skill at"),
+            "the failure was never reported: {stderr}"
+        );
+    }
+
+    /// The only installed skill fails to delete: nothing was removed, but
+    /// claiming nothing was *installed* would be a different lie.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_human_output_does_not_claim_nothing_was_installed_when_removal_failed() {
+        let roots = roots();
+        let locked = install_unremovable_gemini_global_skill(&roots.home);
+
+        let (stdout, stderr) = uninstall(&roots, false);
+        allow_cleanup(&locked);
+
+        assert!(
+            !stdout.contains("No Vera skill installations found."),
+            "{stdout}"
+        );
+        assert!(
+            stderr.contains("failed to remove installed skill at"),
+            "{stderr}"
+        );
     }
 
     #[test]

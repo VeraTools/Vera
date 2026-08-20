@@ -558,33 +558,61 @@ fn do_remove(locations: &[SkillLocation], json_output: bool) -> anyhow::Result<(
         return Ok(());
     }
 
-    let reports = remove_skill_locations(locations)?;
+    let removal = remove_skill_locations(locations);
 
+    // Report before failing: a location deleted earlier in the run stays visible
+    // even when a later one cannot be deleted.
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&reports)?);
+        println!("{}", serde_json::to_string_pretty(&removal.reports)?);
     } else {
-        write_removed_skill_locations(&reports, &mut std::io::stdout().lock())?;
+        write_removed_skill_locations(&removal, &mut std::io::stdout().lock())?;
+    }
+
+    let mut failures = removal.failures.into_iter();
+    if let Some(first) = failures.next() {
+        for error in failures {
+            tracing::warn!("{error:#}");
+        }
+        return Err(first);
     }
 
     Ok(())
 }
 
+/// One report per location plus the deletions that failed. The two are returned
+/// together because a failure partway through must not discard the locations
+/// already deleted: callers report what happened, then decide whether to fail.
+#[derive(Default)]
+pub(crate) struct SkillRemoval {
+    pub(crate) reports: Vec<SkillLocationReport>,
+    pub(crate) failures: Vec<anyhow::Error>,
+}
+
 /// Delete the skill directory at each location, reporting per location whether
-/// anything was actually there to delete.
-fn remove_skill_locations(locations: &[SkillLocation]) -> anyhow::Result<Vec<SkillLocationReport>> {
-    let mut reports = Vec::with_capacity(locations.len());
+/// a skill was actually there and deleted. A location that cannot be deleted is
+/// recorded as not removed and does not stop the remaining locations.
+fn remove_skill_locations(locations: &[SkillLocation]) -> SkillRemoval {
+    let mut removal = SkillRemoval {
+        reports: Vec::with_capacity(locations.len()),
+        failures: Vec::new(),
+    };
 
     for location in locations {
-        let removed = location.path.join("SKILL.md").exists();
-        if removed {
-            fs::remove_dir_all(&location.path).with_context(|| {
-                format!(
-                    "failed to remove installed skill at {}",
-                    location.path.display()
-                )
-            })?;
-        }
-        reports.push(SkillLocationReport {
+        let installed = location.path.join("SKILL.md").exists();
+        let removed = installed
+            && match fs::remove_dir_all(&location.path) {
+                Ok(()) => true,
+                Err(error) => {
+                    removal
+                        .failures
+                        .push(anyhow::Error::new(error).context(format!(
+                            "failed to remove installed skill at {}",
+                            location.path.display()
+                        )));
+                    false
+                }
+            };
+        removal.reports.push(SkillLocationReport {
             client: location.client,
             scope: location.scope,
             path: location.path.display().to_string(),
@@ -594,30 +622,33 @@ fn remove_skill_locations(locations: &[SkillLocation]) -> anyhow::Result<Vec<Ski
         });
     }
 
-    Ok(reports)
+    removal
 }
 
 /// Remove every supported client/scope skill install under the given roots,
 /// without printing anything. Used by `vera uninstall`, which folds the result
 /// into its own single output document.
-pub(crate) fn remove_all_skills(
-    cwd: &Path,
-    home: &Path,
-) -> anyhow::Result<Vec<SkillLocationReport>> {
+pub(crate) fn remove_all_skills(cwd: &Path, home: &Path) -> anyhow::Result<SkillRemoval> {
     let locations = resolve_locations_with_roots(AgentClient::All, AgentScope::All, cwd, home)?;
-    remove_skill_locations(&locations)
+    Ok(remove_skill_locations(&locations))
 }
 
 pub(crate) fn write_removed_skill_locations(
-    reports: &[SkillLocationReport],
+    removal: &SkillRemoval,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    let removed: Vec<&SkillLocationReport> = reports
+    let removed: Vec<&SkillLocationReport> = removal
+        .reports
         .iter()
         .filter(|report| report.was_removed())
         .collect();
-    if removed.is_empty() {
+    // Only claim nothing was installed when nothing was found; a location that
+    // was found and could not be deleted is a failure, not an absence.
+    if removed.is_empty() && removal.failures.is_empty() {
         writeln!(out, "No Vera skill installations found.")?;
+        return Ok(());
+    }
+    if removed.is_empty() {
         return Ok(());
     }
 
