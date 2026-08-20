@@ -452,6 +452,71 @@ async fn search_hybrid_keeps_intent_out_of_bm25() {
     );
 }
 
+/// An embedding provider that spends a known, dominant amount of time in
+/// `embed_batch`, so the embedding stage is separable from the storage stages
+/// by measurement rather than by inspection.
+struct SlowProvider {
+    inner: crate::embedding::test_helpers::MockProvider,
+    delay: std::time::Duration,
+}
+
+impl crate::embedding::EmbeddingProvider for SlowProvider {
+    async fn embed_batch(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbeddingError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.embed_batch(texts).await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        self.inner.expected_dim()
+    }
+}
+
+// Regression for issue #105: `embedding` and `vector` were both assigned the
+// span that covers the embedding, the store opens, the KNN query and
+// hydration, so `--timing` printed one measurement twice.
+#[tokio::test]
+async fn search_hybrid_reports_embedding_and_vector_as_separate_spans() {
+    use crate::embedding::test_helpers::MockProvider;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (index_dir, dim) = setup_test_index(tmp.path()).await;
+
+    let delay = std::time::Duration::from_millis(300);
+    let provider = SlowProvider {
+        inner: MockProvider::new(dim),
+        delay,
+    };
+
+    let (_results, timings) = search_hybrid(
+        &index_dir,
+        &provider,
+        "authenticate",
+        "authenticate",
+        &SearchFilters::default(),
+        5,
+        60.0,
+        dim,
+        50,
+    )
+    .await
+    .unwrap();
+
+    let embedding = timings.embedding.expect("embedding stage must be reported");
+    let vector = timings.vector.expect("vector stage must be reported");
+
+    assert!(
+        embedding >= delay,
+        "embedding must carry the provider cost: {embedding:?} < {delay:?}"
+    );
+    assert!(
+        vector < delay,
+        "vector must exclude the provider cost: {vector:?} >= {delay:?}"
+    );
+}
+
 #[tokio::test]
 async fn search_hybrid_reranked_returns_reranked_results() {
     use crate::embedding::test_helpers::MockProvider;

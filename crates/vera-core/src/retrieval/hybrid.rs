@@ -22,7 +22,7 @@ use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_q
 use crate::retrieval::query_utils::result_key;
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
-use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores};
+use crate::retrieval::vector::{VectorSearchError, search_vector_with_stores_timed};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
@@ -134,14 +134,14 @@ pub async fn search_hybrid(
     } else {
         vector_candidates.saturating_mul(4).max(200)
     };
-    let embed_start = Instant::now();
-    let vector_results = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
+    let vector_start = Instant::now();
+    let vector_outcome = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
         Ok(vector_store) => {
             let vector_store_result =
                 MetadataStore::open(&vector_metadata_path).context("failed to open metadata store");
             match vector_store_result {
                 Ok(vector_metadata) => {
-                    match search_vector_with_stores(
+                    match search_vector_with_stores_timed(
                         &vector_store,
                         &vector_metadata,
                         provider,
@@ -150,11 +150,11 @@ pub async fn search_hybrid(
                     )
                     .await
                     {
-                        Ok(mut results) => {
+                        Ok((mut results, embed_elapsed)) => {
                             if !filters.is_empty() {
                                 results.retain(|result| filters.matches(result));
                             }
-                            Ok(results)
+                            Ok((results, embed_elapsed))
                         }
                         Err(err) => Err(err),
                     }
@@ -166,9 +166,19 @@ pub async fn search_hybrid(
             err.context("failed to open vector store"),
         )),
     };
-    let vector_elapsed = embed_start.elapsed();
-    timings.embedding = Some(vector_elapsed);
-    timings.vector = Some(vector_elapsed);
+    // The embedding runs inside the vector search, so the two stages share one
+    // wall-clock span. Report query embedding (model cost) on its own and charge
+    // the remainder to `vector` (storage cost): opening both stores, the KNN
+    // query and metadata hydration. A vector search that failed has no embedding
+    // measurement to report, so the whole span stays on `vector`.
+    let vector_span = vector_start.elapsed();
+    let embed_elapsed = vector_outcome
+        .as_ref()
+        .ok()
+        .map(|(_, embed_elapsed)| *embed_elapsed);
+    timings.embedding = embed_elapsed;
+    timings.vector = Some(vector_span.saturating_sub(embed_elapsed.unwrap_or_default()));
+    let vector_results = vector_outcome.map(|(results, _)| results);
 
     // Await the BM25 result (should already be done or nearly done).
     let (bm25_results, bm25_elapsed) = bm25_handle.await.map_err(|e| {
