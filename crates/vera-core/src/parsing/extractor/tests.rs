@@ -1869,3 +1869,45 @@ enum Role {
         "Prisma should extract models as structs"
     );
 }
+
+/// Three levels of inline `mod` around a single function. Each nesting level
+/// costs the shared depth budget, so the innermost item is the one at risk.
+const NESTED_INLINE_MOD_SOURCE: &str = r#"
+mod outer {
+    mod middle {
+        mod inner {
+            fn buried() -> i32 {
+                1
+            }
+        }
+    }
+}
+"#;
+
+#[test]
+fn rust_nested_inline_mods_reach_the_innermost_item() {
+    let symbols = parse_and_extract(NESTED_INLINE_MOD_SOURCE, Language::Rust);
+    let named: Vec<(&str, SymbolType)> = symbols
+        .iter()
+        .filter_map(|s| s.name.as_deref().map(|n| (n, s.symbol_type)))
+        .collect();
+
+    // Presence first: the enclosing modules must be there, or an extractor that
+    // returned nothing would satisfy the assertion below by accident.
+    assert!(
+        named.contains(&("outer", SymbolType::Module)),
+        "expected the outermost module, got {named:?}"
+    );
+    assert!(
+        named.contains(&("middle", SymbolType::Module)),
+        "expected the second-level module, got {named:?}"
+    );
+    assert!(
+        named.contains(&("inner", SymbolType::Module)),
+        "expected the third-level module, got {named:?}"
+    );
+    assert!(
+        named.contains(&("buried", SymbolType::Function)),
+        "expected the function inside three levels of inline mod, got {named:?}"
+    );
+}
