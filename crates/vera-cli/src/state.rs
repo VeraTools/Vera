@@ -411,8 +411,16 @@ fn apply_local_embedding_env(
 }
 
 fn set_process_env(key: &str, value: &str) {
-    // Safe because Vera only mutates process environment during single-threaded
-    // CLI startup, before any background work or runtime threads are created.
+    // In production this runs only during single-threaded CLI startup, before
+    // any background work or runtime threads exist, so no concurrent reader can
+    // observe the write.
+    //
+    // The unit tests below break that condition: libtest runs them on several
+    // threads at once. They are sound instead because every test that reads or
+    // writes any of `RESTORED_ENV_KEYS` holds `VERA_HOME_LOCK` for its whole
+    // body, and nothing else in the test binary touches those variables. Any
+    // new test that calls this, `clear_process_env`, or a helper reaching them
+    // must take the same lock.
     unsafe {
         std::env::set_var(key, value);
     }

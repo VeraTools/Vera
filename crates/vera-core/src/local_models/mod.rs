@@ -92,8 +92,8 @@ pub(super) static MODEL_DOWNLOAD_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 pub enum LocalEmbeddingPooling {
     Mean,
     Cls,
-    /// Take the final unpadded token. Required by decoder-style embedding
-    /// models (Qwen3-Embedding, F2LLM) and by jina-embeddings-v5.
+    /// Take the final unpadded token. Required by jina-embeddings-v5, whose
+    /// `1_Pooling/config.json` sets `pooling_mode_lasttoken`.
     LastToken,
 }
 
