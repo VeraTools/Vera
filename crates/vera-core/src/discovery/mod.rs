@@ -221,11 +221,19 @@ impl ExclusionMatcher {
     /// Paths outside the root are reported as not excluded: the caller cannot
     /// classify them against these patterns, and treating them as excluded would
     /// silently drop work.
+    ///
+    /// The default patterns are directory-only (`!target/`), so `path` is probed
+    /// rather than assumed to be a directory: `discover_files` indexes a regular
+    /// file named `build` or `target`, and classifying it as excluded here would
+    /// make the watcher ignore edits to a file that is in the index. A path that
+    /// no longer exists is treated as a file for the same reason, so deleting
+    /// such a file still triggers an update; its parents are matched as
+    /// directories either way, which keeps deletions under `target/` excluded.
     pub fn is_excluded(&self, path: &Path) -> bool {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
         };
-        if !self.overrides.matched(relative, true).is_none() {
+        if path.is_dir() && !self.overrides.matched(relative, true).is_none() {
             return true;
         }
         override_matches_path_or_any_parents(&self.overrides, relative)
@@ -964,6 +972,83 @@ mod tests {
 
     fn default_config() -> IndexingConfig {
         IndexingConfig::default()
+    }
+
+    /// The matcher exists so the MCP watcher classifies a path the same way
+    /// `discover_files` does. The failing direction is a *file* whose name
+    /// equals an excluded *directory*: `build`, `target`, `dist` and friends are
+    /// ordinary extensionless script names, and discovery indexes them because
+    /// its patterns are directory-only.
+    #[test]
+    fn matcher_agrees_with_discovery_on_a_file_named_like_an_excluded_dir() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("build"), "#!/bin/sh\ncargo build\n").unwrap();
+        fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        fs::write(dir.path().join("target/debug/app.o"), "object").unwrap();
+
+        let config = default_config();
+        let discovered: Vec<String> = discover_files(dir.path(), &config)
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|f| f.relative_path)
+            .collect();
+        // Presence first: the assertion below is meaningless if discovery
+        // skipped the file for some unrelated reason.
+        assert!(
+            discovered.contains(&"build".to_string()),
+            "discovery indexes an extensionless file named `build`: {discovered:?}"
+        );
+        assert!(
+            !discovered.contains(&"target/debug/app.o".to_string()),
+            "discovery skips the target/ directory: {discovered:?}"
+        );
+
+        let root = dir.path().canonicalize().unwrap();
+        let matcher = ExclusionMatcher::new(&root, &config).unwrap();
+        assert!(
+            !matcher.is_excluded(&root.join("build")),
+            "a regular file named `build` is indexed, so it must not be classified as excluded"
+        );
+        assert!(
+            matcher.is_excluded(&root.join("target/debug/app.o")),
+            "a file under target/ is not indexed, so it must be classified as excluded"
+        );
+        assert!(
+            matcher.is_excluded(&root.join("target")),
+            "the target directory itself must be classified as excluded"
+        );
+    }
+
+    #[test]
+    fn matcher_excludes_index_and_vendor_dirs_but_not_sources() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let matcher = ExclusionMatcher::new(&root, &default_config()).unwrap();
+
+        for excluded in [".vera/metadata.db", ".git/HEAD", "node_modules/x/i.js"] {
+            assert!(
+                matcher.is_excluded(&root.join(excluded)),
+                "{excluded} must be excluded"
+            );
+        }
+        assert!(!matcher.is_excluded(&root.join("src/main.rs")));
+        assert!(
+            !matcher.is_excluded(Path::new("/somewhere/else/main.rs")),
+            "a path outside the root cannot be classified, so it is not excluded"
+        );
+    }
+
+    #[test]
+    fn matcher_applies_extra_excludes() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut config = default_config();
+        config.extra_excludes = vec!["vendor/**".to_string()];
+        let matcher = ExclusionMatcher::new(&root, &config).unwrap();
+
+        assert!(matcher.is_excluded(&root.join("vendor/lib/x.rs")));
+        assert!(!matcher.is_excluded(&root.join("src/x.rs")));
     }
 
     #[test]

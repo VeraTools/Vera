@@ -158,6 +158,12 @@ fn start_watching_with(
     let exclusions = ExclusionMatcher::new(&repo_path, indexing)
         .map_err(|e| format!("Failed to build watcher exclusions: {e:#}"))?;
 
+    // The index directory is filtered on its own, never through `exclusions`:
+    // an update cycle writes into it, so a watcher that reacts to those writes
+    // re-triggers itself. `no_default_excludes`, or a stored `default_excludes`
+    // without `.vera`, would switch that guard off.
+    let index_dir = idx_dir.clone();
+
     let updating = Arc::new(AtomicBool::new(false));
     let updating_clone = updating.clone();
     let repo_clone = repo_path.clone();
@@ -177,12 +183,15 @@ fn start_watching_with(
                 }
             };
 
-            // Ignore events under directories indexing would not walk anyway
-            // (.vera, target, node_modules, ...). A build churning target/ used
-            // to start a full update cycle per debounce window.
-            let has_relevant_changes = events
-                .iter()
-                .any(|e| e.kind == DebouncedEventKind::Any && !exclusions.is_excluded(&e.path));
+            // Ignore the index directory always, plus the directories indexing
+            // would not walk anyway (target, node_modules, ...). A build
+            // churning target/ used to start a full update cycle per debounce
+            // window.
+            let has_relevant_changes = events.iter().any(|e| {
+                e.kind == DebouncedEventKind::Any
+                    && !e.path.starts_with(&index_dir)
+                    && !exclusions.is_excluded(&e.path)
+            });
 
             if !has_relevant_changes {
                 return;
@@ -423,6 +432,55 @@ mod tests {
             updates.load(Ordering::SeqCst),
             1,
             "build output under target/ must not trigger an update cycle"
+        );
+    }
+
+    /// An update cycle writes into `.vera`, so a watcher that reacts to those
+    /// writes re-triggers itself forever. The index directory therefore cannot
+    /// be filtered through the configurable exclusions: `no_default_excludes`
+    /// (and a stored `default_excludes` that omits `.vera`) would switch the
+    /// guard off.
+    #[test]
+    fn index_writes_never_trigger_updates_even_without_default_excludes() {
+        let repo = repo_fixture();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let updates = Arc::new(AtomicUsize::new(0));
+        let indexing = IndexingConfig {
+            no_default_excludes: true,
+            ..IndexingConfig::default()
+        };
+
+        let _handle = start_watching_with(
+            repo.path(),
+            false,
+            TEST_DEBOUNCE,
+            &indexing,
+            counting_builder(Arc::clone(&builds), Arc::clone(&updates)),
+        )
+        .expect("watcher starts");
+
+        // Presence first: with the default exclusions off, an ordinary source
+        // change must still be seen, or the absence assertion below is vacuous.
+        std::fs::write(repo.path().join("src/real.rs"), "fn real() {}").expect("write");
+        assert!(
+            wait_until(Duration::from_secs(10), || updates.load(Ordering::SeqCst)
+                == 1),
+            "an indexable change must trigger exactly one update cycle"
+        );
+
+        for i in 0..5 {
+            std::fs::write(
+                repo.path().join(format!(".vera/chunk{i}.db")),
+                format!("index write {i}"),
+            )
+            .expect("write");
+        }
+        std::thread::sleep(TEST_DEBOUNCE * 6);
+
+        assert_eq!(
+            updates.load(Ordering::SeqCst),
+            1,
+            "writes into the index directory must never trigger an update cycle"
         );
     }
 }
