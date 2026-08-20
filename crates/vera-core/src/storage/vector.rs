@@ -262,7 +262,8 @@ impl VectorStore {
         // Resolve the rowids in one query instead of one per hit. The KNN
         // query above is deliberately left alone: joining `chunk_id_map` into
         // it would risk losing the vec0 KNN optimization.
-        let chunk_ids = self.chunk_ids_for_rowids(&hits)?;
+        let rowids: Vec<i64> = hits.iter().map(|(rowid, _)| *rowid).collect();
+        let chunk_ids = self.chunk_ids_for_rowids(&rowids)?;
 
         hits.iter()
             .map(|(rowid, distance)| {
@@ -279,12 +280,12 @@ impl VectorStore {
     }
 
     /// Resolve many rowids to their chunk ids in a single query.
-    fn chunk_ids_for_rowids(&self, hits: &[(i64, f64)]) -> Result<HashMap<i64, String>> {
-        if hits.is_empty() {
+    fn chunk_ids_for_rowids(&self, rowids: &[i64]) -> Result<HashMap<i64, String>> {
+        if rowids.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", hits.len())
+        let placeholders = std::iter::repeat_n("?", rowids.len())
             .collect::<Vec<_>>()
             .join(",");
         // Text varies with the number of ids, so plain `prepare` here too.
@@ -296,10 +297,9 @@ impl VectorStore {
             .context("failed to prepare chunk id lookup")?;
 
         let mapped = stmt
-            .query_map(
-                rusqlite::params_from_iter(hits.iter().map(|(rowid, _)| *rowid)),
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
+            .query_map(rusqlite::params_from_iter(rowids.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .context("failed to query chunk ids")?
             .collect::<std::result::Result<HashMap<_, _>, _>>()
             .context("failed to collect chunk ids")?;
@@ -601,8 +601,8 @@ mod tests {
                 .unwrap();
         }
 
-        let hits: Vec<(i64, f64)> = (1..=4096).map(|rowid| (rowid, 0.0)).collect();
-        let mapped = store.chunk_ids_for_rowids(&hits).unwrap();
+        let rowids: Vec<i64> = (1..=4096).collect();
+        let mapped = store.chunk_ids_for_rowids(&rowids).unwrap();
 
         assert_eq!(mapped.len(), 4096);
         assert_eq!(mapped.get(&1).map(String::as_str), Some("chunk-1"));
