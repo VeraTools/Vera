@@ -383,9 +383,10 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     // intermediate symlinked directory would still be traversed by every check
     // below. The walker never descends through one, so nothing beneath it is
     // enumerated; reject the whole path before reading metadata, ignore rules
-    // or content through the link. The scan runs on the path as written, since
-    // collapsing `..` first erases the very links the kernel would traverse.
-    match scan_ancestors(&root, root_relative)? {
+    // or content through the link. Which form of the path the scan walks is
+    // platform-dependent, since only POSIX resolves a `..` against the directory
+    // it has already reached.
+    match scan_ancestors(&root, ancestor_scan_path(root_relative, &relative))? {
         AncestorScan::Symlink(link) => {
             return Ok(path_excluded(
                 display_input,
@@ -617,14 +618,34 @@ enum AncestorScan {
     UnresolvableAncestor,
 }
 
-/// Walk the ancestors of `relative` under `root`, stopping at the first that is
-/// a symbolic link or that the kernel could not resolve through.
+/// Which form of the path the ancestor scan should walk: the one whose
+/// ancestors the operating system would actually visit.
 ///
-/// `relative` must be the path as it was written, before `..` segments are
-/// collapsed. The kernel resolves left to right, so `link/../file` traverses
-/// `link`, while collapsing the pair lexically first erases the link and leaves
-/// no ancestor to inspect. The walk therefore keeps its own lexical prefix and
-/// treats a `..` as one more component following whatever precedes it.
+/// POSIX resolves a path left to right and applies each `..` to the directory it
+/// has already reached, so the ancestors are the ones written down:
+/// `link/../file` traverses `link`, and `regular/../file` stops at `regular`
+/// with `ENOTDIR`. Win32 canonicalizes `..` out of an ordinary path before the
+/// file system sees it, so `link\..\file` opens `file` and `regular\..\file`
+/// succeeds; scanning the written form there would report on ancestors Windows
+/// never visits.
+///
+/// Only the placement of `..` differs, which is why this selects an input rather
+/// than gating the scan. The scan's other two outcomes hold on both platforms:
+/// Windows will not open `regular\nested\file` either, and the walker declines a
+/// reparse point exactly as it declines a symbolic link. The Windows branch is
+/// reasoned from Win32's documented path canonicalization and is not exercised
+/// by the tests below, which run only on Unix.
+fn ancestor_scan_path<'a>(as_written: &'a Path, collapsed: &'a Path) -> &'a Path {
+    if cfg!(unix) { as_written } else { collapsed }
+}
+
+/// Walk the ancestors of `relative` under `root`, stopping at the first that is
+/// a symbolic link or that the operating system could not resolve through.
+///
+/// `relative` comes from `ancestor_scan_path`, which decides whether this
+/// platform has already collapsed its `..` segments. The walk keeps its own
+/// lexical prefix so that a `..` still present counts as one more component
+/// following whatever precedes it.
 ///
 /// An unresolvable ancestor is reported separately rather than skipped, because
 /// the kernel cannot resolve through it either: `absent/../link/file` is missing,
@@ -1804,7 +1825,8 @@ mod tests {
     }
 
     // Windows collapses `..` lexically before the filesystem sees the path, so
-    // the `ENOTDIR` this pins is POSIX resolution order.
+    // the `ENOTDIR` this pins is POSIX resolution order, which is what
+    // `ancestor_scan_path` selects for.
     #[cfg(unix)]
     #[test]
     fn explain_path_reports_a_non_directory_ancestor_as_missing() {
