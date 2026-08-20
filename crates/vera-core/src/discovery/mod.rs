@@ -380,6 +380,28 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     let relative_path = relative.to_string_lossy().to_string();
     let relative = Path::new(&relative_path);
 
+    // `symlink_metadata` refuses to follow only the final component, so an
+    // intermediate symlinked directory would still be traversed by every check
+    // below. The walker never descends through one, so nothing beneath it is
+    // enumerated; reject the whole path before reading metadata, ignore rules
+    // or content through the link.
+    if let Some(link) = symlinked_ancestor(&root, relative)? {
+        return Ok(path_excluded(
+            display_input,
+            absolute_display,
+            relative_path,
+            IgnoreMatchExplanation {
+                reason: PathReason::NonRegularFile,
+                source: Some("discovery".to_string()),
+                pattern: None,
+                details: Some(format!(
+                    "the ancestor {} is a symbolic link, and symbolic links are not followed during indexing",
+                    link.display()
+                )),
+            },
+        ));
+    }
+
     // Inspect the link itself, not its target, so this diagnostic reports the
     // same decision the walker makes.
     let metadata = match std::fs::symlink_metadata(&candidate) {
@@ -585,6 +607,34 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         pattern,
         details: details.or_else(|| Some("path would be indexed".to_string())),
     })
+}
+
+/// Return the first repository-relative ancestor of `relative` that is a
+/// symbolic link, ignoring the final component.
+///
+/// A missing ancestor yields `None` so the caller still reports the path as
+/// missing rather than as a link.
+fn symlinked_ancestor(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
+    let mut prefix = PathBuf::new();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        prefix.push(component);
+        let ancestor = root.join(&prefix);
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_symlink() => return Ok(Some(prefix)),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to read metadata for {}", ancestor.display())
+                });
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn normalized_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
@@ -1594,6 +1644,57 @@ mod tests {
             explain_path(dir.path(), Path::new("alias.rs"), &default_config()).unwrap();
         assert_eq!(explanation.decision, PathDecision::Excluded);
         assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_rejects_files_below_a_symlinked_directory() {
+        let outside = TempDir::new().unwrap();
+        let outside_dir = outside.path().join("secrets");
+        fs::create_dir_all(outside_dir.join("nested")).unwrap();
+        fs::write(
+            outside_dir.join("nested/secret.rs"),
+            "fn outside_secret() {}\n",
+        )
+        .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, dir.path().join("linkdir")).unwrap();
+
+        let result = discover_files(dir.path(), &default_config()).unwrap();
+        let discovered: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(discovered, vec!["main.rs"]);
+
+        // The symlink is an intermediate component, not the final one, so
+        // `symlink_metadata` on the candidate would follow it.
+        let explanation = explain_path(
+            dir.path(),
+            Path::new("linkdir/nested/secret.rs"),
+            &default_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            explanation.decision,
+            PathDecision::Excluded,
+            "explain_path must agree with discovery, which never enumerated this path"
+        );
+        assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    #[test]
+    fn explain_path_reports_a_path_that_does_not_exist_as_missing() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+
+        let explanation =
+            explain_path(dir.path(), Path::new("src/absent.rs"), &default_config()).unwrap();
+        assert_eq!(explanation.decision, PathDecision::Missing);
+        assert_eq!(explanation.reason, PathReason::Missing);
     }
 
     #[cfg(unix)]
