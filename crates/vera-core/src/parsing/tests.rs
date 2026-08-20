@@ -65,6 +65,31 @@ impl Point {
 }
 
 #[test]
+fn rust_impl_methods_emit_no_gap_chunks() {
+    let source = r#"impl CancellationToken {
+    /// Create a token.
+    fn new() -> Self {
+        Self
+    }
+
+    /// Cancel the token.
+    fn cancel(&self) {}
+}
+"#;
+    let chunks = parse(source, "cancellation.rs", Language::Rust);
+
+    let unnamed: Vec<_> = chunks.iter().filter(|c| c.symbol_name.is_none()).collect();
+    assert!(
+        unnamed.is_empty(),
+        "spans inside the impl are already covered by its chunk: {unnamed:?}"
+    );
+    assert!(
+        !chunks.iter().any(|c| c.content.trim() == "}"),
+        "the impl's closing brace must not become its own chunk: {chunks:?}"
+    );
+}
+
+#[test]
 fn rust_enum_and_trait() {
     let source = r#"enum Color {
     Red,
