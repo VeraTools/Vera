@@ -75,3 +75,36 @@ pub fn apply_filters(
         .take(limit)
         .collect()
 }
+
+/// Collapse whitespace and drop empty or repeated subqueries.
+///
+/// Fusion counts every subquery, so the same query arriving twice would
+/// otherwise weigh double against the ones it was meant to complement.
+pub fn normalize_queries(queries: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(queries.len());
+    let mut seen = std::collections::HashSet::new();
+
+    for query in queries {
+        let collapsed = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            continue;
+        }
+        if seen.insert(collapsed.to_ascii_lowercase()) {
+            normalized.push(collapsed);
+        }
+    }
+
+    normalized
+}
+
+/// Candidate width each subquery keeps before multi-query fusion.
+///
+/// A subquery has to over-fetch relative to the caller's limit, or fusion has
+/// nothing to merge: the first subquery alone fills the final window and every
+/// later one is truncated away.
+pub fn multi_query_candidate_limit(result_limit: usize) -> usize {
+    result_limit
+        .saturating_mul(2)
+        .max(result_limit.saturating_add(10))
+        .max(20)
+}

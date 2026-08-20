@@ -21,6 +21,7 @@ use crate::types::{SearchFilters, SearchResult};
 
 use super::completion_client::CompletionClient;
 use super::hybrid::fuse_rrf_multi_weighted;
+use super::multi_query_candidate_limit;
 use super::search_service::{SearchContext, SearchTimings};
 
 /// Execute deep search: RAG-fusion if a completion endpoint is configured,
@@ -111,7 +112,7 @@ async fn execute_rag_fusion_with_context(
         ));
     }
 
-    let per_query_limit = compute_per_query_limit(result_limit);
+    let per_query_limit = multi_query_candidate_limit(result_limit);
 
     let query_count = queries.len();
 
@@ -192,13 +193,6 @@ fn normalize_query(query: &str) -> String {
     query.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn compute_per_query_limit(result_limit: usize) -> usize {
-    result_limit
-        .saturating_mul(2)
-        .max(result_limit.saturating_add(10))
-        .max(20)
-}
-
 fn merge_timings(target: &mut SearchTimings, incoming: &SearchTimings) {
     add_duration(&mut target.embedding, incoming.embedding);
     add_duration(&mut target.bm25, incoming.bm25);
@@ -277,8 +271,8 @@ mod tests {
 
     #[test]
     fn per_query_limit_overfetches() {
-        assert_eq!(compute_per_query_limit(5), 20);
-        assert_eq!(compute_per_query_limit(20), 40);
+        assert_eq!(multi_query_candidate_limit(5), 20);
+        assert_eq!(multi_query_candidate_limit(20), 40);
     }
 
     #[test]
