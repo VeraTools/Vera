@@ -361,6 +361,45 @@ mod tests {
         );
     }
 
+    /// A skill whose `SKILL.md` cannot be stat'd at all, because its own
+    /// directory denies traversal. `Path::exists` reports that as absent.
+    #[cfg(unix)]
+    fn install_uninspectable_claude_global_skill(home: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = home.join(".claude").join("skills").join("vera");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), "test").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        path
+    }
+
+    /// An installed skill that cannot be inspected is not an absent one. Reporting
+    /// it as absent leaves it on disk while claiming it was never there.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_does_not_report_an_uninspectable_skill_as_absent() {
+        let roots = roots();
+        let locked = install_uninspectable_claude_global_skill(&roots.home);
+
+        let (stdout, stderr) = uninstall(&roots, false);
+        allow_cleanup(&locked);
+        let skill_survived = locked.join("SKILL.md").exists();
+
+        assert!(
+            skill_survived,
+            "fixture does not discriminate: the skill was deleted after all"
+        );
+        assert!(
+            !stdout.contains("No Vera skill installations found."),
+            "claimed nothing was installed while {} was still on disk: {stdout}",
+            locked.display()
+        );
+        assert!(
+            stderr.contains("failed to check for an installed skill at"),
+            "the inspection failure was never reported: {stderr}"
+        );
+    }
+
     #[test]
     fn uninstall_human_output_reports_nothing_when_no_skills_are_installed() {
         let roots = roots();

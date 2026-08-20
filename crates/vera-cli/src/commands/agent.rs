@@ -589,8 +589,9 @@ pub(crate) struct SkillRemoval {
 }
 
 /// Delete the skill directory at each location, reporting per location whether
-/// a skill was actually there and deleted. A location that cannot be deleted is
-/// recorded as not removed and does not stop the remaining locations.
+/// a skill was actually there and deleted. A location that cannot be inspected
+/// or deleted is recorded as not removed, with the reason kept as a failure, and
+/// does not stop the remaining locations.
 fn remove_skill_locations(locations: &[SkillLocation]) -> SkillRemoval {
     let mut removal = SkillRemoval {
         reports: Vec::with_capacity(locations.len()),
@@ -598,7 +599,23 @@ fn remove_skill_locations(locations: &[SkillLocation]) -> SkillRemoval {
     };
 
     for location in locations {
-        let installed = location.path.join("SKILL.md").exists();
+        let marker = location.path.join("SKILL.md");
+        // `Path::exists` coerces a permission error into `false`, which reports an
+        // installed skill as absent. `try_exists` keeps that call's symlink-following
+        // semantics, so a broken `SKILL.md` symlink stays "not installed" exactly as
+        // before, and only separates "cannot tell" from "not there".
+        let installed = match marker.try_exists() {
+            Ok(installed) => installed,
+            Err(error) => {
+                removal
+                    .failures
+                    .push(anyhow::Error::new(error).context(format!(
+                        "failed to check for an installed skill at {}",
+                        marker.display()
+                    )));
+                false
+            }
+        };
         let removed = installed
             && match fs::remove_dir_all(&location.path) {
                 Ok(()) => true,
