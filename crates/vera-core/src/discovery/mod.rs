@@ -250,9 +250,12 @@ pub fn discover_files_with_cancellation(
             }
         };
 
-        // Skip directories — we only want files.
+        // Keep only regular files. `file_type()` reports the entry's own type,
+        // so a symlink is skipped rather than indexed through its target: the
+        // walker does not follow links, and resolving one here would pull
+        // content from outside the repository under an in-repository path.
         let path = entry.path();
-        if !path.is_file() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
@@ -377,20 +380,29 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     let relative_path = relative.to_string_lossy().to_string();
     let relative = Path::new(&relative_path);
 
-    if !candidate.exists() {
-        return Ok(PathExplanation {
-            input_path: display_input,
-            absolute_path: absolute_display,
-            relative_path: Some(relative_path),
-            decision: PathDecision::Missing,
-            reason: PathReason::Missing,
-            source: None,
-            pattern: None,
-            details: Some("path does not exist".to_string()),
-        });
-    }
+    // Inspect the link itself, not its target, so this diagnostic reports the
+    // same decision the walker makes.
+    let metadata = match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PathExplanation {
+                input_path: display_input,
+                absolute_path: absolute_display,
+                relative_path: Some(relative_path),
+                decision: PathDecision::Missing,
+                reason: PathReason::Missing,
+                source: None,
+                pattern: None,
+                details: Some("path does not exist".to_string()),
+            });
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read metadata for {}", candidate.display()));
+        }
+    };
 
-    if candidate.is_dir() {
+    if metadata.is_dir() {
         return Ok(PathExplanation {
             input_path: display_input,
             absolute_path: absolute_display,
@@ -403,7 +415,7 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         });
     }
 
-    if !candidate.is_file() {
+    if !metadata.is_file() {
         return Ok(path_excluded(
             display_input,
             absolute_display,
@@ -412,7 +424,11 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
                 reason: PathReason::NonRegularFile,
                 source: Some("discovery".to_string()),
                 pattern: None,
-                details: Some("only regular files are indexed".to_string()),
+                details: Some(if metadata.is_symlink() {
+                    "symbolic links are not followed during indexing".to_string()
+                } else {
+                    "only regular files are indexed".to_string()
+                }),
             },
         ));
     }
@@ -483,8 +499,6 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         ));
     }
 
-    let metadata = std::fs::metadata(&candidate)
-        .with_context(|| format!("failed to read metadata for {}", candidate.display()))?;
     if metadata.len() > config.max_file_size_bytes {
         return Ok(path_excluded(
             display_input,
@@ -1521,6 +1535,65 @@ mod tests {
         assert_eq!(explanation.reason, PathReason::OutsideRoot);
 
         fs::remove_file(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_file_outside_root_is_not_discovered() {
+        let outside = TempDir::new().unwrap();
+        let canary = outside.path().join("canary.rs");
+        fs::write(&canary, "fn canary_outside_root() {}\n").unwrap();
+
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(&canary, dir.path().join("linked.rs")).unwrap();
+
+        let result = discover_files(dir.path(), &default_config()).unwrap();
+        let names: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["main.rs"],
+            "a symlink to a file outside the root must not be discovered"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_file_inside_root_is_not_indexed_twice() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("main.rs");
+        fs::write(&real, "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("alias.rs")).unwrap();
+
+        let result = discover_files(dir.path(), &default_config()).unwrap();
+        let names: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["main.rs"],
+            "a symlink to an in-repository file must not be indexed a second time"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_rejects_symlinks_to_regular_files() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("main.rs");
+        fs::write(&real, "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("alias.rs")).unwrap();
+
+        let explanation =
+            explain_path(dir.path(), Path::new("alias.rs"), &default_config()).unwrap();
+        assert_eq!(explanation.decision, PathDecision::Excluded);
+        assert_eq!(explanation.reason, PathReason::NonRegularFile);
     }
 
     #[cfg(unix)]
