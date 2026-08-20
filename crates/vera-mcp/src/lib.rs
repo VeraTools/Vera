@@ -16,5 +16,7 @@ pub mod protocol;
 pub mod saved_config;
 pub mod server;
 pub mod staleness;
+#[cfg(test)]
+mod test_support;
 pub mod tools;
 pub mod watcher;

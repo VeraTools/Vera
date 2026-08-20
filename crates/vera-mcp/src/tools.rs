@@ -1012,23 +1012,7 @@ fn handle_explain_path(args: &Value) -> ToolCallResult {
 mod tests {
     use super::*;
 
-    /// Build a repo holding `source`, indexed under the hash of `indexed_source`.
-    /// Passing the same text twice yields a fresh index.
-    fn repo_indexed_as(source: &str, indexed_source: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/lib.rs"), source).unwrap();
-        std::fs::create_dir_all(dir.path().join(".vera")).unwrap();
-        let db_path = dir.path().join(".vera/metadata.db");
-        let metadata = vera_core::storage::metadata::MetadataStore::open(&db_path).unwrap();
-        metadata
-            .set_file_hash(
-                "src/lib.rs",
-                &vera_core::indexing::content_hash(indexed_source),
-            )
-            .unwrap();
-        dir
-    }
+    use crate::test_support::repo_indexed_as;
 
     #[test]
     fn stale_index_result_carries_the_warning_after_the_results() {
