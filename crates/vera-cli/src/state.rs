@@ -482,12 +482,19 @@ mod tests {
       }
     }"#;
 
-    /// A stored model that prefixes queries only. Nothing in the presets or the
-    /// generic fallback produces this repo, pooling, dimension or prefix, so a
-    /// default standing in for the stored value would fail every assertion.
+    /// A stored model that prefixes queries only.
+    ///
+    /// The repo is jina's on purpose: `defaults_for_source` answers it with a
+    /// preset that *does* carry a document prefix, so a default reinstated for
+    /// the missing field is visible. An unrecognised repo would fall to
+    /// `generic_defaults`, whose document prefix is already `None`, and the
+    /// assertion would pass for want of a default rather than because the
+    /// stored config won. Pooling, dimension and length are still nothing any
+    /// preset produces, so those assertions stay honest too.
     const STORED_QUERY_PREFIX_ONLY_CONFIG: &str = r#"{
       "local_embedding_model": {
-        "source": {"source": "hugging-face", "repo": "acme/query-prefixed-encoder"},
+        "source": {"source": "hugging-face",
+                   "repo": "jinaai/jina-embeddings-v5-text-nano-retrieval"},
         "onnx_file": "onnx/model_quantized.onnx",
         "tokenizer_file": "tokenizer.json",
         "embedding_dim": 384,
