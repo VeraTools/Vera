@@ -144,15 +144,71 @@ class Widget {
 struct Point {
     func norm() -> Int { return 2 }
 }
+
+enum Color {
+    case red
+    func describe() -> Int { return 3 }
+}
+
+extension Color {
+    func other() -> Int { return 4 }
+}
 "#,
         Language::Swift,
     );
 
-    // The refined type survives the recursion: a struct stays a struct.
+    // One kind, `class_declaration`, spells all four constructs. The refined
+    // type survives the recursion: a struct stays a struct, an enum an enum.
     let class = require(&symbols, "Widget", SymbolType::Class);
     let structure = require(&symbols, "Point", SymbolType::Struct);
+    let enumeration = require(&symbols, "Color", SymbolType::Enum);
+    // An extension carries no name the extractor can read, so pin it by row.
+    let extension = require_at(&symbols, 14, SymbolType::Class);
     assert_nested(class, require(&symbols, "render", SymbolType::Function));
     assert_nested(structure, require(&symbols, "norm", SymbolType::Function));
+    assert_nested(
+        enumeration,
+        require(&symbols, "describe", SymbolType::Function),
+    );
+    assert_nested(extension, require(&symbols, "other", SymbolType::Function));
+}
+
+#[test]
+fn csharp_namespace_keeps_its_members_in_both_spellings() {
+    let braced = extracted(
+        r#"
+namespace App {
+    class Widget {
+        public int Render() { return 1; }
+    }
+}
+"#,
+        Language::CSharp,
+    );
+    let namespace = require(&braced, "App", SymbolType::Module);
+    let class = require(&braced, "Widget", SymbolType::Class);
+    assert_nested(namespace, class);
+    assert_nested(class, require(&braced, "Render", SymbolType::Method));
+
+    // The file-scoped spelling parses as a header ending at its semicolon, not
+    // as a node spanning the file, so its members are siblings rather than
+    // children. Recursing into it finds nothing; it is listed alongside the
+    // braced spelling because the case this replaced listed it.
+    let file_scoped = extracted(
+        r#"
+namespace App;
+
+class Widget {
+    public int Render() { return 1; }
+}
+"#,
+        Language::CSharp,
+    );
+    let namespace = require(&file_scoped, "App", SymbolType::Module);
+    assert_eq!(namespace.end_row, 1);
+    let class = require(&file_scoped, "Widget", SymbolType::Class);
+    assert!(class.start_byte > namespace.end_byte);
+    assert_nested(class, require(&file_scoped, "Render", SymbolType::Method));
 }
 
 #[test]
@@ -199,6 +255,10 @@ public:
 int helper() { return 2; }
 
 }
+
+struct Holder {
+  int fetch() { return 3; }
+};
 "#,
         Language::Cpp,
     );
@@ -209,10 +269,13 @@ int helper() { return 2; }
     let class = require(&symbols, "Widget", SymbolType::Class);
     let render = require(&symbols, "render", SymbolType::Function);
     let helper = require(&symbols, "helper", SymbolType::Function);
+    // A C++ struct holds inline member definitions the same way a class does.
+    let holder = require(&symbols, "Holder", SymbolType::Struct);
 
     assert_nested(namespace, class);
     assert_nested(class, render);
     assert_nested(namespace, helper);
+    assert_nested(holder, require(&symbols, "fetch", SymbolType::Function));
 }
 
 #[test]
@@ -292,6 +355,14 @@ class Widget {
 struct Holder {
     int fetch() { return 2; }
 }
+
+interface Drawable {
+    int draw();
+}
+
+template Pair(T) {
+    T get() { return T.init; }
+}
 "#,
         Language::DLang,
     );
@@ -303,8 +374,13 @@ struct Holder {
 
     let class = require(&symbols, "Widget", SymbolType::Class);
     let structure = require(&symbols, "Holder", SymbolType::Struct);
+    let interface = require(&symbols, "Drawable", SymbolType::Interface);
+    // A template holds its declarations through the same `aggregate_body`.
+    let template = require(&symbols, "Pair", SymbolType::TypeAlias);
     assert_nested(class, require(&symbols, "render", SymbolType::Function));
     assert_nested(structure, require(&symbols, "fetch", SymbolType::Function));
+    assert_nested(interface, require(&symbols, "draw", SymbolType::Function));
+    assert_nested(template, require(&symbols, "get", SymbolType::Function));
 }
 
 #[test]
@@ -386,4 +462,25 @@ end module widgets
     let module = require_only(&symbols, SymbolType::Module);
     assert_eq!(module.start_row, 1);
     assert_nested(module, require_at(&symbols, 3, SymbolType::Function));
+}
+
+#[test]
+fn fortran_program_keeps_its_procedures() {
+    let symbols = extracted(
+        r#"
+program main
+contains
+  subroutine helper(x)
+    integer :: x
+  end subroutine helper
+end program main
+"#,
+        Language::Fortran,
+    );
+
+    // As with `module`, the `program_statement` header must not be recorded as
+    // a second program symbol.
+    let program = require_only(&symbols, SymbolType::Block);
+    assert_eq!(program.start_row, 1);
+    assert_nested(program, require_at(&symbols, 3, SymbolType::Function));
 }
