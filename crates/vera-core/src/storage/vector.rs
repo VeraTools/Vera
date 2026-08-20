@@ -589,6 +589,46 @@ mod tests {
     }
 
     #[test]
+    fn chunk_id_batch_lookup_handles_4096_bound_parameters() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        for index in 1..=4096 {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO chunk_id_map (rowid, chunk_id) VALUES (?1, ?2)",
+                    params![index, format!("chunk-{index}")],
+                )
+                .unwrap();
+        }
+
+        let hits: Vec<(i64, f64)> = (1..=4096).map(|rowid| (rowid, 0.0)).collect();
+        let mapped = store.chunk_ids_for_rowids(&hits).unwrap();
+
+        assert_eq!(mapped.len(), 4096);
+        assert_eq!(mapped.get(&1).map(String::as_str), Some("chunk-1"));
+        assert_eq!(mapped.get(&4096).map(String::as_str), Some("chunk-4096"));
+    }
+
+    #[test]
+    fn search_reports_missing_chunk_id_mapping() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        store.insert("missing", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM chunk_id_map WHERE chunk_id = ?1",
+                params!["missing"],
+            )
+            .unwrap();
+
+        let error = store.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to map rowid"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn search_clamps_limit_above_sqlite_vec_knn_cap() {
         let store = VectorStore::open_in_memory(4).unwrap();
         for i in 0..10 {
