@@ -70,9 +70,14 @@ pub enum Commands {
 
     /// Start the Vera HTTP API server for remote embedding and reranking.
     #[command(long_about = "Start the Vera HTTP API server.\n\n\
-                      Loads the embedding model at startup and the reranker on its first \
-                      use (using the selected backend), then exposes both via HTTP so any \
-                      unmodified vera client can use this host for compute.\n\n\
+                      Loads the embedding model at startup and keeps it (using the \
+                      selected backend), then exposes it via HTTP so any unmodified vera \
+                      client can use this host for compute.\n\n\
+                      The reranker is built at startup too, to check it works, but that \
+                      copy is discarded rather than kept: a server that only answers \
+                      /v1/embeddings would otherwise hold it for nothing. Startup \
+                      therefore pays for both models, and the first /v1/rerank request \
+                      pays to load the reranker again.\n\n\
                       A loaded model is held in memory and reused across requests. It is \
                       unloaded after --idle-timeout seconds of inactivity and reloaded on \
                       the next request that needs it; see that flag for the values that \
@@ -112,7 +117,8 @@ pub enum Commands {
         /// Seconds of inactivity before a model is unloaded from memory.
         /// 0 = rebuild the model on every request, and hold one live model per
         /// concurrent request; only useful to pick up model files replaced under
-        /// a running server. -1 = keep loaded indefinitely.
+        /// a running server. Any negative value, -1 included, keeps models
+        /// loaded indefinitely.
         #[arg(long, default_value_t = 300, allow_negative_numbers = true)]
         idle_timeout: i64,
 
