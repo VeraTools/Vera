@@ -536,6 +536,28 @@ mod tests {
     }
 
     #[test]
+    fn repair_command_does_not_rewrite_stored_pooling() {
+        let _guard = with_stored_config(LEGACY_JINA_CONFIG);
+        assert_eq!(stored_pooling_on_disk(), "mean");
+
+        // `vera repair` resolves an embedding model and hands it to
+        // `setup::configure_backend`, which persists it verbatim. Sourcing it
+        // from the repaired accessor put `last-token` in the file and bricked
+        // an older Vera installed alongside — and unlike `vera setup`, the user
+        // never picked a pooling mode here.
+        let model = crate::commands::repair::embedding_model_to_persist(
+            vera_core::config::InferenceBackend::OnnxJina(
+                vera_core::config::OnnxExecutionProvider::Cpu,
+            ),
+        )
+        .unwrap()
+        .expect("an ONNX backend always carries an embedding model");
+        save_local_embedding_model(&model).unwrap();
+
+        assert_eq!(stored_pooling_on_disk(), "mean");
+    }
+
+    #[test]
     fn runtime_readers_repair_stored_pooling_in_memory() {
         let _guard = with_stored_config(LEGACY_JINA_CONFIG);
 
