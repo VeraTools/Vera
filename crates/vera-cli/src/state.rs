@@ -91,6 +91,18 @@ pub fn save_local_embedding_model(
     save_config(&config)
 }
 
+/// The single point where a stored model config becomes a runtime one.
+///
+/// Every runtime reader of `local_embedding_model` goes through here, so the
+/// repair cannot be forgotten by a future one and silently reinstate the
+/// mean-pooled jina config. Nothing here reaches disk; see `load_saved_config`
+/// for why the repair must stay out of the load path.
+fn repaired_local_embedding_model(
+    stored: Option<vera_core::local_models::LocalEmbeddingModelConfig>,
+) -> Option<vera_core::local_models::LocalEmbeddingModelConfig> {
+    stored.map(vera_core::local_models::LocalEmbeddingModelConfig::repair_stored_defaults)
+}
+
 /// The stored model config as runtime should see it.
 ///
 /// `setup` freezes the resolved model config into `config.json` and that copy
@@ -99,9 +111,9 @@ pub fn save_local_embedding_model(
 /// memory only; the file keeps whatever `setup` wrote.
 pub fn saved_local_embedding_model()
 -> Result<Option<vera_core::local_models::LocalEmbeddingModelConfig>> {
-    Ok(load_saved_config()?
-        .local_embedding_model
-        .map(vera_core::local_models::LocalEmbeddingModelConfig::repair_stored_defaults))
+    Ok(repaired_local_embedding_model(
+        load_saved_config()?.local_embedding_model,
+    ))
 }
 
 pub fn saved_backend() -> Result<Option<vera_core::config::InferenceBackend>> {
@@ -231,9 +243,7 @@ fn apply_saved_env_impl(force: bool) -> Result<()> {
 
     // Repaired in memory on the way to the process environment; see
     // `saved_local_embedding_model`.
-    let local_embedding_model = config
-        .local_embedding_model
-        .map(vera_core::local_models::LocalEmbeddingModelConfig::repair_stored_defaults);
+    let local_embedding_model = repaired_local_embedding_model(config.local_embedding_model);
     apply_local_embedding_env(local_embedding_model.as_ref(), force);
 
     Ok(())
