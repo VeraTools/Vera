@@ -233,10 +233,10 @@ impl LocalEmbeddingModelConfig {
     }
 
     pub fn from_directory(path: PathBuf) -> Self {
-        Self {
-            source: LocalEmbeddingSource::Directory { path },
-            ..Self::default()
-        }
+        let source = LocalEmbeddingSource::Directory { path };
+        let mut defaults = Self::defaults_for_source(&source);
+        defaults.source = source;
+        defaults
     }
 
     /// Switch to the FP16 ONNX model when running on a GPU execution provider.

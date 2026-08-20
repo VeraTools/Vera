@@ -563,6 +563,24 @@ fn unknown_repo_still_defaults_to_mean_pooling() {
 }
 
 #[test]
+fn directory_source_still_defaults_to_mean_pooling() {
+    // `--embedding-dir` and VERA_LOCAL_EMBEDDING_DIR point at a model Vera has
+    // no preset for, so they must inherit the generic fallback. Deriving them
+    // from `Default` instead handed every custom directory model jina's
+    // last-token pooling the moment jina's own pooling was fixed.
+    let path = PathBuf::from("/models/some-encoder");
+    let config = LocalEmbeddingModelConfig::from_directory(path.clone());
+
+    assert_eq!(config.pooling, LocalEmbeddingPooling::Mean);
+    assert_eq!(config.source, LocalEmbeddingSource::Directory { path });
+    assert!(
+        config.model_identity().contains("pooling=mean"),
+        "identity `{}` should record mean pooling",
+        config.model_identity()
+    );
+}
+
+#[test]
 fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
     // Vectors pooled two ways are not comparable. If the preset identity
     // ignored pooling, upgrading would query mean-pooled rows with last-token
