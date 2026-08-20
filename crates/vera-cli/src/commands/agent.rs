@@ -940,6 +940,16 @@ struct SyncOutcome {
     refreshed_snippets: Vec<PathBuf>,
 }
 
+/// Whether project-scoped paths under `cwd` can be resolved at all.
+///
+/// `getcwd` still succeeds on Linux for a directory the process has no search
+/// permission on, so `project_cwd` can be `Some` for a directory every
+/// `Path::exists()` probe underneath reports as missing. Stat a path inside it
+/// so that access error is not read as "nothing is installed".
+fn project_root_is_searchable(cwd: &Path) -> bool {
+    fs::metadata(cwd.join(".")).is_ok()
+}
+
 fn sync_to_roots(
     client: AgentClient,
     scope: AgentScope,
@@ -947,6 +957,7 @@ fn sync_to_roots(
     home: &Path,
     refresh_project_snippets: bool,
 ) -> anyhow::Result<SyncOutcome> {
+    let project_cwd = project_cwd.filter(|cwd| project_root_is_searchable(cwd));
     let scan_scope = match (scope, project_cwd) {
         (AgentScope::Project, None) => {
             bail!("--scope project needs a readable current directory")
@@ -1787,5 +1798,54 @@ mod tests {
         assert_eq!(outcome.updated, vec![stale]);
         assert!(outcome.refreshed_snippets.is_empty());
         assert_eq!(fs::read_to_string(&claude_md).unwrap(), managed);
+    }
+
+    /// Restores a directory's mode on unwind so a failing test cannot leave an
+    /// unreadable directory behind for `TempDir` to fail cleaning up.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_to_roots_rejects_a_project_scope_it_cannot_search() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+
+        let stale = skill_path_for(AgentClient::Claude, AgentScope::Project, &cwd, &home).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("SKILL.md"), "stale").unwrap();
+        fs::write(stale.join(".version"), "0.0.0").unwrap();
+
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestoreMode(cwd.clone());
+        if fs::metadata(cwd.join(".")).is_ok() {
+            // Running as root, or on a filesystem that ignores mode bits.
+            return;
+        }
+
+        let error = sync_to_roots(
+            AgentClient::All,
+            AgentScope::Project,
+            Some(cwd.as_path()),
+            &home,
+            true,
+        )
+        .expect_err("an unsearchable project directory must not report success");
+        assert!(
+            error.to_string().contains("current directory"),
+            "unexpected error: {error}"
+        );
     }
 }
