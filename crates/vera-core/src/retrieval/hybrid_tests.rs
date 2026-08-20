@@ -452,10 +452,9 @@ async fn search_hybrid_keeps_intent_out_of_bm25() {
     );
 }
 
-/// An embedding provider that spends a caller-chosen amount of time in
-/// `embed_batch`. A zero delay leaves the code path identical, so two runs
-/// differ only by the delay and the stage timings can be compared against each
-/// other instead of against an absolute bound.
+/// An embedding provider that spends a known amount of time in `embed_batch`,
+/// so the model cost dominates the span the storage stages share with it and
+/// its attribution is decidable from the reported stages alone.
 struct SlowProvider {
     inner: crate::embedding::test_helpers::MockProvider,
     delay: std::time::Duration,
@@ -475,20 +474,31 @@ impl crate::embedding::EmbeddingProvider for SlowProvider {
     }
 }
 
-/// Run one `search_hybrid` against `index_dir` with a provider that sleeps
-/// `delay`, returning `(embedding, vector)`.
-async fn timed_hybrid_search(
-    index_dir: &std::path::Path,
-    dim: usize,
-    delay: std::time::Duration,
-) -> (std::time::Duration, std::time::Duration) {
+// Regression for issue #105: `embedding` and `vector` were both assigned the
+// span that covers the embedding, the store opens, the KNN query and
+// hydration, so `--timing` printed one measurement twice.
+//
+// Both stages are cut from one span nested inside the call, so their sum is
+// that span and can never exceed the wall time of the call itself unless a
+// cost is counted twice. Measuring that outer time in the test turns the
+// property into containment rather than a bound on how long anything takes:
+// there is no tolerance to choose, and a machine slow enough to stretch the
+// storage work stretches the outer time with it, so load widens the bound
+// instead of tightening it.
+#[tokio::test]
+async fn search_hybrid_charges_embedding_delay_to_embedding_not_vector() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (index_dir, dim) = setup_test_index(tmp.path()).await;
+
+    let delay = std::time::Duration::from_millis(300);
     let provider = SlowProvider {
         inner: crate::embedding::test_helpers::MockProvider::new(dim),
         delay,
     };
 
+    let started = std::time::Instant::now();
     let (_results, timings) = search_hybrid(
-        index_dir,
+        &index_dir,
         &provider,
         "authenticate",
         "authenticate",
@@ -500,74 +510,36 @@ async fn timed_hybrid_search(
     )
     .await
     .unwrap();
+    let total = started.elapsed();
 
-    (
-        timings.embedding.expect("embedding stage must be reported"),
-        timings.vector.expect("vector stage must be reported"),
-    )
-}
+    let embedding = timings.embedding.expect("embedding stage must be reported");
+    let vector = timings.vector.expect("vector stage must be reported");
 
-// Regression for issue #105: `embedding` and `vector` were both assigned the
-// span that covers the embedding, the store opens, the KNN query and
-// hydration, so `--timing` printed one measurement twice.
-//
-// The property is that the embedding cost is charged to `embedding` and
-// excluded from `vector`, which is a statement about where added cost lands,
-// not about how long anything takes. Asserting it as a difference between two
-// otherwise identical runs keeps it off the wall clock of a machine we do not
-// control.
-#[tokio::test]
-async fn search_hybrid_charges_embedding_delay_to_embedding_not_vector() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (index_dir, dim) = setup_test_index(tmp.path()).await;
-
-    let delay = std::time::Duration::from_millis(300);
-
-    // Discarded: the first search on a fresh index pays cold page-cache and
-    // file-open costs that later ones do not, and those would otherwise land
-    // entirely on whichever run went first and skew the comparison.
-    timed_hybrid_search(&index_dir, dim, std::time::Duration::ZERO).await;
-
-    let (baseline_embedding, baseline_vector) =
-        timed_hybrid_search(&index_dir, dim, std::time::Duration::ZERO).await;
-    let (delayed_embedding, delayed_vector) = timed_hybrid_search(&index_dir, dim, delay).await;
-
-    // `vector` is the remainder of the span after `embedding` is subtracted, so
-    // the delay has to land on exactly one of them and both bounds are the same
-    // question asked from either side. Half the delay is the widest tolerance
-    // that still answers it: under the original bug the full delay lands on
-    // both stages, so `vector` grows by ~300 ms and has to come in under 150 ms
-    // to pass. That leaves 150 ms of headroom for scheduler and I/O jitter on
-    // storage work that takes well under a millisecond against this fixture,
-    // while still failing any split that misattributes more than half the
-    // embedding cost.
-    let tolerance = delay / 2;
-
-    let embedding_growth = delayed_embedding.saturating_sub(baseline_embedding);
+    // `sleep` never returns early, so this is a property of the provider rather
+    // than of the machine: the model cost is charged to `embedding` in full.
     assert!(
-        embedding_growth >= delay - tolerance,
-        "embedding must absorb the provider delay: grew {embedding_growth:?} \
-         (baseline {baseline_embedding:?}, delayed {delayed_embedding:?}), \
-         expected at least {:?}",
-        delay - tolerance
+        embedding >= delay,
+        "embedding must carry the provider cost: {embedding:?} < {delay:?}"
     );
 
-    let vector_growth = delayed_vector.saturating_sub(baseline_vector);
+    // Together with the bound above this pins `vector` under `total - delay`,
+    // leaving it only the cost outside the span to hide in, a few milliseconds
+    // against this fixture. So a split that misattributes a material part of
+    // the embedding fails too, not only one that charges the whole of it twice.
     assert!(
-        vector_growth < tolerance,
-        "vector must exclude the provider delay: grew {vector_growth:?} \
-         (baseline {baseline_vector:?}, delayed {delayed_vector:?}), \
-         expected under {tolerance:?}"
+        embedding + vector <= total,
+        "stages must partition the search, not double-count it: \
+         embedding {embedding:?} + vector {vector:?} exceeds the {total:?} the \
+         whole search took"
     );
 
     // Excluding the embedding must not empty the stage: the store opens, the
     // KNN query and hydration are still charged to `vector`. Without this, a
     // split that assigned the whole span to `embedding` would satisfy both
-    // growth bounds.
+    // bounds above.
     assert!(
-        baseline_vector > std::time::Duration::ZERO && delayed_vector > std::time::Duration::ZERO,
-        "vector must still carry the storage cost: \
-         baseline {baseline_vector:?}, delayed {delayed_vector:?}"
+        vector > std::time::Duration::ZERO,
+        "vector must still carry the storage cost: {vector:?}"
     );
 }
 
