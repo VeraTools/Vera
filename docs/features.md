@@ -280,7 +280,7 @@ Key flags:
 
 ### Diagnostics
 
-`vera doctor` reports the saved and active backend, installed version, checks GitHub for newer releases, and detects missing, corrupt, or truncated ONNX model caches. If model assets are damaged, it suggests running `vera repair --<backend>`; runtime embedding load errors provide the same repair hint. `--probe` adds a deeper read-only local backend check. `--json` outputs machine-readable diagnostics. `vera repair` re-fetches missing or corrupt local assets.
+`vera doctor` reports the saved and active backend, installed version, checks GitHub for newer releases, and detects missing, corrupt, or truncated ONNX model caches. If model assets are damaged, it suggests running `vera repair --<backend>`; runtime embedding load errors provide the same repair hint. `--probe` adds a deeper read-only local backend check. `--json` outputs machine-readable diagnostics. It exits 1 when any check fails, matching the `overall_ok` field in the JSON report; warnings leave the exit code at 0. `vera repair` re-fetches missing or corrupt local assets.
 
 ### Self-Updating
 

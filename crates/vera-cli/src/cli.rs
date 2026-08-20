@@ -234,6 +234,9 @@ pub enum Commands {
                       API environment variables, and whether the current repository \
                       has a `.vera/` index. `--probe` adds a deeper read-only local \
                       backend probe and never downloads or repairs missing assets.\n\n\
+                      Exits 1 if any check fails, so `vera doctor && vera index .` \
+                      stops on a broken setup. Warnings do not affect the exit \
+                      code.\n\n\
                       Examples:\n  \
                       vera doctor\n  \
                       vera doctor --probe\n  \
