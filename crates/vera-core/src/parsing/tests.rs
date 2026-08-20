@@ -78,6 +78,21 @@ fn rust_impl_methods_emit_no_gap_chunks() {
 "#;
     let chunks = parse(source, "cancellation.rs", Language::Rust);
 
+    let impl_block = find_chunk(&chunks, "impl CancellationToken");
+    assert_eq!(impl_block.symbol_type, Some(SymbolType::Block));
+    assert!(
+        impl_block.content.contains("fn cancel"),
+        "impl chunk should cover the whole body: {impl_block:?}"
+    );
+    for method in ["new", "cancel"] {
+        let chunk = find_chunk(&chunks, method);
+        assert_eq!(
+            chunk.symbol_type,
+            Some(SymbolType::Method),
+            "`{method}` should be chunked as a method: {chunk:?}"
+        );
+    }
+
     let unnamed: Vec<_> = chunks.iter().filter(|c| c.symbol_name.is_none()).collect();
     assert!(
         unnamed.is_empty(),

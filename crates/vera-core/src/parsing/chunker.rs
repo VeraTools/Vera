@@ -678,6 +678,13 @@ mod tests {
             &default_config(),
         );
 
+        let names: Vec<_> = chunks.iter().map(|c| c.symbol_name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![Some("Token".to_string()), Some("new".to_string()), None],
+            "the parent and its child must still be chunked before the trailing gap, got {chunks:?}"
+        );
+
         let trailing = chunks
             .iter()
             .find(|c| c.symbol_name.is_none())
