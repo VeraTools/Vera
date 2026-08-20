@@ -1368,31 +1368,44 @@ mod tests {
     }
 
     /// The local ONNX path and the API path must embed the same query
-    /// identically. They apply the prefix differently (`query_text` trims and
-    /// joins with one space, `prepare_query_text` concatenates raw), so this
-    /// pins the resulting text rather than the constant.
+    /// identically. They apply the prefix differently (`query_text` trims the
+    /// *prefix* and rejoins it with one space, `prepare_query_text`
+    /// concatenates a prefix that already carries its own trailing space), so
+    /// this pins the resulting text rather than the constant.
+    ///
+    /// Neither path touches the query itself, so an un-normalized query has to
+    /// survive verbatim and identically on both sides; that case is covered
+    /// here so a one-sided `trim()` cannot be added without failing.
     #[test]
     fn coderankembed_query_text_matches_across_local_and_api_paths() {
-        let query = "find router code";
+        let cases = [
+            (
+                "find router code",
+                "Represent this query for searching relevant code: find router code",
+            ),
+            (
+                "  find router code  ",
+                "Represent this query for searching relevant code:   find router code  ",
+            ),
+        ];
 
-        let local =
-            crate::local_models::LocalEmbeddingModelConfig::coderankembed().query_text(query);
+        for (query, expected) in cases {
+            let local =
+                crate::local_models::LocalEmbeddingModelConfig::coderankembed().query_text(query);
 
-        let mut config = EmbeddingProviderConfig::new(
-            "http://x".into(),
-            "krlvi/CodeRankEmbed".into(),
-            "k".into(),
-        );
-        config.query_prefix = default_query_prefix_for_model(&config.model_id);
-        let api = OpenAiProvider::new(config)
-            .unwrap()
-            .prepare_query_text(query);
+            let mut config = EmbeddingProviderConfig::new(
+                "http://x".into(),
+                "krlvi/CodeRankEmbed".into(),
+                "k".into(),
+            );
+            config.query_prefix = default_query_prefix_for_model(&config.model_id);
+            let api = OpenAiProvider::new(config)
+                .unwrap()
+                .prepare_query_text(query);
 
-        assert_eq!(local, api);
-        assert_eq!(
-            local,
-            "Represent this query for searching relevant code: find router code"
-        );
+            assert_eq!(local, api, "paths diverged on {query:?}");
+            assert_eq!(local, expected, "unexpected prefixed text for {query:?}");
+        }
     }
 
     #[test]
