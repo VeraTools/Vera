@@ -664,6 +664,41 @@ mod tests {
         assert_eq!(model.document_prefix, None);
     }
 
+    /// The opt-out has to survive the file and the environment, not just the
+    /// struct. It used to be filtered out on the way to `config.json`, whose
+    /// missing key then let jina's preset reinstate the prefix on the next run,
+    /// so disabling a prefix lasted exactly one invocation.
+    #[test]
+    fn an_explicitly_emptied_prefix_survives_a_save_and_reload() {
+        let _guard = with_stored_config("{}");
+
+        let mut model = vera_core::local_models::LocalEmbeddingModelConfig::jina();
+        model.query_prefix = Some(String::new());
+        model.document_prefix = Some(String::new());
+        save_local_embedding_model(&model).unwrap();
+
+        // The empty value has to reach the file; a skipped key is what the
+        // preset fills back in.
+        let raw = fs::read(config_path().unwrap()).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(stored["local_embedding_model"]["query_prefix"], "");
+        assert_eq!(stored["local_embedding_model"]["document_prefix"], "");
+
+        apply_saved_env_force().unwrap();
+
+        let reloaded = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(
+            reloaded.query_prefix, None,
+            "jina's preset query prefix came back after an explicit opt-out"
+        );
+        assert_eq!(
+            reloaded.document_prefix, None,
+            "jina's preset document prefix came back after an explicit opt-out"
+        );
+        assert_eq!(reloaded.query_text("find main"), "find main");
+        assert_eq!(reloaded.document_text("fn main() {}"), "fn main() {}");
+    }
+
     #[test]
     fn stored_config_defaults_are_empty() {
         let config = StoredConfig::default();

@@ -477,9 +477,12 @@ impl LocalEmbeddingModelConfig {
             embedding_dim: parse_env_usize(LOCAL_EMBEDDING_DIM_ENV, defaults.embedding_dim)?,
             pooling: parse_pooling_env(LOCAL_EMBEDDING_POOLING_ENV, defaults.pooling)?,
             max_length: parse_env_usize(LOCAL_EMBEDDING_MAX_LENGTH_ENV, defaults.max_length)?,
-            query_prefix: parse_query_prefix_from_env().or_else(|| defaults.query_prefix.clone()),
-            document_prefix: env_override(LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV)
-                .or_else(|| defaults.document_prefix.clone()),
+            query_prefix: query_prefix_from_env(defaults.query_prefix.clone(), explicit_model_env),
+            document_prefix: env_optional_override(
+                LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
+                defaults.document_prefix.clone(),
+                explicit_model_env,
+            ),
         })
     }
 }
@@ -549,6 +552,13 @@ fn env_optional_override(
     resolve_optional_env_value(value.as_deref(), default, explicit_model_env)
 }
 
+/// Resolve a field whose absence is meaningful.
+///
+/// Unlike `env_override`, a variable that is set but empty is not the same as
+/// an unset one: it is the opt-out, and returns `None` without consulting the
+/// default. An unset variable falls back to the preset default unless the
+/// caller spelled the model out through the environment, in which case nothing
+/// is inherited from the preset.
 fn resolve_optional_env_value(
     value: Option<&str>,
     default: Option<String>,
@@ -589,9 +599,23 @@ pub(super) fn parse_pooling_env(
     }
 }
 
-pub(super) fn parse_query_prefix_from_env() -> Option<String> {
-    env_override(LOCAL_EMBEDDING_QUERY_PREFIX_ENV)
-        .or_else(|| env_override(LEGACY_EMBEDDING_QUERY_PREFIX_ENV))
+/// Resolve the query prefix from the canonical variable, then the legacy one.
+///
+/// The canonical variable is consulted even when it is empty: an empty value is
+/// the opt-out, so it has to suppress the legacy variable rather than fall
+/// through to it.
+pub(super) fn query_prefix_from_env(
+    default: Option<String>,
+    explicit_model_env: bool,
+) -> Option<String> {
+    match std::env::var(LOCAL_EMBEDDING_QUERY_PREFIX_ENV) {
+        Ok(value) => resolve_optional_env_value(Some(&value), default, explicit_model_env),
+        Err(_) => env_optional_override(
+            LEGACY_EMBEDDING_QUERY_PREFIX_ENV,
+            default,
+            explicit_model_env,
+        ),
+    }
 }
 
 pub fn normalize_huggingface_repo(value: &str) -> Result<String> {
