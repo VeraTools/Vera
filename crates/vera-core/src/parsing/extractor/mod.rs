@@ -10,12 +10,6 @@ pub(crate) mod classify;
 pub(crate) mod names;
 mod special_forms;
 
-#[cfg(test)]
-mod container_tests;
-
-#[cfg(test)]
-mod tests;
-
 use classify::{classify_node, container_body_kinds};
 use names::extract_name;
 use special_forms::*;
@@ -441,3 +435,9 @@ fn collect_symbols(
     let mut cursor = node.walk();
     collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
 }
+
+#[cfg(test)]
+mod container_tests;
+
+#[cfg(test)]
+mod tests;
