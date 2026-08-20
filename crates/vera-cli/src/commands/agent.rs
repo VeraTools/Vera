@@ -938,6 +938,8 @@ pub(crate) fn sync_skills_only() -> anyhow::Result<()> {
 struct SyncOutcome {
     updated: Vec<PathBuf>,
     refreshed_snippets: Vec<PathBuf>,
+    /// `--scope all` was asked for but only the global half could run.
+    project_scope_skipped: bool,
 }
 
 /// Whether project-scoped paths under `cwd` can be resolved at all.
@@ -991,6 +993,7 @@ fn sync_to_roots(
     Ok(SyncOutcome {
         updated,
         refreshed_snippets,
+        project_scope_skipped: scope == AgentScope::All && scan_scope == AgentScope::Global,
     })
 }
 
@@ -1007,6 +1010,7 @@ fn sync_with_options(
     let SyncOutcome {
         updated,
         refreshed_snippets,
+        project_scope_skipped,
     } = sync_to_roots(
         client,
         scope,
@@ -1017,6 +1021,16 @@ fn sync_with_options(
 
     if quiet {
         return Ok(());
+    }
+
+    // Half of what `--scope all` asked for could not run. The global half is
+    // still work the user wants, so proceed, but do not let the project half
+    // vanish into a report that reads as a complete success.
+    if project_scope_skipped {
+        eprintln!(
+            "Warning: --scope all needs a readable current directory for the project scope. \
+             Synced global scope only."
+        );
     }
 
     if json_output {
@@ -1846,6 +1860,75 @@ mod tests {
         assert!(
             error.to_string().contains("current directory"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// `--scope all` keeps the global half rather than failing outright, so the
+    /// only thing standing between "half the request ran" and a report that
+    /// reads as complete success is this flag.
+    #[cfg(unix)]
+    #[test]
+    fn sync_to_roots_flags_a_project_scope_all_could_not_search() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+
+        for &(client, scope) in SCOPED_SYNC_FIXTURE {
+            let path = skill_path_for(client, scope, &cwd, &home).unwrap();
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("SKILL.md"), "stale").unwrap();
+            fs::write(path.join(".version"), "0.0.0").unwrap();
+        }
+
+        let searchable = sync_to_roots(
+            AgentClient::All,
+            AgentScope::All,
+            Some(cwd.as_path()),
+            &home,
+            true,
+        )
+        .unwrap();
+        assert!(
+            !searchable.project_scope_skipped,
+            "a searchable project directory must not report a skipped scope"
+        );
+
+        for &(client, scope) in SCOPED_SYNC_FIXTURE {
+            let path = skill_path_for(client, scope, &cwd, &home).unwrap();
+            fs::write(path.join(".version"), "0.0.0").unwrap();
+        }
+
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestoreMode(cwd.clone());
+        if fs::metadata(cwd.join(".")).is_ok() {
+            // Running as root, or on a filesystem that ignores mode bits.
+            return;
+        }
+
+        let outcome = sync_to_roots(
+            AgentClient::All,
+            AgentScope::All,
+            Some(cwd.as_path()),
+            &home,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            outcome.project_scope_skipped,
+            "--scope all silently degraded to global for an unsearchable project directory"
+        );
+        let global: Vec<PathBuf> = SCOPED_SYNC_FIXTURE
+            .iter()
+            .filter(|(_, scope)| *scope == AgentScope::Global)
+            .map(|(client, scope)| skill_path_for(*client, *scope, &cwd, &home).unwrap())
+            .collect();
+        assert_eq!(
+            outcome.updated, global,
+            "the global half of --scope all must still run"
         );
     }
 }
