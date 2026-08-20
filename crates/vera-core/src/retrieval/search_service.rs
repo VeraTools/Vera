@@ -1,7 +1,8 @@
 //! Shared search service used by both CLI and MCP.
 //!
 //! Encapsulates the common hybrid search flow: create embedding provider,
-//! build reranker, compute fetch limits, execute search, apply filters.
+//! resolve the reranker for the query, compute fetch limits, execute search,
+//! apply filters.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -748,6 +749,14 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "fastapi/dependencies/utils.py");
         assert!(timings.bm25.is_some());
+        // The query above is one `reranking_wanted` accepts, so this pins the
+        // invariant `bm25_only`'s placeholder backend rests on: `search` returns
+        // on the BM25-only path before any reranker is resolved.
+        assert_eq!(
+            context.reranker_build_count(),
+            0,
+            "a context with no embedding provider must never construct a reranker"
+        );
     }
 
     #[test]
