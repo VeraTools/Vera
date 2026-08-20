@@ -698,8 +698,33 @@ fn legacy_jina_literal_stays_pinned_when_the_constants_move() {
 }
 
 #[test]
+fn explicit_mean_on_the_default_repo_is_repaired_with_the_legacy_default() {
+    // `--embedding-pooling mean` on the default repo, changing nothing else,
+    // writes byte-for-byte the config.json an older `vera setup` wrote on its
+    // own. Nothing in the file distinguishes the two, so the migration cannot
+    // spare this user's choice without sparing every pre-fix install as well.
+    // Overwriting it is the knowingly accepted side of that trade, not a bug
+    // to fix here, and this asserts the behaviour that actually ships rather
+    // than the behaviour the neighbouring test's comment implies.
+    let mut explicit_mean = LocalEmbeddingModelConfig::jina();
+    explicit_mean.pooling = LocalEmbeddingPooling::Mean;
+    assert_eq!(
+        explicit_mean,
+        LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix()
+    );
+
+    assert_eq!(
+        explicit_mean.repair_stored_defaults(),
+        LocalEmbeddingModelConfig::jina()
+    );
+}
+
+#[test]
 fn repair_leaves_customised_and_unrelated_configs_alone() {
-    // A deliberate non-default choice on the same repo must survive.
+    // A deliberate non-default choice on the same repo survives as long as
+    // some field other than pooling also differs from the historical default —
+    // `max_length` here. Pooling alone does not; see
+    // `explicit_mean_on_the_default_repo_is_repaired_with_the_legacy_default`.
     let mut customised = LocalEmbeddingModelConfig::jina();
     customised.pooling = LocalEmbeddingPooling::Mean;
     customised.max_length = 256;
