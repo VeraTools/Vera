@@ -115,12 +115,19 @@ impl<T> ModelSlot<T> {
             return false;
         };
         let mut guard = self.resident.lock().await;
-        let Some(resident) = guard.as_ref() else {
+        let Some(resident) = guard.as_mut() else {
             return false;
         };
         // Evicting a model a request still holds would force a second load in
-        // parallel with the first one.
-        if Arc::strong_count(&resident.model) > 1 || resident.last_used.elapsed() < timeout {
+        // parallel with the first one. A held model is also in use *now*, so
+        // restart its idle clock: `last_used` is stamped at acquisition, and
+        // without this a request that outlives the timeout would be followed by
+        // an immediate eviction instead of a fresh idle window.
+        if Arc::strong_count(&resident.model) > 1 {
+            resident.last_used = Instant::now();
+            return false;
+        }
+        if resident.last_used.elapsed() < timeout {
             return false;
         }
         *guard = None;
@@ -369,6 +376,38 @@ mod tests {
 
         drop(held);
         assert!(slot.evict_if_idle().await);
+    }
+
+    /// `last_used` is stamped at acquisition, so a request that outlives the
+    /// idle window would otherwise be followed by an immediate eviction: the
+    /// timeout has to measure inactivity after the last request, not since it
+    /// started. Real sleeps, because the slot uses `std::time::Instant`, which
+    /// tokio's paused clock does not control. Overshoot under load only makes
+    /// the eviction assertions more true; the one budget that matters is the
+    /// 1s window covering a `drop` and one call.
+    #[tokio::test]
+    async fn the_idle_clock_restarts_when_the_last_request_releases_the_model() {
+        let slot: ModelSlot<usize> = ModelSlot::new(CacheMode::Idle(Duration::from_secs(1)));
+        let builds = Builds::new();
+
+        let held = slot.get_or_load(|| builds.load()).await.unwrap().unwrap();
+
+        // A request still running well past the idle window.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!slot.evict_if_idle().await, "a held model must be spared");
+
+        drop(held);
+        assert!(
+            !slot.evict_if_idle().await,
+            "releasing the model must start a fresh idle window, not evict at once"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            slot.evict_if_idle().await,
+            "and it evicts once genuinely idle"
+        );
+        assert_eq!(builds.count(), 1);
     }
 
     #[tokio::test]

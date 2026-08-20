@@ -89,9 +89,10 @@ pub async fn run_server(
     // still releases it before anything else is loaded.
     embedding.seed(Arc::new(probe)).await;
 
-    // The reranker probe is deliberately not seeded. It costs ~670 MB resident,
-    // and a server that only answers /v1/embeddings would hold it for nothing;
-    // it is loaded on the first /v1/rerank instead.
+    // The reranker probe is deliberately not seeded: it is built here, read for
+    // `reranker_available`, and dropped, so the first /v1/rerank loads it again.
+    // Keeping it would cost ~670 MB resident on a server that only answers
+    // /v1/embeddings and never reranks at all.
     let reranker_available = vera_core::retrieval::create_dynamic_reranker(&config, backend)
         .await
         .unwrap_or_else(|e| {
