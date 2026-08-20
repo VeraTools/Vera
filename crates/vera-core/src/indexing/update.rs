@@ -30,8 +30,6 @@ use crate::embedding::{
     EmbeddingError, EmbeddingProvider, embed_chunks_concurrent_with_progress_and_cancellation,
 };
 use crate::parsing;
-use crate::parsing::references::RawReference;
-use crate::parsing::type_relations::RawTypeRelation;
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
 use crate::storage::vector::VectorStore;
@@ -107,6 +105,20 @@ struct PreparedFile {
     references: Vec<parsing::references::RawReference>,
     type_relations: Vec<parsing::type_relations::RawTypeRelation>,
     state: FileIndexState,
+}
+
+fn collect_prepared_results(
+    results: Vec<(PreparedFile, Option<FileError>)>,
+) -> (Vec<PreparedFile>, Vec<FileError>) {
+    let mut prepared_files = Vec::with_capacity(results.len());
+    let mut parse_errors = Vec::new();
+    for (prepared, parse_error) in results {
+        prepared_files.push(prepared);
+        if let Some(parse_error) = parse_error {
+            parse_errors.push(parse_error);
+        }
+    }
+    (prepared_files, parse_errors)
 }
 
 fn processed_file_counts(files: impl IntoIterator<Item = bool>) -> (usize, usize) {
@@ -348,19 +360,30 @@ where
         .into_iter()
         .collect();
 
-    // Read file contents and compute hashes for current files.
-    let mut current_files: HashMap<String, String> = HashMap::new(); // rel_path → content
-    for file in &disc.files {
-        cancellation.check()?;
-        match discovery::read_source_lossy(&file.absolute_path) {
-            Ok(content) => {
-                current_files.insert(file.relative_path.clone(), content);
-            }
-            Err(err) => {
-                warn!(file = %file.relative_path, error = %err, "failed to read file");
-            }
-        }
-    }
+    // File reads are independent and I/O-bound, so run them under rayon.
+    // Unreadable files stay in `current_paths` below but not `current_files`,
+    // preserving their existing index data instead of treating them as deleted.
+    let read_results: Vec<(String, Option<String>)> = disc
+        .files
+        .par_iter()
+        .map(|file| {
+            cancellation.check()?;
+            let content = match discovery::read_source_lossy(&file.absolute_path) {
+                Ok(content) => Some(content),
+                Err(err) => {
+                    warn!(file = %file.relative_path, error = %err, "failed to read file");
+                    None
+                }
+            };
+            Ok((file.relative_path.clone(), content))
+        })
+        .collect::<Result<_>>()?;
+    cancellation.check()?;
+
+    let current_files: HashMap<String, String> = read_results
+        .into_iter()
+        .filter_map(|(path, content)| content.map(|content| (path, content)))
+        .collect();
 
     let current_paths: HashSet<&str> = disc
         .files
@@ -519,12 +542,7 @@ where
 
         // `files_to_index` order is preserved by `collect`, so the sequential
         // and parallel paths produce identical `prepared_files` ordering.
-        for (prepared, parse_error) in parsed {
-            prepared_files.push(prepared);
-            if let Some(parse_error) = parse_error {
-                parse_errors.push(parse_error);
-            }
-        }
+        (prepared_files, parse_errors) = collect_prepared_results(parsed);
     }
 
     let all_chunks: Vec<_> = prepared_files
@@ -663,18 +681,19 @@ where
         // file. This stays at the same point in the sequence as the per-file
         // writes it replaces, so the "nothing is replaced until embedding
         // succeeds" guarantee is unchanged.
-        let file_refs: Vec<(String, Vec<RawReference>)> = prepared_files
+        let file_refs: Vec<(&str, &[parsing::references::RawReference])> = prepared_files
             .iter()
             .filter(|file| !file.references.is_empty())
-            .map(|file| (file.path.clone(), file.references.clone()))
+            .map(|file| (file.path.as_str(), file.references.as_slice()))
             .collect();
-        let file_type_relations: Vec<(String, Vec<RawTypeRelation>)> = prepared_files
-            .iter()
-            .filter(|file| !file.type_relations.is_empty())
-            .map(|file| (file.path.clone(), file.type_relations.clone()))
-            .collect();
+        let file_type_relations: Vec<(&str, &[parsing::type_relations::RawTypeRelation])> =
+            prepared_files
+                .iter()
+                .filter(|file| !file.type_relations.is_empty())
+                .map(|file| (file.path.as_str(), file.type_relations.as_slice()))
+                .collect();
         metadata_store
-            .insert_parse_artifacts_batch(&file_refs, &file_type_relations)
+            .insert_parse_artifacts_batch_borrowed(&file_refs, &file_type_relations)
             .context("failed to store references and type relations")?;
 
         if !all_chunks.is_empty() {
@@ -698,12 +717,12 @@ where
                 .insert_file_states(&file_states)
                 .context("failed to update file index states")?;
         }
-        let file_hashes: Vec<(String, String)> = prepared_files
+        let file_hashes: Vec<(&str, &str)> = prepared_files
             .iter()
-            .map(|file| (file.path.clone(), file.hash.clone()))
+            .map(|file| (file.path.as_str(), file.hash.as_str()))
             .collect();
         metadata_store
-            .set_file_hashes_batch(&file_hashes)
+            .set_file_hashes_batch_borrowed(&file_hashes)
             .context("failed to update file hashes")?;
     }
 

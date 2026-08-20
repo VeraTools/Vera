@@ -201,7 +201,6 @@ fn distance_to_similarity(distance: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context;
     use crate::embedding::test_helpers::MockProvider;
     use crate::types::{Chunk, Language, SymbolType};
     use std::collections::HashMap;

@@ -23,7 +23,7 @@ use crate::storage::metadata::{FileIndexState, FileIndexStatus, MetadataStore};
 use crate::storage::vector::VectorStore;
 use crate::types::Language;
 
-use super::{content_hash, processed_file_counts};
+use super::{PreparedFile, collect_prepared_results, content_hash, processed_file_counts};
 
 fn default_config() -> VeraConfig {
     VeraConfig::default()
@@ -158,6 +158,49 @@ fn content_hash_is_hex_sha256() {
 #[test]
 fn processed_file_counts_cover_modified_and_added_files() {
     assert_eq!(processed_file_counts([true, false]), (1, 1));
+}
+
+#[test]
+fn parallel_results_keep_parse_error_files_in_input_order() {
+    let prepared = |path: &str, status| PreparedFile {
+        path: path.to_string(),
+        hash: format!("hash-{path}"),
+        modified: true,
+        chunks: Vec::new(),
+        references: Vec::new(),
+        type_relations: Vec::new(),
+        state: FileIndexState {
+            file_path: path.to_string(),
+            language: "rust".to_string(),
+            status,
+            tree_has_error: false,
+            tier0_fallback: false,
+            chunk_count: 0,
+        },
+    };
+    let error = crate::indexing::pipeline::FileError {
+        file_path: "broken.rs".to_string(),
+        error: "parse failed".to_string(),
+    };
+
+    let (prepared_files, parse_errors) = collect_prepared_results(vec![
+        (prepared("ok.rs", FileIndexStatus::Indexed), None),
+        (
+            prepared("broken.rs", FileIndexStatus::ParseError),
+            Some(error),
+        ),
+    ]);
+
+    assert_eq!(
+        prepared_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["ok.rs", "broken.rs"]
+    );
+    assert_eq!(prepared_files[1].state.status, FileIndexStatus::ParseError);
+    assert_eq!(parse_errors.len(), 1);
+    assert_eq!(parse_errors[0].file_path, "broken.rs");
 }
 
 // ── Update: no changes ──────────────────────────────────────────────

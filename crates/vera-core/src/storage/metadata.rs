@@ -572,7 +572,7 @@ impl MetadataStore {
 
     /// Store a file content hash for incremental indexing.
     pub fn set_file_hash(&self, file_path: &str, hash: &str) -> Result<()> {
-        self.set_file_hashes_batch(&[(file_path.to_string(), hash.to_string())])
+        self.set_file_hashes_batch_borrowed(&[(file_path, hash)])
     }
 
     /// Get the stored content hash for a file.
@@ -653,7 +653,7 @@ impl MetadataStore {
         file_path: &str,
         refs: &[crate::parsing::references::RawReference],
     ) -> Result<()> {
-        self.insert_parse_artifacts_batch(&[(file_path.to_string(), refs.to_vec())], &[])
+        self.insert_parse_artifacts_batch_borrowed(&[(file_path, refs)], &[])
     }
 
     /// Insert a batch of explicit type relations for a single file.
@@ -662,7 +662,7 @@ impl MetadataStore {
         file_path: &str,
         relations: &[RawTypeRelation],
     ) -> Result<()> {
-        self.insert_parse_artifacts_batch(&[], &[(file_path.to_string(), relations.to_vec())])
+        self.insert_parse_artifacts_batch_borrowed(&[], &[(file_path, relations)])
     }
 
     /// Store content hashes for many files in a single transaction.
@@ -670,6 +670,18 @@ impl MetadataStore {
     /// Equivalent to calling [`Self::set_file_hash`] once per file, but
     /// issues one commit for the whole batch instead of one per file.
     pub fn set_file_hashes_batch(&self, hashes: &[(String, String)]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let borrowed: Vec<(&str, &str)> = hashes
+            .iter()
+            .map(|(file_path, hash)| (file_path.as_str(), hash.as_str()))
+            .collect();
+        self.set_file_hashes_batch_borrowed(&borrowed)
+    }
+
+    pub(crate) fn set_file_hashes_batch_borrowed(&self, hashes: &[(&str, &str)]) -> Result<()> {
         if hashes.is_empty() {
             return Ok(());
         }
@@ -709,6 +721,26 @@ impl MetadataStore {
             return Ok(());
         }
 
+        let borrowed_refs: Vec<(&str, &[crate::parsing::references::RawReference])> = file_refs
+            .iter()
+            .map(|(file_path, refs)| (file_path.as_str(), refs.as_slice()))
+            .collect();
+        let borrowed_relations: Vec<(&str, &[RawTypeRelation])> = file_type_relations
+            .iter()
+            .map(|(file_path, relations)| (file_path.as_str(), relations.as_slice()))
+            .collect();
+        self.insert_parse_artifacts_batch_borrowed(&borrowed_refs, &borrowed_relations)
+    }
+
+    pub(crate) fn insert_parse_artifacts_batch_borrowed(
+        &self,
+        file_refs: &[(&str, &[crate::parsing::references::RawReference])],
+        file_type_relations: &[(&str, &[RawTypeRelation])],
+    ) -> Result<()> {
+        if file_refs.is_empty() && file_type_relations.is_empty() {
+            return Ok(());
+        }
+
         let tx = self
             .conn
             .unchecked_transaction()
@@ -720,7 +752,7 @@ impl MetadataStore {
                      VALUES (?1, ?2, ?3, ?4)",
                 )
                 .context("failed to prepare batch reference insert")?;
-            for (file_path, refs) in file_refs {
+            for &(file_path, refs) in file_refs {
                 for r in refs {
                     ref_stmt
                         .execute(params![file_path, r.line, r.callee, r.caller])
@@ -734,7 +766,7 @@ impl MetadataStore {
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 )
                 .context("failed to prepare batch type relation insert")?;
-            for (file_path, relations) in file_type_relations {
+            for &(file_path, relations) in file_type_relations {
                 for relation in relations {
                     relation_stmt
                         .execute(params![
