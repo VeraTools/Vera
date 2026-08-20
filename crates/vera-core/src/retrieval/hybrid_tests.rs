@@ -293,11 +293,13 @@ fn rrf_ties_break_on_file_path_then_line_range() {
         make_result("z_bm25.rs", 1, 10, 5.0, None),
         make_result("a_bm25.rs", 1, 10, 4.0, None),
         make_result("shared.rs", 200, 210, 3.0, None),
+        make_result("shared.rs", 300, 1000, 2.0, None),
     ];
     let vector = vec![
         make_result("m_vec.rs", 1, 10, 0.9, None),
         make_result("b_vec.rs", 1, 10, 0.8, None),
         make_result("shared.rs", 30, 40, 0.7, None),
+        make_result("shared.rs", 300, 305, 0.6, None),
     ];
 
     // Each call builds a fresh HashMap, and std gives every HashMap in a thread its own
@@ -305,24 +307,36 @@ fn rrf_ties_break_on_file_path_then_line_range() {
     for _ in 0..8 {
         let results = fuse_rrf(&bm25, &vector, 60.0, 10);
 
-        let order: Vec<(&str, u32)> = results
+        let order: Vec<(&str, u32, u32)> = results
             .iter()
-            .map(|result| (result.file_path.as_str(), result.line_start))
+            .map(|result| {
+                (
+                    result.file_path.as_str(),
+                    result.line_start,
+                    result.line_end,
+                )
+            })
             .collect();
 
         assert_eq!(
             order,
             vec![
                 // rank 1 tie, ascending file_path
-                ("m_vec.rs", 1),
-                ("z_bm25.rs", 1),
+                ("m_vec.rs", 1, 10),
+                ("z_bm25.rs", 1, 10),
                 // rank 2 tie, ascending file_path
-                ("a_bm25.rs", 1),
-                ("b_vec.rs", 1),
+                ("a_bm25.rs", 1, 10),
+                ("b_vec.rs", 1, 10),
                 // rank 3 tie, same file, ascending line_start numerically (a lexicographic
                 // compare of the "path:start:end" key would put 200 before 30)
-                ("shared.rs", 30),
-                ("shared.rs", 200),
+                ("shared.rs", 30, 40),
+                ("shared.rs", 200, 210),
+                // rank 4 tie, same file and same line_start, so only line_end separates
+                // them; 305 before 1000 is again the numeric order, not the lexicographic
+                // one. A comparator that stopped at (file_path, line_start) would leave
+                // this pair on the HashMap seed.
+                ("shared.rs", 300, 305),
+                ("shared.rs", 300, 1000),
             ],
             "tied RRF scores must order by (file_path, line_start, line_end)"
         );
