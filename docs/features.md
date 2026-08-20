@@ -47,7 +47,7 @@ When a task is limited to modified files or a PR diff, scope the search before b
 - `--since <rev>`: files changed since a specific revision
 - `--base <rev>`: files changed since `merge-base(HEAD, <rev>)`
 
-These flags work with `vera search`, `vera grep`, and `vera overview`.
+These flags work with `vera search`, `vera grep`, and `vera overview`. Git state is read from the repository containing the indexed directory, and the result is limited to files inside that directory, so indexing a package inside a monorepo scopes to that package rather than to the whole repository.
 
 ### Query-Aware Ranking
 
