@@ -275,7 +275,7 @@ Key flags:
 - `--port <PORT>`: TCP port to listen on (default: 3000)
 - `--host <HOST>`: bind address (default: 127.0.0.1)
 - `--api-key <KEY>`: require Bearer token authentication (or set `VERA_SERVE_KEY`)
-- `--idle-timeout <SECS>`: seconds of inactivity before unloading models from memory (0 = reload per request, -1 = keep loaded indefinitely, default: 0)
+- `--idle-timeout <SECS>`: seconds of inactivity before unloading a model from memory (default: 300). `-1` keeps models loaded for the lifetime of the process. `0` disables the cache, rebuilding the model on every request and holding one live model per concurrent request; it exists to pick up model files replaced under a running server, and makes indexing through the server far slower.
 - Backend flags: `--potion-code`, `--onnx-jina-cuda`, `--onnx-jina-rocm`, `--onnx-jina-coreml`, `--onnx-jina-openvino`, `--onnx-jina-directml`, or `--api`
 
 ### Diagnostics

@@ -105,10 +105,11 @@ pub enum Commands {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Seconds of inactivity before the model is unloaded from memory.
-        /// 0 = disable cache (reload per request, same behaviour as vera search).
-        /// -1 = keep loaded indefinitely.
-        #[arg(long, default_value = "0")]
+        /// Seconds of inactivity before a model is unloaded from memory.
+        /// 0 = rebuild the model on every request, and hold one live model per
+        /// concurrent request; only useful to pick up model files replaced under
+        /// a running server. -1 = keep loaded indefinitely.
+        #[arg(long, default_value_t = 300)]
         idle_timeout: i64,
 
         #[command(flatten)]
