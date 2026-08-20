@@ -586,15 +586,25 @@ fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
     // ignored pooling, upgrading would query mean-pooled rows with last-token
     // vectors and silently return worse results instead of asking for a
     // re-index.
+    // Assert the exact preset form. Comparing jina's identity against a
+    // mean-pooled clone proves nothing on its own: changing `pooling` breaks
+    // struct equality with `Self::jina()`, so the clone leaves the preset
+    // branch of `model_identity` and renders through the generic one. The two
+    // strings then differ because of the branch, not because pooling is in the
+    // preset identity, and the assertion still passes with pooling dropped
+    // from that branch entirely.
     let jina = LocalEmbeddingModelConfig::jina();
-    let mut mean_pooled = jina.clone();
-    mean_pooled.pooling = LocalEmbeddingPooling::Mean;
-
-    assert_ne!(jina.model_identity(), mean_pooled.model_identity());
-    assert_ne!(jina.model_identity(), jina.display_name());
-    assert!(jina.model_identity().contains("last-token"));
+    assert_eq!(
+        jina.model_identity(),
+        format!("{}|pooling=last-token", jina.display_name())
+    );
     // The repo still has to be recognisable in the stored name.
     assert!(jina.model_identity().starts_with(&jina.display_name()));
+
+    let mut mean_pooled = jina.clone();
+    mean_pooled.pooling = LocalEmbeddingPooling::Mean;
+    assert_ne!(jina.model_identity(), mean_pooled.model_identity());
+    assert!(mean_pooled.model_identity().contains("pooling=mean"));
 }
 
 #[test]
