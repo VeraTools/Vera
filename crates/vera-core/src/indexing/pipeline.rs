@@ -670,9 +670,11 @@ fn store_index(
     // deleted and repopulated above; committing the hashes first would leave a
     // crash or a Ctrl-C in that window with a complete metadata store, current
     // hashes and a missing or half-built vector/BM25 store, which
-    // `detect_staleness` cannot see and `vera update` skips. Writing them last
-    // means every kill point leaves the old hashes, so the next run
-    // reprocesses. `update.rs` keeps the same order.
+    // `detect_staleness` cannot see and `vera update` skips. `metadata_store`
+    // was cleared above, hashes and index metadata included, so writing them
+    // last means a kill anywhere in this window leaves both absent, every file
+    // reads as new and the next run reprocesses. `update.rs` keeps the same
+    // order.
     metadata_store
         .set_file_hashes_batch(file_hashes)
         .context("failed to store file hashes")?;
