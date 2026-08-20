@@ -408,6 +408,11 @@ fn apply_local_embedding_env(
     if force {
         clear_process_env(vera_core::local_models::LEGACY_EMBEDDING_QUERY_PREFIX_ENV);
     }
+    set_optional_env_value(
+        vera_core::local_models::LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
+        model.and_then(|value| value.document_prefix.as_deref()),
+        force,
+    );
 }
 
 fn set_process_env(key: &str, value: &str) {
@@ -460,6 +465,23 @@ mod tests {
       }
     }"#;
 
+    /// What `vera setup --embedding-document-prefix 'Passage:'` writes. The
+    /// prefix differs from jina's preset so the preset cannot stand in for it.
+    const STORED_DOCUMENT_PREFIX_CONFIG: &str = r#"{
+      "local_embedding_model": {
+        "source": {"source": "hugging-face",
+                   "repo": "jinaai/jina-embeddings-v5-text-nano-retrieval"},
+        "onnx_file": "onnx/model_quantized.onnx",
+        "onnx_data_file": "onnx/model_quantized.onnx_data",
+        "tokenizer_file": "tokenizer.json",
+        "embedding_dim": 768,
+        "pooling": "last-token",
+        "max_length": 512,
+        "query_prefix": "Query:",
+        "document_prefix": "Passage:"
+      }
+    }"#;
+
     /// Everything `apply_saved_env_impl` can write, plus the redirect itself.
     const RESTORED_ENV_KEYS: &[&str] = &[
         "VERA_HOME",
@@ -480,6 +502,7 @@ mod tests {
         vera_core::local_models::LOCAL_EMBEDDING_POOLING_ENV,
         vera_core::local_models::LOCAL_EMBEDDING_MAX_LENGTH_ENV,
         vera_core::local_models::LOCAL_EMBEDDING_QUERY_PREFIX_ENV,
+        vera_core::local_models::LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
         vera_core::local_models::LEGACY_EMBEDDING_QUERY_PREFIX_ENV,
     ];
 
@@ -584,6 +607,18 @@ mod tests {
         );
 
         assert_eq!(stored_pooling_on_disk(), "mean");
+    }
+
+    #[test]
+    fn stored_document_prefix_reaches_the_env_config() {
+        let _guard = with_stored_config(STORED_DOCUMENT_PREFIX_CONFIG);
+
+        apply_saved_env_force().unwrap();
+
+        // `from_env` is the only reader the embedding pipeline has, so a stored
+        // prefix that never reaches the environment is a dropped flag.
+        let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(model.document_prefix.as_deref(), Some("Passage:"));
     }
 
     #[test]
