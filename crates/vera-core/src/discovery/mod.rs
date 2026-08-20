@@ -356,7 +356,7 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         .canonicalize()
         .with_context(|| format!("failed to resolve path: {}", root.display()))?;
     let display_input = path.display().to_string();
-    let Some(relative) = normalized_relative_path(&root, path) else {
+    let Some((root_relative, relative)) = normalized_relative_path(&root, path) else {
         return Ok(PathExplanation {
             input_path: display_input,
             absolute_path: if path.is_absolute() {
@@ -378,14 +378,14 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
     let candidate = root.join(&relative);
     let absolute_display = candidate.display().to_string();
     let relative_path = relative.to_string_lossy().to_string();
-    let relative = Path::new(&relative_path);
 
     // `symlink_metadata` refuses to follow only the final component, so an
     // intermediate symlinked directory would still be traversed by every check
     // below. The walker never descends through one, so nothing beneath it is
     // enumerated; reject the whole path before reading metadata, ignore rules
-    // or content through the link.
-    if let Some(link) = symlinked_ancestor(&root, relative)? {
+    // or content through the link. The scan runs on the path as written, since
+    // collapsing `..` first erases the very links the kernel would traverse.
+    if let Some(link) = symlinked_ancestor(&root, root_relative)? {
         return Ok(path_excluded(
             display_input,
             absolute_display,
@@ -455,7 +455,7 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         ));
     }
 
-    if let Some(explanation) = explain_override_match(&root, relative, config)? {
+    if let Some(explanation) = explain_override_match(&root, &relative, config)? {
         return Ok(path_excluded(
             display_input,
             absolute_display,
@@ -469,10 +469,10 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
         let strategy = determine_ignore_strategy(&root, config)?;
 
         for decision in [
-            explain_custom_ignore_match(&root, relative, strategy.use_veraignore)?,
-            explain_named_ignore_match(&root, relative, ".ignore", PathReason::DotIgnore)?,
+            explain_custom_ignore_match(&root, &relative, strategy.use_veraignore)?,
+            explain_named_ignore_match(&root, &relative, ".ignore", PathReason::DotIgnore)?,
             if strategy.use_gitignore {
-                explain_named_ignore_match(&root, relative, ".gitignore", PathReason::Gitignore)?
+                explain_named_ignore_match(&root, &relative, ".gitignore", PathReason::Gitignore)?
             } else {
                 IgnoreDecision::None
             },
@@ -612,21 +612,38 @@ pub fn explain_path(root: &Path, path: &Path, config: &IndexingConfig) -> Result
 /// Return the first repository-relative ancestor of `relative` that is a
 /// symbolic link, ignoring the final component.
 ///
-/// A missing ancestor yields `None` so the caller still reports the path as
-/// missing rather than as a link.
+/// `relative` must be the path as it was written, before `..` segments are
+/// collapsed. The kernel resolves left to right, so `link/../file` traverses
+/// `link`, while collapsing the pair lexically first erases the link and leaves
+/// no ancestor to inspect. The scan therefore keeps its own lexical prefix and
+/// treats a `..` as one more component following whatever precedes it.
+///
+/// A missing ancestor cannot hide a link behind it, because every path below it
+/// is missing too, so the scan continues and the caller still reports the path
+/// as missing rather than as a link.
 fn symlinked_ancestor(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
     let mut prefix = PathBuf::new();
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
+        match component {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                if !prefix.pop() {
+                    return Ok(None);
+                }
+                continue;
+            }
+            Component::Normal(part) => prefix.push(part),
+            Component::RootDir | Component::Prefix(_) => return Ok(None),
+        }
         if components.peek().is_none() {
             break;
         }
-        prefix.push(component);
         let ancestor = root.join(&prefix);
         match std::fs::symlink_metadata(&ancestor) {
             Ok(metadata) if metadata.is_symlink() => return Ok(Some(prefix)),
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!("failed to read metadata for {}", ancestor.display())
@@ -637,13 +654,19 @@ fn symlinked_ancestor(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn normalized_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+/// Resolve `path` against `root`, returning both the root-relative path as it
+/// was written and its lexically normalized form.
+///
+/// Callers that inspect the filesystem need the former, because normalization
+/// discards the `..` segments the kernel would resolve through; callers that
+/// match ignore rules or report the path need the latter.
+fn normalized_relative_path<'a>(root: &Path, path: &'a Path) -> Option<(&'a Path, PathBuf)> {
     let relative = if path.is_absolute() {
         path.strip_prefix(root).ok()?
     } else {
         path
     };
-    normalize_relative_path(relative)
+    Some((relative, normalize_relative_path(relative)?))
 }
 
 fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
@@ -1683,6 +1706,67 @@ mod tests {
             PathDecision::Excluded,
             "explain_path must agree with discovery, which never enumerated this path"
         );
+        assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_rejects_a_symlinked_ancestor_erased_by_a_parent_segment() {
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(outside.path().join("vault")).unwrap();
+        fs::write(
+            outside.path().join("secret.rs"),
+            "fn outside_the_repository() {}\n",
+        )
+        .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("secret.rs"),
+            "fn inside_the_repository() {}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("vault"), dir.path().join("link")).unwrap();
+
+        // The kernel resolves left to right, so `link/../secret.rs` traverses
+        // `link` and names `<outside>/secret.rs`. Collapsing `..` lexically
+        // first rewrites it to the unrelated in-repository `secret.rs` and
+        // leaves no ancestor for the symlink check to see.
+        let explanation = explain_path(
+            dir.path(),
+            Path::new("link/../secret.rs"),
+            &default_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            explanation.decision,
+            PathDecision::Excluded,
+            "a parent segment must not erase the symlinked ancestor it traverses"
+        );
+        assert_eq!(explanation.reason, PathReason::NonRegularFile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_path_scans_past_a_missing_segment_for_a_symlinked_ancestor() {
+        let outside = TempDir::new().unwrap();
+        let secrets = outside.path().join("secrets");
+        fs::create_dir_all(secrets.join("nested")).unwrap();
+        fs::write(secrets.join("nested/secret.rs"), "fn outside_secret() {}\n").unwrap();
+
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(&secrets, dir.path().join("link")).unwrap();
+
+        // A missing segment cancels itself out lexically, so the scan has to
+        // keep going: stopping at `absent` would hand the checks below a
+        // candidate that reaches through `link` and report it as indexed.
+        let explanation = explain_path(
+            dir.path(),
+            Path::new("absent/../link/nested/secret.rs"),
+            &default_config(),
+        )
+        .unwrap();
+        assert_eq!(explanation.decision, PathDecision::Excluded);
         assert_eq!(explanation.reason, PathReason::NonRegularFile);
     }
 
