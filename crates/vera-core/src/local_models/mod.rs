@@ -350,8 +350,8 @@ impl LocalEmbeddingModelConfig {
                 "{}|pooling={}|qp={}|dp={}",
                 self.display_name(),
                 self.pooling,
-                self.query_prefix.as_deref().unwrap_or("-"),
-                self.document_prefix.as_deref().unwrap_or("-"),
+                Self::prefix_identity(self.query_prefix.as_deref()),
+                Self::prefix_identity(self.document_prefix.as_deref()),
             );
         }
 
@@ -367,9 +367,35 @@ impl LocalEmbeddingModelConfig {
             self.pooling,
             self.embedding_dim,
             self.max_length,
-            self.query_prefix.as_deref().unwrap_or("-"),
-            self.document_prefix.as_deref().unwrap_or("-"),
+            Self::prefix_identity(self.query_prefix.as_deref()),
+            Self::prefix_identity(self.document_prefix.as_deref()),
         )
+    }
+
+    /// The canonical form of a configured prefix: trimmed, and absent once
+    /// nothing is left of it.
+    ///
+    /// Both the text that gets embedded and the identity that guards the index
+    /// go through here, so two configs that embed byte-identical text can never
+    /// disagree about whether the index is stale.
+    fn normalize_prefix(prefix: Option<&str>) -> Option<&str> {
+        prefix.map(str::trim).filter(|value| !value.is_empty())
+    }
+
+    /// Encode a prefix for `model_identity`.
+    ///
+    /// Length-delimited, because `|qp=` and `|dp=` are otherwise ordinary text:
+    /// a prefix containing one moved the field boundary, so
+    /// `qp="a" dp="b|dp=c"` and `qp="a|dp=b" dp="c"` encoded to the same
+    /// string. The absent case gets a marker no encoded value can spell, since
+    /// a present prefix always starts with its length; `unwrap_or("-")` used to
+    /// give an unprefixed config and one prefixed with a literal `-` the same
+    /// identity, so the staleness guard let their vectors share a table.
+    fn prefix_identity(prefix: Option<&str>) -> String {
+        match Self::normalize_prefix(prefix) {
+            Some(value) => format!("{}:{value}", value.len()),
+            None => "none".to_string(),
+        }
     }
 
     /// Join a configured prefix to a text with exactly one space.
@@ -379,7 +405,7 @@ impl LocalEmbeddingModelConfig {
     /// whitespace-preserving branch: a trimmed prefix can never end in
     /// whitespace by the time it is joined.
     fn apply_prefix(prefix: Option<&str>, text: &str) -> String {
-        let Some(prefix) = prefix.map(str::trim).filter(|value| !value.is_empty()) else {
+        let Some(prefix) = Self::normalize_prefix(prefix) else {
             return text.to_string();
         };
         format!("{prefix} {text}")

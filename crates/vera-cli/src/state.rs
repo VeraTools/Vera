@@ -482,6 +482,21 @@ mod tests {
       }
     }"#;
 
+    /// A stored model that prefixes queries only. Nothing in the presets or the
+    /// generic fallback produces this repo, pooling, dimension or prefix, so a
+    /// default standing in for the stored value would fail every assertion.
+    const STORED_QUERY_PREFIX_ONLY_CONFIG: &str = r#"{
+      "local_embedding_model": {
+        "source": {"source": "hugging-face", "repo": "acme/query-prefixed-encoder"},
+        "onnx_file": "onnx/model_quantized.onnx",
+        "tokenizer_file": "tokenizer.json",
+        "embedding_dim": 384,
+        "pooling": "cls",
+        "max_length": 256,
+        "query_prefix": "Ask:"
+      }
+    }"#;
+
     /// Everything `apply_saved_env_impl` can write, plus the redirect itself.
     const RESTORED_ENV_KEYS: &[&str] = &[
         "VERA_HOME",
@@ -619,6 +634,34 @@ mod tests {
         // prefix that never reaches the environment is a dropped flag.
         let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
         assert_eq!(model.document_prefix.as_deref(), Some("Passage:"));
+    }
+
+    #[test]
+    fn a_stored_config_without_a_document_prefix_clears_a_stale_one() {
+        let _guard = with_stored_config(STORED_QUERY_PREFIX_ONLY_CONFIG);
+        set_process_env(
+            vera_core::local_models::LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
+            "Stale-Passage-Marker:",
+        );
+
+        apply_saved_env_force().unwrap();
+
+        // Forcing the stored config over the environment has to remove a
+        // document prefix the stored config does not have, or an inherited one
+        // would keep prefixing passages the stored model never asked for.
+        assert!(
+            std::env::var_os(vera_core::local_models::LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV)
+                .is_none()
+        );
+        // Clearing one side must not clear the other.
+        assert_eq!(
+            std::env::var(vera_core::local_models::LOCAL_EMBEDDING_QUERY_PREFIX_ENV).unwrap(),
+            "Ask:"
+        );
+
+        let model = vera_core::local_models::LocalEmbeddingModelConfig::from_env().unwrap();
+        assert_eq!(model.query_prefix.as_deref(), Some("Ask:"));
+        assert_eq!(model.document_prefix, None);
     }
 
     #[test]

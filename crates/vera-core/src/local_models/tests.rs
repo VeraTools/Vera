@@ -597,8 +597,10 @@ fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
     assert_eq!(
         jina.model_identity(),
         format!(
-            "{}|pooling=last-token|qp={JINA_QUERY_PREFIX}|dp={JINA_DOCUMENT_PREFIX}",
-            jina.display_name()
+            "{}|pooling=last-token|qp={}:{JINA_QUERY_PREFIX}|dp={}:{JINA_DOCUMENT_PREFIX}",
+            jina.display_name(),
+            JINA_QUERY_PREFIX.len(),
+            JINA_DOCUMENT_PREFIX.len()
         )
     );
     // The repo still has to be recognisable in the stored name.
@@ -622,8 +624,9 @@ fn coderank_preset_identity_records_its_pooling() {
     assert_eq!(
         coderank.model_identity(),
         format!(
-            "{}|pooling=cls|qp={CODERANK_QUERY_PREFIX}|dp=-",
-            coderank.display_name()
+            "{}|pooling=cls|qp={}:{CODERANK_QUERY_PREFIX}|dp=none",
+            coderank.display_name(),
+            CODERANK_QUERY_PREFIX.len()
         )
     );
     assert!(
@@ -843,8 +846,87 @@ fn prefixes_are_part_of_the_model_identity() {
     // The preset form has to name both too, or jina's own identity would not
     // move when the prefixes were introduced.
     let jina = LocalEmbeddingModelConfig::jina();
-    assert!(jina.model_identity().contains("qp=Query:"));
-    assert!(jina.model_identity().contains("dp=Document:"));
+    assert!(jina.model_identity().contains("qp=6:Query:"));
+    assert!(jina.model_identity().contains("dp=9:Document:"));
+}
+
+#[test]
+fn an_absent_prefix_is_not_the_same_identity_as_a_literal_dash() {
+    // `unwrap_or("-")` spelled both of these `-`, so an index embedded with no
+    // prefix at all passed the staleness check against a config whose prefix is
+    // the literal `-`, and `vera update` appended incompatible vectors to it.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+    assert!(base.query_prefix.is_none());
+    assert!(base.document_prefix.is_none());
+
+    let mut dash_query = base.clone();
+    dash_query.query_prefix = Some("-".to_string());
+    // The two configs really do embed different text, so the identity has to
+    // move with them.
+    assert_ne!(base.query_text("q"), dash_query.query_text("q"));
+    assert_ne!(base.model_identity(), dash_query.model_identity());
+
+    let mut dash_document = base.clone();
+    dash_document.document_prefix = Some("-".to_string());
+    assert_ne!(base.document_text("d"), dash_document.document_text("d"));
+    assert_ne!(base.model_identity(), dash_document.model_identity());
+
+    // And a dash on one side is not a dash on the other.
+    assert_ne!(dash_query.model_identity(), dash_document.model_identity());
+}
+
+#[test]
+fn a_prefix_cannot_forge_an_identity_field_boundary() {
+    // `|qp=` and `|dp=` were ordinary text inside a prefix, so a value carrying
+    // one shifted where the next field started. These two configs prefix
+    // different text on both sides and encoded to a single identity string.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+
+    let mut carried_by_query = base.clone();
+    carried_by_query.query_prefix = Some("alpha|dp=beta|qp=gamma".to_string());
+    carried_by_query.document_prefix = Some("delta".to_string());
+
+    let mut carried_by_document = base.clone();
+    carried_by_document.query_prefix = Some("alpha".to_string());
+    carried_by_document.document_prefix = Some("beta|qp=gamma|dp=delta".to_string());
+
+    assert_ne!(
+        carried_by_query.query_text("q"),
+        carried_by_document.query_text("q")
+    );
+    assert_ne!(
+        carried_by_query.model_identity(),
+        carried_by_document.model_identity()
+    );
+}
+
+#[test]
+fn identity_matches_on_prefixes_that_embed_the_same_text() {
+    // The identity is a staleness guard, not a config diff. Trimming and the
+    // empty-to-absent fold happen before the text is embedded, so configs that
+    // feed the model byte-identical input must agree, or every one of these
+    // spellings would demand its own full re-index for nothing.
+    let base = LocalEmbeddingModelConfig::from_huggingface_repo("acme/prefix-identity-fixture");
+
+    for equivalent_to_absent in ["", "   ", "\t\n"] {
+        let mut blank = base.clone();
+        blank.query_prefix = Some(equivalent_to_absent.to_string());
+        blank.document_prefix = Some(equivalent_to_absent.to_string());
+        assert_eq!(blank.query_text("q"), base.query_text("q"));
+        assert_eq!(blank.document_text("d"), base.document_text("d"));
+        assert_eq!(
+            blank.model_identity(),
+            base.model_identity(),
+            "prefix {equivalent_to_absent:?} embeds exactly what no prefix embeds"
+        );
+    }
+
+    let mut tight = base.clone();
+    tight.query_prefix = Some("Ask:".to_string());
+    let mut padded = base.clone();
+    padded.query_prefix = Some("  Ask:  ".to_string());
+    assert_eq!(tight.query_text("q"), padded.query_text("q"));
+    assert_eq!(tight.model_identity(), padded.model_identity());
 }
 
 #[test]
