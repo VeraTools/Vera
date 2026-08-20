@@ -31,6 +31,14 @@ impl EmbeddingProvider for DynamicProvider {
         }
     }
 
+    fn prepare_document_text(&self, document: &str) -> String {
+        match self {
+            Self::Api(p) => p.prepare_document_text(document),
+            Self::Local(p) => p.prepare_document_text(document),
+            Self::Model2Vec(p) => p.prepare_document_text(document),
+        }
+    }
+
     fn prepare_query_text(&self, query: &str) -> String {
         match self {
             Self::Api(p) => p.prepare_query_text(query),

@@ -516,6 +516,10 @@ fn resolve_local_embedding_model(
     if let Some(max_length) = flags.embedding_max_length {
         model.max_length = max_length;
     }
+    if let Some(document_prefix) = flags.embedding_document_prefix.as_ref() {
+        model.document_prefix =
+            Some(document_prefix.trim().to_string()).filter(|value| !value.is_empty());
+    }
     if let Some(query_prefix) = flags.embedding_query_prefix.as_ref() {
         model.query_prefix =
             Some(query_prefix.trim().to_string()).filter(|value| !value.is_empty());

@@ -19,6 +19,12 @@ pub(super) const EMBEDDING_MAX_LENGTH: usize = 512;
 pub(super) const ONNX_HEADER_MAX_BYTES: usize = 4 * 1024;
 pub(super) const ONNX_HEADER_MAX_FIELDS: usize = 256;
 
+/// jina-embeddings-v5-text-nano-retrieval is asymmetric: `config_sentence_transformers.json`
+/// declares `{"query": "Query: ", "document": "Document: "}` and the model card requires both
+/// sides for the retrieval variant.
+pub(super) const JINA_QUERY_PREFIX: &str = "Query:";
+pub(super) const JINA_DOCUMENT_PREFIX: &str = "Document:";
+
 pub(super) const CODERANK_EMBEDDING_REPO: &str = "Zenabius/CodeRankEmbed-onnx";
 pub(super) const CODERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code:";
 
@@ -38,6 +44,7 @@ pub const LOCAL_EMBEDDING_DIM_ENV: &str = "VERA_LOCAL_EMBEDDING_DIM";
 pub const LOCAL_EMBEDDING_POOLING_ENV: &str = "VERA_LOCAL_EMBEDDING_POOLING";
 pub const LOCAL_EMBEDDING_MAX_LENGTH_ENV: &str = "VERA_LOCAL_EMBEDDING_MAX_LENGTH";
 pub const LOCAL_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_LOCAL_EMBEDDING_QUERY_PREFIX";
+pub const LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "VERA_LOCAL_EMBEDDING_DOCUMENT_PREFIX";
 pub const LEGACY_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_EMBEDDING_QUERY_PREFIX";
 
 pub(super) const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
@@ -142,6 +149,8 @@ pub struct LocalEmbeddingModelConfig {
     pub max_length: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +172,7 @@ impl LocalEmbeddingModelConfig {
         onnx_data_file: Option<&str>,
         pooling: LocalEmbeddingPooling,
         query_prefix: Option<&str>,
+        document_prefix: Option<&str>,
     ) -> Self {
         Self {
             source: LocalEmbeddingSource::HuggingFace {
@@ -175,6 +185,7 @@ impl LocalEmbeddingModelConfig {
             pooling,
             max_length: EMBEDDING_MAX_LENGTH,
             query_prefix: query_prefix.map(str::to_string),
+            document_prefix: document_prefix.map(str::to_string),
         }
     }
 
@@ -187,7 +198,8 @@ impl LocalEmbeddingModelConfig {
             EMBEDDING_REPO,
             Some(EMBEDDING_ONNX_DATA_FILE),
             LocalEmbeddingPooling::LastToken,
-            None,
+            Some(JINA_QUERY_PREFIX),
+            Some(JINA_DOCUMENT_PREFIX),
         )
     }
 
@@ -197,6 +209,7 @@ impl LocalEmbeddingModelConfig {
             None,
             LocalEmbeddingPooling::Cls,
             Some(CODERANK_QUERY_PREFIX),
+            None,
         )
     }
 
@@ -223,6 +236,7 @@ impl LocalEmbeddingModelConfig {
             pooling: LocalEmbeddingPooling::Mean,
             max_length: 512,
             query_prefix: None,
+            document_prefix: None,
         }
     }
 
@@ -332,7 +346,13 @@ impl LocalEmbeddingModelConfig {
         // change must invalidate an existing index rather than silently query
         // mean-pooled rows with last-token vectors.
         if self == &Self::jina() || self == &Self::coderankembed() {
-            return format!("{}|pooling={}", self.display_name(), self.pooling);
+            return format!(
+                "{}|pooling={}|qp={}|dp={}",
+                self.display_name(),
+                self.pooling,
+                self.query_prefix.as_deref().unwrap_or("-"),
+                self.document_prefix.as_deref().unwrap_or("-"),
+            );
         }
 
         let source = match &self.source {
@@ -341,26 +361,38 @@ impl LocalEmbeddingModelConfig {
         };
         let onnx_data = self.onnx_data_file.as_deref().unwrap_or("-");
         format!(
-            "{source}|onnx={}|onnx_data={onnx_data}|tokenizer={}|pooling={}|dim={}|max_length={}",
-            self.onnx_file, self.tokenizer_file, self.pooling, self.embedding_dim, self.max_length
+            "{source}|onnx={}|onnx_data={onnx_data}|tokenizer={}|pooling={}|dim={}|max_length={}|qp={}|dp={}",
+            self.onnx_file,
+            self.tokenizer_file,
+            self.pooling,
+            self.embedding_dim,
+            self.max_length,
+            self.query_prefix.as_deref().unwrap_or("-"),
+            self.document_prefix.as_deref().unwrap_or("-"),
         )
     }
 
-    pub fn query_text(&self, query: &str) -> String {
-        let Some(prefix) = self
-            .query_prefix
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return query.to_string();
+    /// Join a configured prefix to a text with exactly one space.
+    ///
+    /// The prefix is trimmed first, so a trailing space in the configured
+    /// value cannot double up. That trim is also why there is no
+    /// whitespace-preserving branch: a trimmed prefix can never end in
+    /// whitespace by the time it is joined.
+    fn apply_prefix(prefix: Option<&str>, text: &str) -> String {
+        let Some(prefix) = prefix.map(str::trim).filter(|value| !value.is_empty()) else {
+            return text.to_string();
         };
+        format!("{prefix} {text}")
+    }
 
-        if prefix.chars().last().is_some_and(char::is_whitespace) {
-            format!("{prefix}{query}")
-        } else {
-            format!("{prefix} {query}")
-        }
+    pub fn query_text(&self, query: &str) -> String {
+        Self::apply_prefix(self.query_prefix.as_deref(), query)
+    }
+
+    /// Prefix an indexed passage. Mirrors `query_text` and is applied only on
+    /// the indexing path, so a query never receives it.
+    pub fn document_text(&self, document: &str) -> String {
+        Self::apply_prefix(self.document_prefix.as_deref(), document)
     }
 
     pub fn cached_asset_paths(&self) -> Result<LocalEmbeddingAssetPaths> {
@@ -399,6 +431,7 @@ impl LocalEmbeddingModelConfig {
             Some(EMBEDDING_ONNX_DATA_FILE),
             LocalEmbeddingPooling::Mean,
             None,
+            None,
         )
     }
 
@@ -419,6 +452,8 @@ impl LocalEmbeddingModelConfig {
             pooling: parse_pooling_env(LOCAL_EMBEDDING_POOLING_ENV, defaults.pooling)?,
             max_length: parse_env_usize(LOCAL_EMBEDDING_MAX_LENGTH_ENV, defaults.max_length)?,
             query_prefix: parse_query_prefix_from_env().or_else(|| defaults.query_prefix.clone()),
+            document_prefix: env_override(LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV)
+                .or_else(|| defaults.document_prefix.clone()),
         })
     }
 }

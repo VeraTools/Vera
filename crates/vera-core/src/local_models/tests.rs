@@ -596,7 +596,10 @@ fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
     let jina = LocalEmbeddingModelConfig::jina();
     assert_eq!(
         jina.model_identity(),
-        format!("{}|pooling=last-token", jina.display_name())
+        format!(
+            "{}|pooling=last-token|qp={JINA_QUERY_PREFIX}|dp={JINA_DOCUMENT_PREFIX}",
+            jina.display_name()
+        )
     );
     // The repo still has to be recognisable in the stored name.
     assert!(jina.model_identity().starts_with(&jina.display_name()));
@@ -613,11 +616,15 @@ fn coderank_preset_identity_records_its_pooling() {
     // jina, so it carries the same obligation: pooling stays in the identity,
     // and the repo stays readable in it. Asserting the exact preset form keeps
     // this from passing on a CodeRankEmbed that quietly fell through to the
-    // generic branch.
+    // generic branch. CodeRankEmbed prefixes queries only, so it is also the
+    // preset that pins how the absent document side is spelled.
     let coderank = LocalEmbeddingModelConfig::coderankembed();
     assert_eq!(
         coderank.model_identity(),
-        format!("{}|pooling=cls", coderank.display_name())
+        format!(
+            "{}|pooling=cls|qp={CODERANK_QUERY_PREFIX}|dp=-",
+            coderank.display_name()
+        )
     );
     assert!(
         coderank
@@ -674,6 +681,7 @@ fn legacy_jina_literal_stays_pinned_when_the_constants_move() {
             pooling: LocalEmbeddingPooling::Mean,
             max_length: 512,
             query_prefix: None,
+            document_prefix: None,
         }
     );
 
@@ -705,36 +713,58 @@ fn legacy_jina_literal_stays_pinned_when_the_constants_move() {
     );
     assert_eq!(legacy.embedding_dim, EMBEDDING_DIM, "{GUIDANCE}");
     assert_eq!(legacy.max_length, EMBEDDING_MAX_LENGTH, "{GUIDANCE}");
+
+    // Half three: the two fields that deliberately do *not* track the preset.
+    // A pre-fix `config.json` predates the retrieval prefixes, so it carries
+    // neither. Copying `JINA_QUERY_PREFIX`/`JINA_DOCUMENT_PREFIX` in here to
+    // "match the preset" would stop the literal matching any file on any real
+    // install, and every pre-fix install would stay mean-pooled with no error.
+    assert_eq!(legacy.query_prefix, None, "{GUIDANCE}");
+    assert_eq!(legacy.document_prefix, None, "{GUIDANCE}");
 }
 
 #[test]
-fn explicit_mean_on_the_default_repo_is_repaired_with_the_legacy_default() {
-    // `--embedding-pooling mean` on the default repo, changing nothing else,
-    // writes byte-for-byte the config.json an older `vera setup` wrote on its
-    // own. Nothing in the file distinguishes the two, so the migration cannot
-    // spare this user's choice without sparing every pre-fix install as well.
-    // Overwriting it is the knowingly accepted side of that trade, not a bug
-    // to fix here, and this asserts the behaviour that actually ships rather
-    // than the behaviour the neighbouring test's comment implies.
+fn explicit_mean_on_the_default_repo_is_no_longer_the_legacy_default() {
+    // Before the retrieval prefixes, `--embedding-pooling mean` on the default
+    // repo wrote byte-for-byte the config.json an older `vera setup` wrote on
+    // its own, so the migration could not spare this user's choice without
+    // sparing every pre-fix install with it. The prefixes end that collision:
+    // a pre-fix file predates them and carries neither, so an explicit mean
+    // written today is distinguishable and is left alone.
     let mut explicit_mean = LocalEmbeddingModelConfig::jina();
     explicit_mean.pooling = LocalEmbeddingPooling::Mean;
-    assert_eq!(
+    assert_ne!(
         explicit_mean,
         LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix()
     );
-
     assert_eq!(
-        explicit_mean.repair_stored_defaults(),
+        explicit_mean.clone().repair_stored_defaults(),
+        explicit_mean
+    );
+
+    // Pooling aside, that config differs from the historical file in the
+    // prefixes and in nothing else — so the prefixes are what spares it, and
+    // the historical file itself is still migrated.
+    let mut without_prefixes = explicit_mean;
+    without_prefixes.query_prefix = None;
+    without_prefixes.document_prefix = None;
+    assert_eq!(
+        without_prefixes,
+        LocalEmbeddingModelConfig::legacy_jina_before_pooling_fix()
+    );
+    assert_eq!(
+        without_prefixes.repair_stored_defaults(),
         LocalEmbeddingModelConfig::jina()
     );
 }
 
 #[test]
 fn repair_leaves_customised_and_unrelated_configs_alone() {
-    // A deliberate non-default choice on the same repo survives as long as
-    // some field other than pooling also differs from the historical default —
-    // `max_length` here. Pooling alone does not; see
-    // `explicit_mean_on_the_default_repo_is_repaired_with_the_legacy_default`.
+    // A deliberate non-default choice on the same repo survives; `max_length`
+    // here differs from the historical default on top of the pooling. Pooling
+    // alone survives too, now that the retrieval prefixes separate a config
+    // written today from the pre-fix file — see
+    // `explicit_mean_on_the_default_repo_is_no_longer_the_legacy_default`.
     let mut customised = LocalEmbeddingModelConfig::jina();
     customised.pooling = LocalEmbeddingPooling::Mean;
     customised.max_length = 256;
@@ -750,4 +780,67 @@ fn repair_leaves_customised_and_unrelated_configs_alone() {
     assert_eq!(jina.clone().repair_stored_defaults(), jina);
     let coderank = LocalEmbeddingModelConfig::coderankembed();
     assert_eq!(coderank.clone().repair_stored_defaults(), coderank);
+}
+
+#[test]
+fn jina_preset_carries_both_retrieval_prefixes() {
+    // config_sentence_transformers.json declares
+    // {"query": "Query: ", "document": "Document: "} and the card requires both
+    // sides for the retrieval variant.
+    let config = LocalEmbeddingModelConfig::jina();
+    assert_eq!(
+        config.query_text("find router code"),
+        "Query: find router code"
+    );
+    assert_eq!(
+        config.document_text("fn route() {}"),
+        "Document: fn route() {}"
+    );
+}
+
+#[test]
+fn document_prefix_is_independent_of_query_prefix() {
+    // CodeRankEmbed is query-prefixed only. A document prefix must not appear
+    // from nowhere, and the query prefix must not leak onto passages.
+    let coderank = LocalEmbeddingModelConfig::coderankembed();
+    assert!(coderank.document_prefix.is_none());
+    assert_eq!(coderank.document_text("fn route() {}"), "fn route() {}");
+    assert_eq!(
+        coderank.query_text("find router code"),
+        "Represent this query for searching relevant code: find router code"
+    );
+
+    // An unprefixed model leaves both sides untouched.
+    let plain = LocalEmbeddingModelConfig::from_huggingface_repo("some-org/some-encoder");
+    assert_eq!(plain.query_text("q"), "q");
+    assert_eq!(plain.document_text("d"), "d");
+}
+
+#[test]
+fn prefixes_are_part_of_the_model_identity() {
+    // Prefixes change the embedded text, so they change the vector space and
+    // must invalidate an index the same way pooling does.
+    let jina = LocalEmbeddingModelConfig::jina();
+    let mut no_doc_prefix = jina.clone();
+    no_doc_prefix.document_prefix = None;
+    assert_ne!(jina.model_identity(), no_doc_prefix.model_identity());
+
+    let mut other_query_prefix = jina.clone();
+    other_query_prefix.query_prefix = Some("Search:".to_string());
+    assert_ne!(jina.model_identity(), other_query_prefix.model_identity());
+}
+
+#[test]
+fn prefix_joins_with_exactly_one_space_however_it_is_written() {
+    let mut config = LocalEmbeddingModelConfig::jina();
+    for spelling in ["Query:", "Query: ", "  Query:  "] {
+        config.query_prefix = Some(spelling.to_string());
+        assert_eq!(config.query_text("q"), "Query: q", "spelling {spelling:?}");
+    }
+    config.query_prefix = Some("   ".to_string());
+    assert_eq!(
+        config.query_text("q"),
+        "q",
+        "whitespace-only prefix should be ignored"
+    );
 }

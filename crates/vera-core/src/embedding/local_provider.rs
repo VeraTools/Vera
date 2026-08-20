@@ -897,6 +897,10 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
         Some(self.config.embedding_dim)
     }
 
+    fn prepare_document_text(&self, document: &str) -> String {
+        self.config.document_text(document)
+    }
+
     fn prepare_query_text(&self, query: &str) -> String {
         self.config.query_text(query)
     }

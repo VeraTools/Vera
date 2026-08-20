@@ -78,6 +78,12 @@ pub trait EmbeddingProvider: Send + Sync {
         query.to_string()
     }
 
+    /// Rewrite passage text for providers that require asymmetric document
+    /// prefixes. Applied on the indexing path only.
+    fn prepare_document_text(&self, document: &str) -> String {
+        document.to_string()
+    }
+
     /// Return the maximum number of inputs the provider accepts per request.
     ///
     /// `None` means Vera should use the configured batch size as-is.
@@ -655,6 +661,10 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
         self.inner.prepare_query_text(query)
     }
 
+    fn prepare_document_text(&self, document: &str) -> String {
+        self.inner.prepare_document_text(document)
+    }
+
     fn max_batch_size(&self) -> Option<usize> {
         self.inner.max_batch_size()
     }
@@ -1040,7 +1050,8 @@ where
                 .map(|(orig_idx, chunk)| EmbeddingBatchItem {
                     original_index: *orig_idx,
                     chunk_id: chunk.id.clone(),
-                    text: chunk_to_embedding_text(chunk, max_chunk_bytes),
+                    text: provider
+                        .prepare_document_text(&chunk_to_embedding_text(chunk, max_chunk_bytes)),
                 })
                 .collect()
         })
@@ -1603,5 +1614,78 @@ mod tests {
 
         assert!(matches!(result, Err(EmbeddingError::Cancelled)));
         assert_eq!(progress_events.load(Ordering::SeqCst), 0);
+    }
+
+    /// Records the texts it is asked to embed and prefixes passages, so the
+    /// test can prove the indexing funnel actually calls the document hook
+    /// rather than merely defining it.
+    struct RecordingProvider {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl EmbeddingProvider for RecordingProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![0.0]).collect())
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(1)
+        }
+
+        fn prepare_document_text(&self, document: &str) -> String {
+            format!("Document: {document}")
+        }
+
+        fn prepare_query_text(&self, query: &str) -> String {
+            format!("Query: {query}")
+        }
+    }
+
+    #[tokio::test]
+    async fn indexing_applies_the_document_prefix_and_not_the_query_prefix() {
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "fn main() {}".to_string(),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+
+        embed_chunks_concurrent_with_progress_and_cancellation(
+            &provider,
+            &chunks,
+            1,
+            1,
+            0,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("embedding should succeed");
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one embedded passage");
+        assert!(
+            seen[0].starts_with("Document: "),
+            "indexing path did not apply the document prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            !seen[0].contains("Query: "),
+            "indexed passage was given the query prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("fn main() {}"),
+            "prefix replaced the chunk body instead of prefixing it: {:?}",
+            seen[0]
+        );
     }
 }

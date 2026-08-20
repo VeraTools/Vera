@@ -79,6 +79,7 @@ Use this when you already downloaded or exported the model yourself.
 | `--embedding-pooling <mode>` | Pooling method for token-level outputs: `mean`, `cls`, or `last-token` |
 | `--embedding-max-length <n>` | Tokenizer truncation length |
 | `--embedding-query-prefix <text>` | Optional prefix prepended to local embedding queries |
+| `--embedding-document-prefix <text>` | Optional prefix prepended to indexed passages |
 
 ## Required Files
 

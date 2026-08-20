@@ -281,6 +281,9 @@ pub struct LocalEmbeddingModelFlags {
     /// Optional asymmetric query prefix for models that require it.
     #[arg(long = "embedding-query-prefix", value_name = "TEXT")]
     pub embedding_query_prefix: Option<String>,
+    /// Optional asymmetric document prefix for models that require it.
+    #[arg(long = "embedding-document-prefix", value_name = "TEXT")]
+    pub embedding_document_prefix: Option<String>,
 }
 
 impl LocalEmbeddingModelFlags {
