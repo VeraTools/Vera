@@ -598,6 +598,31 @@ fn preset_identity_changes_with_pooling_so_stale_indexes_are_detected() {
 }
 
 #[test]
+fn coderank_preset_identity_records_its_pooling() {
+    // The preset branch of `model_identity` covers CodeRankEmbed as well as
+    // jina, so it carries the same obligation: pooling stays in the identity,
+    // and the repo stays readable in it. Asserting the exact preset form keeps
+    // this from passing on a CodeRankEmbed that quietly fell through to the
+    // generic branch.
+    let coderank = LocalEmbeddingModelConfig::coderankembed();
+    assert_eq!(
+        coderank.model_identity(),
+        format!("{}|pooling=cls", coderank.display_name())
+    );
+    assert!(
+        coderank
+            .model_identity()
+            .starts_with(&coderank.display_name())
+    );
+
+    // CodeRankEmbed is CLS-pooled, so mean is the contrasting choice.
+    let mut mean_pooled = coderank.clone();
+    mean_pooled.pooling = LocalEmbeddingPooling::Mean;
+    assert_ne!(coderank.model_identity(), mean_pooled.model_identity());
+    assert!(mean_pooled.model_identity().contains("pooling=mean"));
+}
+
+#[test]
 fn stored_legacy_jina_config_is_repaired_to_last_token() {
     // What `vera setup` wrote to config.json before the pooling fix.
     let stored: LocalEmbeddingModelConfig = serde_json::from_str(
