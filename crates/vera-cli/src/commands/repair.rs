@@ -9,7 +9,7 @@ use crate::state;
 
 /// The embedding model `vera repair` hands to `configure_backend`.
 ///
-/// Deliberately the raw stored value, not `state::saved_local_embedding_model`:
+/// Deliberately the raw stored value, not `state::repaired_local_embedding_model`:
 /// `configure_backend` persists whatever it is handed, so the in-memory pooling
 /// repair would be laundered into `config.json` and an older Vera on the same
 /// machine would then abort on every command, its `FromStr` knowing only `mean`

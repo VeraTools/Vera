@@ -103,19 +103,6 @@ fn repaired_local_embedding_model(
     stored.map(vera_core::local_models::LocalEmbeddingModelConfig::repair_stored_defaults)
 }
 
-/// The stored model config as runtime should see it.
-///
-/// `setup` freezes the resolved model config into `config.json` and that copy
-/// outranks the preset, so an install created before jina's pooling was
-/// corrected would keep mean-pooling it indefinitely. The repair is applied in
-/// memory only; the file keeps whatever `setup` wrote.
-pub fn saved_local_embedding_model()
--> Result<Option<vera_core::local_models::LocalEmbeddingModelConfig>> {
-    Ok(repaired_local_embedding_model(
-        load_saved_config()?.local_embedding_model,
-    ))
-}
-
 pub fn saved_backend() -> Result<Option<vera_core::config::InferenceBackend>> {
     use vera_core::config::{InferenceBackend, OnnxExecutionProvider};
 
@@ -242,7 +229,7 @@ fn apply_saved_env_impl(force: bool) -> Result<()> {
     }
 
     // Repaired in memory on the way to the process environment; see
-    // `saved_local_embedding_model`.
+    // `repaired_local_embedding_model`.
     let local_embedding_model = repaired_local_embedding_model(config.local_embedding_model);
     apply_local_embedding_env(local_embedding_model.as_ref(), force);
 
@@ -569,9 +556,9 @@ mod tests {
     fn runtime_readers_repair_stored_pooling_in_memory() {
         let _guard = with_stored_config(LEGACY_JINA_CONFIG);
 
-        let model = saved_local_embedding_model()
-            .unwrap()
-            .expect("stored config carries a local embedding model");
+        let model =
+            repaired_local_embedding_model(load_saved_config().unwrap().local_embedding_model)
+                .expect("stored config carries a local embedding model");
         assert_eq!(
             model.pooling,
             vera_core::local_models::LocalEmbeddingPooling::LastToken
