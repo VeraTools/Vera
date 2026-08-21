@@ -270,9 +270,9 @@ fn run_lane(
     lane: &lanes::ResolvedLane,
 ) -> Result<types::EvalReport> {
     let _env = lanes::apply_environment(lane);
+    let corpus = load_verified_corpus(corpus_path)?;
+    let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths)?;
     let (mut report, evaluated_tasks) = if lane.is_bm25() {
-        let corpus = load_verified_corpus(corpus_path)?;
-        let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths)?;
         let vera = vera_adapter::VeraBm25Adapter::new()?;
         let report = runner::run_benchmark_scoped(
             &vera,
@@ -283,8 +283,6 @@ fn run_lane(
         );
         (report, tasks)
     } else {
-        let corpus = load_verified_corpus(corpus_path)?;
-        let tasks = filter_tasks_to_corpus(tasks, &corpus.repo_paths)?;
         let backend = lane.backend.expect("non-BM25 lane must have a backend");
         let vera =
             vera_adapter::VeraFullAdapter::new_with_options(backend, lane.rerank(), lane.name())?;

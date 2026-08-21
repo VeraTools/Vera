@@ -125,7 +125,11 @@ impl ResolvedLane {
     }
 
     pub fn rerank(&self) -> bool {
-        self.spec.rerank && !matches!(self.backend, Some(InferenceBackend::PotionCode))
+        self.spec.rerank
+            && matches!(
+                self.backend,
+                Some(InferenceBackend::Api | InferenceBackend::OnnxJina(_))
+            )
     }
 
     /// Resolve the effective model settings after [`LaneEnvGuard`] is active.
@@ -330,7 +334,13 @@ pub fn resolve(spec: LaneSpec) -> Result<ResolvedLane> {
 
     let backend_name = spec.backend.trim().to_ascii_lowercase();
     let backend = match backend_name.as_str() {
-        "bm25" => None,
+        "bm25" => {
+            reject_local_fields(&spec, "bm25")?;
+            if spec.repo.is_some() || spec.dir.is_some() {
+                anyhow::bail!("lane '{}' BM25 backend cannot set repo or dir", spec.name);
+            }
+            None
+        }
         "api" => {
             reject_local_fields(&spec, "api")?;
             if spec.repo.is_some() || spec.dir.is_some() {
@@ -391,7 +401,8 @@ fn reject_local_fields(spec: &LaneSpec, backend: &str) -> Result<()> {
 }
 
 fn parse_execution_provider(value: Option<&str>) -> Result<OnnxExecutionProvider> {
-    let value = value.unwrap_or("cpu");
+    let value = value.map(str::trim).map(str::to_ascii_lowercase);
+    let value = value.as_deref().unwrap_or("cpu");
     let backend = if value.starts_with("onnx-jina-") {
         value.to_string()
     } else {
