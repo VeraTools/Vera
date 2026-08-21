@@ -501,6 +501,11 @@ impl LocalEmbeddingProvider {
                         }
                         emb
                     }
+                    LocalEmbeddingPooling::LastToken => {
+                        let last = last_unpadded_index(&attention_mask, i, max_len);
+                        let start = i * seq_len * dim + last * dim;
+                        data[start..start + dim].to_vec()
+                    }
                 };
                 let mut emb = emb;
                 normalize_embedding(&mut emb);
@@ -795,6 +800,17 @@ fn load_tokenizer(tokenizer_path: std::path::PathBuf, max_length: usize) -> Resu
     Ok(tokenizer)
 }
 
+/// Index of the final unpadded token in row `row` of `attention_mask`.
+///
+/// Scanning for the highest set position rather than counting ones keeps this
+/// correct under both left and right padding. An all-padding row yields 0.
+fn last_unpadded_index(attention_mask: &ndarray::Array2<i64>, row: usize, len: usize) -> usize {
+    (0..len)
+        .rev()
+        .find(|&j| attention_mask[[row, j]] == 1)
+        .unwrap_or(0)
+}
+
 fn normalize_embedding(embedding: &mut [f32]) {
     let norm: f32 = embedding
         .iter()
@@ -984,6 +1000,43 @@ fn register_execution_provider(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Right padding: the model's real final token sits before the pad run.
+    #[test]
+    fn last_unpadded_index_right_padded() {
+        let mask = ndarray::arr2(&[[1i64, 1, 1, 0, 0]]);
+        assert_eq!(last_unpadded_index(&mask, 0, 5), 2);
+    }
+
+    /// Left padding: the real final token is the last column. Counting set
+    /// bits would answer 2 here, which is a pad position.
+    #[test]
+    fn last_unpadded_index_left_padded() {
+        let mask = ndarray::arr2(&[[0i64, 0, 1, 1, 1]]);
+        assert_eq!(last_unpadded_index(&mask, 0, 5), 4);
+    }
+
+    #[test]
+    fn last_unpadded_index_full_row_and_single_token() {
+        assert_eq!(
+            last_unpadded_index(&ndarray::arr2(&[[1i64, 1, 1]]), 0, 3),
+            2
+        );
+        assert_eq!(last_unpadded_index(&ndarray::arr2(&[[1i64]]), 0, 1), 0);
+    }
+
+    #[test]
+    fn last_unpadded_index_is_per_row() {
+        let mask = ndarray::arr2(&[[1i64, 1, 0, 0], [1, 1, 1, 1]]);
+        assert_eq!(last_unpadded_index(&mask, 0, 4), 1);
+        assert_eq!(last_unpadded_index(&mask, 1, 4), 3);
+    }
+
+    #[test]
+    fn last_unpadded_index_all_padding_falls_back_to_zero() {
+        let mask = ndarray::arr2(&[[0i64, 0, 0]]);
+        assert_eq!(last_unpadded_index(&mask, 0, 3), 0);
+    }
 
     #[tokio::test]
     async fn test_local_embedding_provider() {

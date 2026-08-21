@@ -76,7 +76,7 @@ Use this when you already downloaded or exported the model yourself.
 | `--embedding-no-onnx-data` | Use models that do not ship an external data file |
 | `--embedding-tokenizer-file <path>` | Relative path to the tokenizer file |
 | `--embedding-dim <n>` | Embedding dimension stored in the index |
-| `--embedding-pooling mean|cls` | Pooling method for token-level outputs |
+| `--embedding-pooling <mode>` | Pooling method for token-level outputs: `mean`, `cls`, or `last-token` |
 | `--embedding-max-length <n>` | Tokenizer truncation length |
 | `--embedding-query-prefix <text>` | Optional prefix prepended to local embedding queries |
 

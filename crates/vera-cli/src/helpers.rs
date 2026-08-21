@@ -270,7 +270,7 @@ pub struct LocalEmbeddingModelFlags {
     #[arg(long = "embedding-dim", value_name = "DIM")]
     pub embedding_dim: Option<usize>,
     /// Pooling strategy for token-level output models.
-    #[arg(long = "embedding-pooling", value_name = "POOLING", value_parser = ["mean", "cls"])]
+    #[arg(long = "embedding-pooling", value_name = "POOLING", value_parser = ["mean", "cls", "last-token"])]
     pub embedding_pooling: Option<String>,
     /// Tokenizer truncation length for local embedding inference.
     #[arg(long = "embedding-max-length", value_name = "TOKENS")]
