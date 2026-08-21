@@ -101,7 +101,8 @@ end
         Language::Ruby,
     );
 
-    let module = require(&symbols, "Outer", SymbolType::Module);
+    let module = require_only(&symbols, SymbolType::Module);
+    assert_eq!(module.name.as_deref(), Some("Outer"));
     let class = require_only(&symbols, SymbolType::Class);
     assert_eq!(class.name.as_deref(), Some("Widget"));
     let render = require(&symbols, "render", SymbolType::Function);
