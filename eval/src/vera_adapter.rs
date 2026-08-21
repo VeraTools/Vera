@@ -204,19 +204,29 @@ pub struct VeraFullAdapter {
     runtime: Runtime,
     config: VeraConfig,
     backend: InferenceBackend,
+    name: String,
     search_context: SearchContext,
 }
 
 impl VeraFullAdapter {
-    pub fn new(backend: InferenceBackend) -> anyhow::Result<Self> {
+    pub fn new_with_options(
+        backend: InferenceBackend,
+        reranking_enabled: bool,
+        name: impl Into<String>,
+    ) -> anyhow::Result<Self> {
         let mut config = VeraConfig::default();
+        config.retrieval.reranking_enabled = reranking_enabled;
         config.adjust_for_backend(backend);
         let runtime = Runtime::new()?;
         let search_context = runtime.block_on(SearchContext::new(&config, backend));
+        if search_context.embedding_provider().is_none() {
+            anyhow::bail!("failed to initialize the embedding provider for backend {backend}");
+        }
         Ok(Self {
             runtime,
             config,
             backend,
+            name: name.into(),
             search_context,
         })
     }
@@ -224,7 +234,7 @@ impl VeraFullAdapter {
 
 impl ToolAdapter for VeraFullAdapter {
     fn name(&self) -> &str {
-        "vera-full"
+        &self.name
     }
 
     fn version(&self) -> String {

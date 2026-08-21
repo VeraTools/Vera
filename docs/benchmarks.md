@@ -6,6 +6,56 @@ This page tracks the v1.0 full-pipeline results and ablations first, then older 
 
 The v1.0.0-rc run used the full 1,251-task Semble suite across 63 repos on the `vera-cuda` lane: hybrid BM25+vector retrieval, RRF fusion, and a local ONNX cross-encoder reranker on CUDA, measured 2026-08-16 against the v1.0.0 release candidate. The older "BM25 scoped filters" full-suite row (`nDCG@10` 0.7267, measured in May 2026) was a BM25-only lane using an older harness. Cross-date comparisons are approximate.
 
+### Model Lanes And Partial Runs
+
+`vera-eval` keeps the historical lanes `vera-bm25`, `vera-cuda`, `vera-cpu`, and `vera-potion`. Use `--task-id` and `--category` to select a task slice without changing the task files or ground truth:
+
+```bash
+cargo run -p vera-eval -- run --tool vera-bm25 \
+  --task-id symbol-lookup-001,symbol-lookup-002 \
+  --category symbol_lookup --json-only
+```
+
+For candidate models, pass a JSON or TOML file with one or more lanes. Each lane records its backend, model source, pooling, prefixes, dimensions, maximum length, reranking choice, and optional revision. The evaluator emits one report per lane, or a JSON array when more than one lane is requested.
+
+JSON example:
+
+```json
+{
+  "lanes": [
+    {
+      "name": "bitnet-270m",
+      "backend": "custom-onnx",
+      "repo": "microsoft/bitnet-embedding-270m",
+      "onnx_file": "onnx/model.onnx",
+      "tokenizer_file": "tokenizer.json",
+      "pooling": "last-token",
+      "query_prefix": "Represent this query for searching relevant code:",
+      "document_prefix": "Represent this code for retrieval:",
+      "dim": 640,
+      "max_length": 512,
+      "rerank": false,
+      "revision": "<commit-or-tag>"
+    },
+    {
+      "name": "potion-control",
+      "backend": "potion",
+      "rerank": false
+    }
+  ]
+}
+```
+
+The `custom-onnx` backend defaults to CPU; set `execution_provider` to `cuda`, `rocm`, `coreml`, `openvino`, or another supported provider when needed. `repo` downloads from Hugging Face and `dir` points at an existing local model directory. API lanes use `model_id`, `query_prefix`, and `environment` for endpoint settings. Every report includes the resolved lane contract, Vera Git SHA, timestamp, command and redacted environment summary, corpus SHAs, and a SHA-256 identity of the selected task IDs.
+
+The lower-level Python runner supports the same task controls for its existing retrieval modes:
+
+```bash
+python3 benchmarks/scripts/run_vera_benchmarks.py \
+  --modes bm25-only hybrid-norerank \
+  --task-id intent-001,intent-002 --category intent --skip-index
+```
+
 ### Main Results
 
 | Variant | nDCG@10 | Recall@1 | Recall@5 | Mean search latency |

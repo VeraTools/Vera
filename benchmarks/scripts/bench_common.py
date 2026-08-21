@@ -8,7 +8,9 @@ each ground-truth entry consumed at most once.
 """
 
 import json
+import hashlib
 import math
+import os
 import subprocess
 from pathlib import Path
 
@@ -16,13 +18,49 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TASKS_DIR = REPO_ROOT / "eval" / "tasks"
 
 
-def load_tasks() -> list[dict]:
+def load_tasks(
+    task_ids: set[str] | None = None,
+    categories: set[str] | None = None,
+) -> list[dict]:
     """Load all benchmark tasks from eval/tasks/*.json."""
     tasks = []
     for task_file in sorted(TASKS_DIR.glob("*.json")):
         with open(task_file) as f:
             tasks.extend(json.load(f))
-    return tasks
+    task_ids = task_ids or set()
+    categories = {category.replace("-", "_").lower() for category in (categories or set())}
+    filtered = [
+        task
+        for task in tasks
+        if (not task_ids or task["id"] in task_ids)
+        and (not categories or task["category"] in categories)
+    ]
+    unknown_ids = sorted(task_ids - {task["id"] for task in tasks})
+    if unknown_ids:
+        raise ValueError(f"unknown task ID(s): {', '.join(unknown_ids)}")
+    if not filtered and (task_ids or categories):
+        raise ValueError("no benchmark tasks match the requested filters")
+    return filtered
+
+
+def task_set_identity(tasks: list[dict]) -> dict[str, str | int]:
+    """Hash sorted task IDs without including ground truth or task content."""
+    task_ids = sorted(task["id"] for task in tasks)
+    serialized_ids = ("\n".join(task_ids) + "\n") if task_ids else ""
+    digest = hashlib.sha256(serialized_ids.encode()).hexdigest()
+    return {"count": len(task_ids), "task_ids_sha256": digest}
+
+
+def environment_summary(env: dict[str, str]) -> dict[str, str]:
+    """Return the benchmark environment with credential values redacted."""
+    summary = {}
+    for key, value in sorted({**os.environ, **env}.items()):
+        if key.startswith(("EMBEDDING_", "RERANKER_", "VERA_")):
+            if any(secret in key for secret in ("KEY", "TOKEN", "SECRET")):
+                summary[key] = "<redacted>"
+            else:
+                summary[key] = value
+    return summary
 
 
 def load_secrets() -> dict[str, str]:

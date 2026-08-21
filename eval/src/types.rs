@@ -4,7 +4,7 @@
 //! and the overall evaluation report.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A single benchmark task: a query with ground truth expectations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +176,62 @@ pub struct VersionInfo {
     /// Configuration parameters (key -> value).
     #[serde(default)]
     pub config: HashMap<String, String>,
+    /// Resolved model lane configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneProvenance>,
+    /// Identity of the task slice evaluated by this report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_set: Option<TaskSetIdentity>,
+    /// Vera source revision used for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vera_git_sha: Option<String>,
+    /// Process arguments used to invoke the evaluator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Relevant environment values after lane overrides, with secrets redacted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+}
+
+/// Resolved configuration for one benchmark lane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneProvenance {
+    pub name: String,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onnx_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onnx_data_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pooling: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<usize>,
+    pub rerank: bool,
+}
+
+/// Stable identity for the selected task IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSetIdentity {
+    pub count: usize,
+    pub task_ids_sha256: String,
 }
 
 /// Corpus manifest parsed from corpus.toml.

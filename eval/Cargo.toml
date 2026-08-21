@@ -16,6 +16,7 @@ toml = "1.1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.11"
 tokio.workspace = true
 vera-core.workspace = true
 

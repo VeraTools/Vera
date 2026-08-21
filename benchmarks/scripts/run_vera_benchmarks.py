@@ -9,7 +9,7 @@ Modes:
   - bm25-only       : BM25 keyword search only (no embedding API)
 
 Usage:
-    python3 benchmarks/scripts/run_vera_benchmarks.py [--mode MODE] [--runs N]
+    python3 benchmarks/scripts/run_vera_benchmarks.py [--modes MODE ...] [--runs N]
 
 Requires:
     - Vera binary built (cargo build --release)
@@ -25,6 +25,8 @@ from bench_common import (
     is_match,
     load_secrets,
     load_tasks,
+    task_set_identity,
+    environment_summary,
     matched_relevances,
     mrr,
     ndcg_at_k,
@@ -207,7 +209,16 @@ def run_benchmark(
 
     if not available_tasks:
         print("  ✗ No available tasks (no repos indexed)", file=sys.stderr)
-        return {"tool_name": f"vera-{mode}", "mode": mode, "per_task": [], "per_category": {}, "aggregate": {}}
+        return {
+            "tool_name": f"vera-{mode}",
+            "mode": mode,
+            "task_set": task_set_identity([]),
+            "environment": environment_summary(env),
+            "command": ["vera", "--json", "search", "<task-query>", "--limit", "20"],
+            "per_task": [],
+            "per_category": {},
+            "aggregate": {},
+        }
 
     print(f"  Running {len(available_tasks)} tasks (skipped {len(tasks) - len(available_tasks)} for unindexed repos)")
 
@@ -273,6 +284,16 @@ def run_benchmark(
     return {
         "tool_name": f"vera-{mode}",
         "mode": mode,
+        "task_set": task_set_identity(available_tasks),
+        "environment": environment_summary(env),
+        "command": [
+            "vera",
+            "--json",
+            "search",
+            "<task-query>",
+            "--limit",
+            "20",
+        ],
         "per_task": per_task,
         "per_category": per_category,
         "aggregate": aggregate,
@@ -484,6 +505,11 @@ def verify_assertions(vera_results: dict[str, dict]) -> list[tuple[str, bool, st
     norerank = vera_results.get("hybrid-norerank", {}).get("aggregate", {}).get("retrieval", {})
     hybrid_perf = vera_results.get("hybrid", {}).get("aggregate", {}).get("performance", {})
 
+    # A sliced run may intentionally omit one of the comparison lanes. Do not
+    # turn an in-scope partial benchmark into a false failure.
+    if "hybrid" not in vera_results or "bm25-only" not in vera_results:
+        return []
+
     # 1. Hybrid MRR@10 > BM25-only MRR@10
     h_mrr = hybrid.get("mrr", 0)
     b_mrr = bm25.get("mrr", 0)
@@ -513,6 +539,9 @@ def verify_assertions(vera_results: dict[str, dict]) -> list[tuple[str, bool, st
         h_mrr > v_mrr,
         f"hybrid={h_mrr:.4f}, vector-only-baseline={v_mrr:.4f}",
     ))
+
+    if "hybrid-norerank" not in vera_results:
+        return checks
 
     # 3. Reranked Precision@3 > unreranked Precision@3
     h_p3 = hybrid.get("precision_at_3", 0)
@@ -544,12 +573,13 @@ def verify_assertions(vera_results: dict[str, dict]) -> list[tuple[str, bool, st
     hybrid_p95 = hybrid_perf.get("latency_p95_ms", 9999)
     hybrid_queries = hybrid_perf.get("total_queries", 0)
     # Use BM25 for the <500ms target (local computation), report both
-    checks.append((
-        "p95 query latency < 500ms on 20+ queries (local computation)",
-        bm25_p95 < 500 and bm25_queries >= 17,
-        f"bm25_p95={bm25_p95:.1f}ms ({bm25_queries} queries), "
-        f"hybrid_p95={hybrid_p95:.1f}ms ({hybrid_queries} queries, includes API round trips)",
-    ))
+    if bm25_queries >= 17:
+        checks.append((
+            "p95 query latency < 500ms on 20+ queries (local computation)",
+            bm25_p95 < 500,
+            f"bm25_p95={bm25_p95:.1f}ms ({bm25_queries} queries), "
+            f"hybrid_p95={hybrid_p95:.1f}ms ({hybrid_queries} queries, includes API round trips)",
+        ))
 
     return checks
 
@@ -565,6 +595,18 @@ def main():
     )
     parser.add_argument(
         "--runs", type=int, default=1, help="Number of timing runs per mode"
+    )
+    parser.add_argument(
+        "--task-id",
+        action="append",
+        default=[],
+        help="Task ID to include; repeat or use comma-separated values",
+    )
+    parser.add_argument(
+        "--category",
+        action="append",
+        default=[],
+        help="Task category to include; repeat or use comma-separated values",
     )
     parser.add_argument(
         "--skip-index",
@@ -586,7 +628,23 @@ def main():
 
     # Load credentials
     secrets = load_secrets()
-    tasks = load_tasks()
+    task_ids = {
+        task_id.strip()
+        for value in args.task_id
+        for task_id in value.split(",")
+        if task_id.strip()
+    }
+    categories = {
+        category.strip()
+        for value in args.category
+        for category in value.split(",")
+        if category.strip()
+    }
+    try:
+        tasks = load_tasks(task_ids=task_ids, categories=categories)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(2)
     repos = sorted(set(t["repo"] for t in tasks))
 
     print(f"Vera version: {binary_version(VERA_BIN)}")
@@ -646,6 +704,9 @@ def main():
         "vera_version": binary_version(VERA_BIN),
         "git_sha": git_sha(),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "task_set": task_set_identity(tasks),
+        "environment": environment_summary(secrets),
+        "command": sys.argv,
         "modes": vera_results,
         "index_stats": index_stats,
         "assertion_checks": [

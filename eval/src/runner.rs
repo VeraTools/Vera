@@ -3,13 +3,13 @@
 //! Provides a `ToolAdapter` trait that tool integrations implement,
 //! plus a mock adapter for harness self-testing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use crate::metrics;
 use crate::types::{
-    AggregateMetrics, BenchmarkTask, EvalReport, PerformanceMetrics, RetrievalResult,
-    TaskEvaluation, TaskResult, VersionInfo,
+    AggregateMetrics, BenchmarkTask, EvalReport, LaneProvenance, PerformanceMetrics,
+    RetrievalResult, TaskEvaluation, TaskResult, TaskSetIdentity, VersionInfo,
 };
 
 /// Trait for tool adapters that execute search queries.
@@ -47,6 +47,24 @@ pub fn run_benchmark(
     corpus_shas: &HashMap<String, String>,
 ) -> EvalReport {
     run_benchmark_scoped(adapter, tasks, repo_paths, corpus_shas, &HashMap::new())
+}
+
+/// Add invocation metadata to a completed report.
+pub fn attach_provenance(
+    report: &mut EvalReport,
+    lane: Option<LaneProvenance>,
+    task_set: TaskSetIdentity,
+    config: BTreeMap<String, String>,
+    environment: BTreeMap<String, String>,
+    vera_git_sha: Option<String>,
+    command: Vec<String>,
+) {
+    report.version_info.lane = lane;
+    report.version_info.task_set = Some(task_set);
+    report.version_info.environment = environment;
+    report.version_info.vera_git_sha = vera_git_sha;
+    report.version_info.command = command;
+    report.version_info.config.extend(config);
 }
 
 /// Run benchmark with optional per-repo path scopes (benchmark_root).
@@ -108,6 +126,11 @@ pub fn run_benchmark_scoped(
             corpus_version: 1,
             repo_shas: corpus_shas.clone(),
             config: HashMap::new(),
+            lane: None,
+            task_set: None,
+            vera_git_sha: None,
+            command: Vec::new(),
+            environment: BTreeMap::new(),
         },
         per_task,
         per_category,
@@ -261,6 +284,11 @@ pub fn run_benchmark_with_mock(mock: &MockAdapter, tasks: &[BenchmarkTask]) -> E
                 ("accuracy".to_string(), mock.accuracy.to_string()),
                 ("noise_results".to_string(), mock.noise_results.to_string()),
             ]),
+            lane: None,
+            task_set: None,
+            vera_git_sha: None,
+            command: Vec::new(),
+            environment: BTreeMap::new(),
         },
         per_task,
         per_category,

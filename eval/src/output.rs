@@ -8,9 +8,9 @@ use std::path::Path;
 
 use crate::types::EvalReport;
 
-/// Write the evaluation report as JSON to a file.
-pub fn write_json_report(report: &EvalReport, path: &Path) -> Result<()> {
-    let json = serde_json::to_string_pretty(report)?;
+/// Write one report as an object or multiple reports as an array.
+pub fn write_json_reports(reports: &[EvalReport], path: &Path) -> Result<()> {
+    let json = reports_to_json(reports)?;
     std::fs::write(path, &json)?;
     Ok(())
 }
@@ -18,6 +18,14 @@ pub fn write_json_report(report: &EvalReport, path: &Path) -> Result<()> {
 /// Serialize the evaluation report to a JSON string.
 pub fn report_to_json(report: &EvalReport) -> Result<String> {
     Ok(serde_json::to_string_pretty(report)?)
+}
+
+/// Serialize one report as an object or multiple reports as an array.
+pub fn reports_to_json(reports: &[EvalReport]) -> Result<String> {
+    match reports {
+        [report] => report_to_json(report),
+        _ => Ok(serde_json::to_string_pretty(reports)?),
+    }
 }
 
 /// Print a human-readable summary of the evaluation report.
@@ -210,6 +218,11 @@ mod tests {
                 corpus_version: 1,
                 repo_shas: HashMap::from([("ripgrep".to_string(), "abc123".to_string())]),
                 config: HashMap::new(),
+                lane: None,
+                task_set: None,
+                vera_git_sha: None,
+                command: Vec::new(),
+                environment: Default::default(),
             },
             per_task: vec![TaskEvaluation {
                 task_id: "test-001".to_string(),
@@ -303,13 +316,21 @@ mod tests {
     }
 
     #[test]
-    fn test_write_json_report() {
+    fn test_write_json_reports() {
         let report = sample_report();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.json");
-        write_json_report(&report, &path).unwrap();
+        write_json_reports(std::slice::from_ref(&report), &path).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let _: EvalReport = serde_json::from_str(&content).unwrap();
+    }
+
+    #[test]
+    fn test_multiple_reports_are_written_as_an_array() {
+        let report = sample_report();
+        let json = reports_to_json(&[report.clone(), report]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
     }
 }
