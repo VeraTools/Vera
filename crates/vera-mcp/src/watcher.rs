@@ -13,7 +13,7 @@ use std::time::Duration;
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 use tracing::{debug, info, warn};
 
-use vera_core::config::IndexingConfig;
+use vera_core::config::{IndexingConfig, InferenceBackend, VeraConfig};
 use vera_core::discovery::ExclusionMatcher;
 use vera_core::indexing::UpdateSummary;
 use vera_core::storage::metadata::MetadataStore;
@@ -25,67 +25,88 @@ const DEBOUNCE_SECS: u64 = 2;
 /// so the tokio runtime and the embedding model are paid for once rather than
 /// per debounce window.
 trait IncrementalUpdate: Send + Sync {
-    fn update(&self, repo_path: &Path) -> Result<UpdateSummary, anyhow::Error>;
+    fn update(&self, repo_path: &Path, config: &VeraConfig)
+    -> Result<UpdateSummary, anyhow::Error>;
 }
 
 type Engine = Arc<dyn IncrementalUpdate>;
-type EngineBuilder = Arc<dyn Fn() -> Result<Engine, anyhow::Error> + Send + Sync>;
+type EngineBuilder = Arc<dyn Fn(&WatchRuntime) -> Result<Engine, anyhow::Error> + Send + Sync>;
+type RuntimeResolver = Arc<dyn Fn() -> Result<WatchRuntime, anyhow::Error> + Send + Sync>;
 
-/// Holds the update engine for the lifetime of the watcher.
+#[derive(Clone)]
+struct WatchRuntime {
+    config: VeraConfig,
+    backend: InferenceBackend,
+    provider_identity: String,
+}
+
+struct CachedEngine {
+    provider_identity: String,
+    engine: Engine,
+}
+
+/// Holds the update engine for the current provider identity.
 ///
 /// Construction is deferred to the first cycle so starting a watcher never
 /// loads a model, and a construction failure stays a per-cycle error that the
 /// next cycle can retry instead of killing the watcher.
 struct SharedEngine {
     build: EngineBuilder,
-    cached: Mutex<Option<Engine>>,
+    cached: Mutex<Option<CachedEngine>>,
 }
 
 impl SharedEngine {
-    fn get(&self) -> Result<Engine, anyhow::Error> {
+    fn get(&self, runtime: &WatchRuntime) -> Result<Engine, anyhow::Error> {
         let mut guard = self.cached.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(engine) = guard.as_ref() {
-            return Ok(Arc::clone(engine));
+        if let Some(cached) = guard.as_ref() {
+            if cached.provider_identity == runtime.provider_identity {
+                return Ok(Arc::clone(&cached.engine));
+            }
         }
-        let engine = (self.build)()?;
-        *guard = Some(Arc::clone(&engine));
+        let engine = (self.build)(runtime)?;
+        *guard = Some(CachedEngine {
+            provider_identity: runtime.provider_identity.clone(),
+            engine: Arc::clone(&engine),
+        });
         Ok(engine)
     }
 }
 
-/// The production engine: one tokio runtime and one embedding provider.
+/// The production engine: one tokio runtime and one embedding provider for a
+/// single effective provider identity.
 struct EmbeddingUpdateEngine {
     runtime: tokio::runtime::Runtime,
     provider: vera_core::embedding::DynamicProvider,
-    config: vera_core::config::VeraConfig,
     model_name: String,
 }
 
 impl EmbeddingUpdateEngine {
-    fn build(
-        config: vera_core::config::VeraConfig,
-        backend: vera_core::config::InferenceBackend,
-    ) -> Result<Self, anyhow::Error> {
+    fn build(runtime_config: &WatchRuntime) -> Result<Self, anyhow::Error> {
         let runtime = tokio::runtime::Runtime::new()?;
-        let (provider, model_name) = runtime.block_on(
-            vera_core::embedding::create_dynamic_provider(&config, backend),
-        )?;
+        let (provider, model_name) =
+            runtime.block_on(vera_core::embedding::create_dynamic_provider(
+                &runtime_config.config,
+                runtime_config.backend,
+            ))?;
         Ok(Self {
             runtime,
             provider,
-            config,
             model_name,
         })
     }
 }
 
 impl IncrementalUpdate for EmbeddingUpdateEngine {
-    fn update(&self, repo_path: &Path) -> Result<UpdateSummary, anyhow::Error> {
+    fn update(
+        &self,
+        repo_path: &Path,
+        config: &VeraConfig,
+    ) -> Result<UpdateSummary, anyhow::Error> {
         self.runtime
             .block_on(vera_core::indexing::update_repository(
                 repo_path,
                 &self.provider,
-                &self.config,
+                config,
                 &self.model_name,
             ))
     }
@@ -122,30 +143,49 @@ pub fn start_watching_with_progress(repo_path: &Path) -> Result<WatchHandle, Str
 }
 
 fn start_watching_internal(repo_path: &Path, progress_logs: bool) -> Result<WatchHandle, String> {
-    let backend = vera_core::config::resolve_backend(None);
-    let mut config = crate::saved_config::load_saved_runtime_config();
-    config.adjust_for_backend(backend);
+    let runtime = resolve_watch_runtime()
+        .map_err(|error| format!("Failed to resolve watcher runtime configuration: {error}"))?;
+    let indexing = runtime.config.indexing.clone();
+    let resolve: RuntimeResolver = Arc::new(resolve_watch_runtime);
+    let build: EngineBuilder =
+        Arc::new(|runtime| Ok(Arc::new(EmbeddingUpdateEngine::build(runtime)?) as Engine));
 
-    let indexing = config.indexing.clone();
-    let build: EngineBuilder = Arc::new(move || {
-        let engine = EmbeddingUpdateEngine::build(config.clone(), backend)?;
-        Ok(Arc::new(engine) as Engine)
-    });
-
-    start_watching_with(
+    start_watching_with_runtime(
         repo_path,
         progress_logs,
         Duration::from_secs(DEBOUNCE_SECS),
         &indexing,
+        resolve,
         build,
     )
 }
 
+#[cfg(test)]
 fn start_watching_with(
     repo_path: &Path,
     progress_logs: bool,
     debounce: Duration,
     indexing: &IndexingConfig,
+    build: EngineBuilder,
+) -> Result<WatchHandle, String> {
+    let runtime = WatchRuntime {
+        config: VeraConfig {
+            indexing: indexing.clone(),
+            ..VeraConfig::default()
+        },
+        backend: InferenceBackend::Api,
+        provider_identity: "test".to_string(),
+    };
+    let resolve: RuntimeResolver = Arc::new(move || Ok(runtime.clone()));
+    start_watching_with_runtime(repo_path, progress_logs, debounce, indexing, resolve, build)
+}
+
+fn start_watching_with_runtime(
+    repo_path: &Path,
+    progress_logs: bool,
+    debounce: Duration,
+    indexing: &IndexingConfig,
+    resolve: RuntimeResolver,
     build: EngineBuilder,
 ) -> Result<WatchHandle, String> {
     let repo_path = repo_path
@@ -157,7 +197,7 @@ fn start_watching_with(
         return Err("No index found. Run search_code first to auto-index.".to_string());
     }
 
-    let exclusions = ExclusionMatcher::new(&repo_path, indexing)
+    ExclusionMatcher::new(&repo_path, indexing)
         .map_err(|e| format!("Failed to build watcher exclusions: {e:#}"))?;
 
     // The index directory is filtered on its own, never through `exclusions`:
@@ -165,7 +205,6 @@ fn start_watching_with(
     // re-triggers itself. `no_default_excludes`, or a stored `default_excludes`
     // without `.vera`, would switch that guard off.
     let index_dir = idx_dir.clone();
-    let tracked_paths = load_tracked_paths(&idx_dir, &repo_path);
 
     let updating = Arc::new(AtomicBool::new(false));
     let updating_clone = updating.clone();
@@ -174,6 +213,7 @@ fn start_watching_with(
         build,
         cached: Mutex::new(None),
     });
+    let resolve_runtime = Arc::clone(&resolve);
 
     let mut debouncer = new_debouncer(
         debounce,
@@ -185,6 +225,22 @@ fn start_watching_with(
                     return;
                 }
             };
+
+            let runtime = match resolve_runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    warn!(error = %error, "Failed to resolve watcher runtime configuration");
+                    return;
+                }
+            };
+            let exclusions = match ExclusionMatcher::new(&repo_clone, &runtime.config.indexing) {
+                Ok(exclusions) => exclusions,
+                Err(error) => {
+                    warn!(error = %error, "Failed to resolve watcher exclusions");
+                    return;
+                }
+            };
+            let tracked_paths = load_tracked_paths(&index_dir, &repo_clone);
 
             // Ignore the index directory always, plus the directories indexing
             // would not walk anyway (target, node_modules, ...). A build
@@ -223,7 +279,7 @@ fn start_watching_with(
             let engine = Arc::clone(&engine);
 
             std::thread::spawn(move || {
-                run_incremental_update(&engine, &repo, &flag, progress_logs);
+                run_incremental_update(&engine, &repo, &runtime, &flag, progress_logs);
             });
         },
     )
@@ -239,6 +295,44 @@ fn start_watching_with(
     Ok(WatchHandle {
         _watcher: debouncer,
         updating,
+    })
+}
+
+fn resolve_watch_runtime() -> Result<WatchRuntime, anyhow::Error> {
+    let backend = vera_core::config::resolve_backend(None);
+    let mut config = crate::saved_config::load_saved_runtime_config();
+    config.adjust_for_backend(backend);
+    let model_name = match backend {
+        InferenceBackend::Api => std::env::var("EMBEDDING_MODEL_ID").unwrap_or_default(),
+        InferenceBackend::OnnxJina(_) => vera_core::local_models::configured_local_model_name(),
+        InferenceBackend::PotionCode => {
+            vera_core::local_models::potion_code_model_name().to_string()
+        }
+    };
+    let endpoint = match backend {
+        InferenceBackend::Api => std::env::var("EMBEDDING_MODEL_BASE_URL").unwrap_or_default(),
+        _ => String::new(),
+    };
+    let query_prefix = match backend {
+        InferenceBackend::Api => std::env::var("EMBEDDING_QUERY_PREFIX").unwrap_or_default(),
+        InferenceBackend::OnnxJina(_) => {
+            std::env::var(vera_core::local_models::LOCAL_EMBEDDING_QUERY_PREFIX_ENV)
+                .or_else(|_| std::env::var("VERA_EMBEDDING_QUERY_PREFIX"))
+                .unwrap_or_default()
+        }
+        InferenceBackend::PotionCode => String::new(),
+    };
+    let provider_identity = format!(
+        "{backend}|endpoint={endpoint}|model={model_name}|query_prefix={query_prefix}|timeout={}|retries={}|gpu_mem_limit={}|low_vram={}",
+        config.embedding.timeout_secs,
+        config.embedding.max_retries,
+        config.embedding.gpu_mem_limit_mb,
+        config.embedding.low_vram,
+    );
+    Ok(WatchRuntime {
+        config,
+        backend,
+        provider_identity,
     })
 }
 
@@ -262,7 +356,7 @@ fn is_relevant_change(
     exclusions: &ExclusionMatcher,
     tracked_paths: &HashSet<std::path::PathBuf>,
 ) -> bool {
-    !exclusions.is_excluded(path) || tracked_paths.contains(path)
+    !exclusions.is_excluded(path) || path.is_dir() || tracked_paths.contains(path)
 }
 
 /// Describe a failed `watch()` call, with the remedy for the one failure mode
@@ -284,12 +378,15 @@ fn watch_failure_message(repo_path: &Path, error: &notify::Error) -> String {
 fn run_incremental_update(
     engine: &SharedEngine,
     repo_path: &Path,
+    runtime: &WatchRuntime,
     updating: &AtomicBool,
     progress_logs: bool,
 ) {
     debug!(path = %repo_path.display(), "Auto-update triggered by file changes");
 
-    let result = engine.get().and_then(|engine| engine.update(repo_path));
+    let result = engine
+        .get(runtime)
+        .and_then(|engine| engine.update(repo_path, &runtime.config));
 
     match result {
         Ok(summary) => {
@@ -345,7 +442,11 @@ mod tests {
     }
 
     impl IncrementalUpdate for CountingEngine {
-        fn update(&self, _repo_path: &Path) -> Result<UpdateSummary, anyhow::Error> {
+        fn update(
+            &self,
+            _repo_path: &Path,
+            _config: &VeraConfig,
+        ) -> Result<UpdateSummary, anyhow::Error> {
             self.updates.fetch_add(1, Ordering::SeqCst);
             Ok(UpdateSummary {
                 files_modified: 0,
@@ -380,7 +481,11 @@ mod tests {
     }
 
     impl IncrementalUpdate for IndexingEngine {
-        fn update(&self, repo_path: &Path) -> Result<UpdateSummary, anyhow::Error> {
+        fn update(
+            &self,
+            repo_path: &Path,
+            _config: &VeraConfig,
+        ) -> Result<UpdateSummary, anyhow::Error> {
             self.runtime.block_on(update_repository(
                 repo_path,
                 &TestProvider,
@@ -391,7 +496,7 @@ mod tests {
     }
 
     fn indexing_builder(config: VeraConfig) -> EngineBuilder {
-        Arc::new(move || {
+        Arc::new(move |_| {
             Ok(Arc::new(IndexingEngine {
                 runtime: tokio::runtime::Runtime::new()?,
                 config: config.clone(),
@@ -406,7 +511,7 @@ mod tests {
     }
 
     fn counting_builder(builds: Arc<AtomicUsize>, updates: Arc<AtomicUsize>) -> EngineBuilder {
-        Arc::new(move || {
+        Arc::new(move |_| {
             builds.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(CountingEngine {
                 updates: Arc::clone(&updates),
@@ -468,6 +573,34 @@ mod tests {
             1,
             "the engine must be built once and reused, not rebuilt per cycle"
         );
+    }
+
+    #[test]
+    fn engine_rebuilds_when_provider_identity_changes() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let updates = Arc::new(AtomicUsize::new(0));
+        let shared = SharedEngine {
+            build: counting_builder(Arc::clone(&builds), Arc::clone(&updates)),
+            cached: Mutex::new(None),
+        };
+        let runtime_a = WatchRuntime {
+            config: VeraConfig::default(),
+            backend: InferenceBackend::Api,
+            provider_identity: "model-a".to_string(),
+        };
+
+        let first = shared.get(&runtime_a).expect("first engine");
+        let reused = shared.get(&runtime_a).expect("reused engine");
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        let runtime_b = WatchRuntime {
+            provider_identity: "model-b".to_string(),
+            ..runtime_a
+        };
+        let rebuilt = shared.get(&runtime_b).expect("rebuilt engine");
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[test]
