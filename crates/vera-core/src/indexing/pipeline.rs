@@ -671,9 +671,10 @@ fn store_index(
     // crash or a Ctrl-C in that window with a complete metadata store, current
     // hashes and a missing or half-built vector/BM25 store, which
     // `detect_staleness` cannot see and `vera update` skips. `metadata_store`
-    // was cleared above, hashes and index metadata included, so writing them
-    // last means a kill anywhere in this window leaves both absent, every file
-    // reads as new and the next run reprocesses. `update.rs` keeps the same
+    // was cleared above, hashes and index metadata included, so a failure
+    // before final publication leaves both absent, every file reads as new and
+    // the next run reprocesses. A failure during the final metadata writes can
+    // happen only after both stores are complete. `update.rs` keeps the same
     // order.
     metadata_store
         .set_file_hashes_batch(file_hashes)
