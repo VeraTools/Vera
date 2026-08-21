@@ -64,7 +64,7 @@ pub(crate) fn resolve_indexed_path(canonical_root: &Path, relative: &str) -> Opt
     let shape_ok = !relative.is_empty()
         && path
             .components()
-            .all(|component| matches!(component, Component::Normal(_)));
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
 
     let containment = if shape_ok {
         resolve_within(canonical_root, &canonical_root.join(path))
@@ -117,6 +117,15 @@ mod tests {
         let f = fixture();
         let resolved = resolve_indexed_path(&f.root, "src/lib.rs").unwrap();
         assert_eq!(resolved, f.root.join("src/lib.rs"));
+    }
+
+    #[test]
+    fn cur_dir_components_in_stored_path_resolve_inside_the_root() {
+        let f = fixture();
+        for relative in ["./src/lib.rs", "src/./lib.rs"] {
+            let resolved = resolve_indexed_path(&f.root, relative).unwrap();
+            assert_eq!(resolved, f.root.join("src/lib.rs"));
+        }
     }
 
     #[test]
