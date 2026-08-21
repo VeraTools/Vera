@@ -12,19 +12,9 @@ pub fn run(
     config: VeraConfig,
     idle_timeout_secs: i64,
 ) -> Result<()> {
-    let idle_timeout = match idle_timeout_secs {
-        0 => None,
-        -1 => Some(std::time::Duration::MAX),
-        n if n > 0 => Some(std::time::Duration::from_secs(n as u64)),
-        _ => None,
-    };
+    let cache_mode = vera_serve::CacheMode::from_idle_timeout_secs(idle_timeout_secs);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(vera_serve::run_server(
-        config,
-        backend,
-        api_key,
-        host,
-        port,
-        idle_timeout,
+        config, backend, api_key, host, port, cache_mode,
     ))
 }

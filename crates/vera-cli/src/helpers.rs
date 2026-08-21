@@ -66,16 +66,13 @@ pub fn load_runtime_config() -> anyhow::Result<vera_core::config::VeraConfig> {
 
 pub fn warn_if_index_stale(repo_path: &Path, indexing_config: &vera_core::config::IndexingConfig) {
     match vera_core::indexing::detect_staleness(repo_path, indexing_config) {
-        Ok(freshness) if freshness.is_stale() => {
-            let stderr = std::io::stderr();
-            let mut err = stderr.lock();
-            let _ = writeln!(
-                err,
-                "warning: index may be stale: {}. Search and grep only cover indexed files. Run `vera update .` or `vera watch .`.",
-                freshness.summary()
-            );
+        Ok(freshness) => {
+            if let Some(warning) = freshness.stale_warning() {
+                let stderr = std::io::stderr();
+                let mut err = stderr.lock();
+                let _ = writeln!(err, "{warning}");
+            }
         }
-        Ok(_) => {}
         Err(err) => {
             tracing::debug!(error = %err, "failed to check index freshness");
         }
@@ -339,13 +336,13 @@ pub fn output_results(
     compact: bool,
     budget: usize,
 ) {
-    use vera_core::parsing::signatures::extract_signature;
+    use vera_core::parsing::signatures::extract_signature_for_path;
 
     // When compact mode is on, pre-compute signature-only content for each result.
     let compacted: Vec<String> = if compact {
         results
             .iter()
-            .map(|r| extract_signature(&r.content, r.language))
+            .map(|r| extract_signature_for_path(&r.content, r.language, &r.file_path))
             .collect()
     } else {
         Vec::new()

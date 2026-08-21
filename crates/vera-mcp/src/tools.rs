@@ -37,12 +37,12 @@ fn compact_results_json(
     budget: usize,
     signatures_only: bool,
 ) -> Result<String, serde_json::Error> {
-    use vera_core::parsing::signatures::extract_signature;
+    use vera_core::parsing::signatures::extract_signature_for_path;
 
     let signatures: Vec<String> = if signatures_only {
         results
             .iter()
-            .map(|r| extract_signature(&r.content, r.language))
+            .map(|r| extract_signature_for_path(&r.content, r.language, &r.file_path))
             .collect()
     } else {
         Vec::new()
@@ -84,6 +84,15 @@ fn compact_results_json(
         });
     }
     serde_json::to_string(&compact)
+}
+
+/// Wrap serialized results in a tool result, attaching a stale-index notice
+/// when the working tree has drifted from the index.
+///
+/// The notice rides in its own content block, so it stays outside
+/// `MCP_OUTPUT_BUDGET` and cannot silently evict results.
+fn results_with_staleness(cwd: &std::path::Path, json: String) -> ToolCallResult {
+    ToolCallResult::success_with_notice(json, crate::staleness::notice_for_repo(cwd))
 }
 
 /// Git-scope filter properties shared by tool schemas: `changed`, `since`,
@@ -543,9 +552,10 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
             }
         }
     }
+    let queries = vera_core::retrieval::normalize_queries(&queries);
     if queries.is_empty() {
         return ToolCallResult::error(
-            "Missing required parameter: provide 'query' (string) or 'queries' (array)",
+            "Missing required parameter: provide a non-empty 'query' (string) or 'queries' (array)",
         );
     }
 
@@ -588,14 +598,16 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
         Err(err) => return err,
     };
 
-    // Run each query, collect all results.
-    let mut all_results: Vec<vera_core::types::SearchResult> = Vec::new();
+    // Run each query. A multi-query search over-fetches per query so fusion has
+    // candidates to merge; a single query is already at its final width.
     let per_query_limit = if queries.len() > 1 {
-        result_limit.max(10)
+        vera_core::retrieval::multi_query_candidate_limit(result_limit)
     } else {
         result_limit
     };
 
+    let mut result_sets: Vec<Vec<vera_core::types::SearchResult>> =
+        Vec::with_capacity(queries.len());
     for query in &queries {
         // Pass the raw query plus the optional intent. Core applies the intent
         // only to the semantic (embedding/rerank) side; BM25 gets the raw query
@@ -608,15 +620,26 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
             &filters,
             per_query_limit,
         )) {
-            Ok((results, _timings)) => all_results.extend(results),
+            Ok((results, _timings)) => result_sets.push(results),
             Err(e) => return ToolCallResult::error(format!("Search failed: {e}")),
         }
     }
 
-    // Deduplicate by (file_path, line_start, line_end), keeping first occurrence.
-    let mut seen = std::collections::HashSet::new();
-    all_results.retain(|r| seen.insert(format!("{}:{}:{}", r.file_path, r.line_start, r.line_end)));
-    all_results.truncate(result_limit);
+    let all_results = if result_sets.len() == 1 {
+        result_sets.remove(0)
+    } else {
+        match fuse_multi_query_results(
+            &index_dir,
+            &queries,
+            &result_sets,
+            &filters,
+            config.retrieval.rrf_k,
+            result_limit,
+        ) {
+            Ok(results) => results,
+            Err(e) => return ToolCallResult::error(format!("Search failed: {e}")),
+        }
+    };
 
     let signatures_only = args
         .get("compact")
@@ -624,9 +647,33 @@ fn handle_search_code(args: &Value) -> ToolCallResult {
         .unwrap_or(false);
 
     match compact_results_json(&all_results, MCP_OUTPUT_BUDGET, signatures_only) {
-        Ok(json) => ToolCallResult::success(json),
+        Ok(json) => results_with_staleness(&cwd, json),
         Err(e) => ToolCallResult::error(format!("Failed to serialize results: {e}")),
     }
+}
+
+/// Merge per-query result sets the way `vera search` does.
+///
+/// Reciprocal rank fusion over the full candidate pool, then exact-match
+/// augmentation, and only then the cut to `result_limit`. Concatenating instead
+/// would hand the whole window to the first query and drop the rest.
+fn fuse_multi_query_results(
+    index_dir: &std::path::Path,
+    queries: &[String],
+    result_sets: &[Vec<vera_core::types::SearchResult>],
+    filters: &vera_core::types::SearchFilters,
+    rrf_k: f64,
+    result_limit: usize,
+) -> anyhow::Result<Vec<vera_core::types::SearchResult>> {
+    vera_core::retrieval::fuse_and_augment_multi_query(
+        index_dir,
+        queries,
+        result_sets,
+        filters,
+        rrf_k,
+        vera_core::retrieval::multi_query_candidate_limit(result_limit),
+        result_limit,
+    )
 }
 
 fn ensure_index_and_watcher(cwd: &std::path::Path) -> Result<std::path::PathBuf, ToolCallResult> {
@@ -767,7 +814,7 @@ fn handle_get_overview(args: &Value) -> ToolCallResult {
     };
     match vera_core::stats::collect_overview_filtered(&repo_path, exact_paths.as_ref()) {
         Ok(overview) => match serde_json::to_string_pretty(&overview) {
-            Ok(json) => ToolCallResult::success(json),
+            Ok(json) => results_with_staleness(&repo_path, json),
             Err(e) => ToolCallResult::error(format!("Failed to serialize overview: {e}")),
         },
         Err(e) => ToolCallResult::error(format!("Failed to collect overview: {e}")),
@@ -828,7 +875,7 @@ fn handle_regex_search(args: &Value) -> ToolCallResult {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             match compact_results_json(&results, MCP_OUTPUT_BUDGET, signatures_only) {
-                Ok(json) => ToolCallResult::success(json),
+                Ok(json) => results_with_staleness(&cwd, json),
                 Err(e) => ToolCallResult::error(format!("Failed to serialize results: {e}")),
             }
         }
@@ -880,7 +927,7 @@ fn handle_structural_search(args: &Value) -> ToolCallResult {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             match compact_results_json(&results, MCP_OUTPUT_BUDGET, signatures_only) {
-                Ok(json) => ToolCallResult::success(json),
+                Ok(json) => results_with_staleness(&cwd, json),
                 Err(e) => ToolCallResult::error(format!("Failed to serialize results: {e}")),
             }
         }
@@ -926,7 +973,7 @@ fn handle_find_references(args: &Value) -> ToolCallResult {
                 }
                 results.truncate(limit);
                 match serde_json::to_string(&results) {
-                    Ok(json) => ToolCallResult::success(json),
+                    Ok(json) => results_with_staleness(&cwd, json),
                     Err(err) => {
                         ToolCallResult::error(format!("Failed to serialize references: {err}"))
                     }
@@ -948,7 +995,7 @@ fn handle_find_references(args: &Value) -> ToolCallResult {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 match compact_results_json(&results, MCP_OUTPUT_BUDGET, signatures_only) {
-                    Ok(json) => ToolCallResult::success(json),
+                    Ok(json) => results_with_staleness(&cwd, json),
                     Err(err) => {
                         ToolCallResult::error(format!("Failed to serialize references: {err}"))
                     }
@@ -1002,6 +1049,41 @@ fn handle_explain_path(args: &Value) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_support::repo_indexed_as;
+
+    #[test]
+    fn stale_index_result_carries_the_warning_after_the_results() {
+        let dir = repo_indexed_as("pub fn current() {}\n", "pub fn previous() {}\n");
+        let results = r#"[{"file_path":"src/lib.rs"}]"#;
+
+        let result = results_with_staleness(dir.path(), results.to_string());
+
+        assert!(!result.is_error);
+        assert_eq!(
+            result.content.len(),
+            2,
+            "stale index must add a notice block, got {:?}",
+            result.content
+        );
+        assert_eq!(result.content[0].text, results);
+        assert_eq!(
+            result.content[1].text,
+            "warning: index may be stale: 1 modified. \
+             Search and grep only cover indexed files. \
+             Run `vera update .` or `vera watch .`."
+        );
+    }
+
+    #[test]
+    fn fresh_index_result_is_a_single_results_block() {
+        let dir = repo_indexed_as("pub fn current() {}\n", "pub fn current() {}\n");
+        let results = r#"[{"file_path":"src/lib.rs"}]"#;
+        let result = results_with_staleness(dir.path(), results.to_string());
+
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].text, results);
+    }
 
     #[test]
     fn tool_definitions_has_seven_tools() {
@@ -1095,6 +1177,51 @@ mod tests {
         );
         // Should fail (either auto-index fails or embedding provider fails).
         assert!(result.is_error);
+    }
+
+    fn stub_result(name: &str) -> vera_core::types::SearchResult {
+        vera_core::types::SearchResult {
+            file_path: format!("src/{name}.rs"),
+            line_start: 1,
+            line_end: 10,
+            content: format!("fn {name}() {{}}"),
+            language: vera_core::types::Language::Rust,
+            score: 1.0,
+            symbol_name: Some(name.to_string()),
+            symbol_type: None,
+        }
+    }
+
+    #[test]
+    fn multi_query_fusion_keeps_hits_the_first_query_buried() {
+        // Query 1 returns more hits than the caller's limit, so a concatenating
+        // merge fills the window before query 2 is ever read.
+        let first: Vec<_> = (1..=10).map(|i| stub_result(&format!("a{i}"))).collect();
+        // Query 2's top hit is `a8`, which query 1 ranked 8th, followed by three
+        // files query 1 never returned at all.
+        let second: Vec<_> = std::iter::once(stub_result("a8"))
+            .chain((1..=3).map(|i| stub_result(&format!("b{i}"))))
+            .collect();
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let queries = vec!["alpha".to_string(), "beta".to_string()];
+        let fused = fuse_multi_query_results(
+            index_dir.path(),
+            &queries,
+            &[first, second],
+            &vera_core::types::SearchFilters::default(),
+            60.0,
+            5,
+        )
+        .unwrap();
+        let paths: Vec<&str> = fused.iter().map(|r| r.file_path.as_str()).collect();
+
+        // Ranked by both queries, so it outscores every hit only one query found.
+        assert_eq!(paths.first(), Some(&"src/a8.rs"), "fused: {paths:?}");
+        // Query 2 only: reachable solely through fusion.
+        assert!(paths.contains(&"src/b1.rs"), "fused: {paths:?}");
+        // Query 1's 5th hit: inside a concatenated window, outranked after fusion.
+        assert!(!paths.contains(&"src/a5.rs"), "fused: {paths:?}");
     }
 
     #[test]

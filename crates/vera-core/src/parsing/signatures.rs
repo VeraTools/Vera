@@ -8,7 +8,7 @@ use tree_sitter::Parser;
 
 use crate::types::Language;
 
-use super::languages::tree_sitter_grammar;
+use super::languages::tree_sitter_grammar_for_path;
 
 /// Body node kinds per language family. The first match wins.
 fn body_node_kinds(lang: Language) -> &'static [&'static str] {
@@ -84,8 +84,8 @@ fn body_placeholder(lang: Language) -> &'static str {
 ///
 /// Returns `None` if the language has no grammar, parsing fails, or no
 /// body node is found (caller should use the fallback).
-fn extract_signature_inner(content: &str, lang: Language) -> Option<String> {
-    let grammar = tree_sitter_grammar(lang)?;
+fn extract_signature_inner(content: &str, lang: Language, file_path: &str) -> Option<String> {
+    let grammar = tree_sitter_grammar_for_path(lang, file_path)?;
     let kinds = body_node_kinds(lang);
     if kinds.is_empty() {
         return None;
@@ -145,12 +145,26 @@ fn first_n_lines(content: &str, max_lines: usize) -> String {
     out
 }
 
-/// Extract a compact signature from a search result's content.
+/// Extract a compact signature from a code snippet using the language grammar.
+///
+/// This preserves the original public API. Call [`extract_signature_for_path`]
+/// when the source path is available and the grammar dialect may depend on its
+/// extension.
+pub fn extract_signature(content: &str, lang: Language) -> String {
+    extract_signature_inner(content, lang, "").unwrap_or_else(|| first_n_lines(content, 3))
+}
+
+/// Extract a compact signature using the grammar selected for `file_path`.
 ///
 /// Tries tree-sitter body stripping first. Falls back to first 3 lines
 /// for unsupported languages or non-symbol chunks.
-pub fn extract_signature(content: &str, lang: Language) -> String {
-    extract_signature_inner(content, lang).unwrap_or_else(|| first_n_lines(content, 3))
+///
+/// `file_path` selects the grammar dialect, the same way indexing does: a
+/// `.tsx` file must be parsed with the tsx grammar. Parsing JSX with the plain
+/// TypeScript grammar can fail to locate the body at all, in which case this
+/// silently degrades to the raw first-three-lines fallback.
+pub fn extract_signature_for_path(content: &str, lang: Language, file_path: &str) -> String {
+    extract_signature_inner(content, lang, file_path).unwrap_or_else(|| first_n_lines(content, 3))
 }
 
 #[cfg(test)]
@@ -162,6 +176,32 @@ mod tests {
         let code = "export interface Repo extends Base {\n    get(id: string): Item;\n}\n";
         let sig = extract_signature(code, Language::TypeScript);
         assert_eq!(sig, "export interface Repo extends Base { ... }");
+    }
+
+    #[test]
+    fn tsx_signature_uses_the_tsx_grammar() {
+        // JSX ahead of a declaration derails the plain TypeScript grammar
+        // badly enough that no body node is found within the depth limit, so
+        // `extract_signature` silently degrades to the raw first-three-lines
+        // fallback instead of a stripped signature. Selecting the grammar by
+        // path, as indexing does, keeps it working.
+        let code = "const A = <p>{ q }</p>;\nfunction Later(x: number) {\n  return x;\n}\n";
+
+        let tsx = extract_signature_for_path(code, Language::TypeScript, "Widget.tsx");
+        assert_eq!(
+            tsx,
+            "const A = <p>{ q }</p>;\nfunction Later(x: number) { ... }"
+        );
+
+        // The same content under a .ts path keeps the old behaviour, which is
+        // correct: there the angle brackets really are type syntax. Assert the
+        // exact `first_n_lines` output rather than merely "not the tsx one" —
+        // a differently malformed signature would satisfy a negative check.
+        let ts = extract_signature_for_path(code, Language::TypeScript, "Widget.ts");
+        assert_eq!(
+            ts,
+            "const A = <p>{ q }</p>;\nfunction Later(x: number) {\n  return x;\n[... 1 more lines]"
+        );
     }
 
     #[test]
