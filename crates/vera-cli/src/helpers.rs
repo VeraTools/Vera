@@ -335,13 +335,13 @@ pub fn output_results(
     compact: bool,
     budget: usize,
 ) {
-    use vera_core::parsing::signatures::extract_signature;
+    use vera_core::parsing::signatures::extract_signature_for_path;
 
     // When compact mode is on, pre-compute signature-only content for each result.
     let compacted: Vec<String> = if compact {
         results
             .iter()
-            .map(|r| extract_signature(&r.content, r.language))
+            .map(|r| extract_signature_for_path(&r.content, r.language, &r.file_path))
             .collect()
     } else {
         Vec::new()

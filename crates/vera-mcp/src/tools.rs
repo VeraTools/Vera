@@ -37,12 +37,12 @@ fn compact_results_json(
     budget: usize,
     signatures_only: bool,
 ) -> Result<String, serde_json::Error> {
-    use vera_core::parsing::signatures::extract_signature;
+    use vera_core::parsing::signatures::extract_signature_for_path;
 
     let signatures: Vec<String> = if signatures_only {
         results
             .iter()
-            .map(|r| extract_signature(&r.content, r.language))
+            .map(|r| extract_signature_for_path(&r.content, r.language, &r.file_path))
             .collect()
     } else {
         Vec::new()
