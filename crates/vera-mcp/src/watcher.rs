@@ -4,6 +4,7 @@
 //! index updates after a debounce period. This keeps the index fresh
 //! without requiring manual update calls.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ use tracing::{debug, info, warn};
 use vera_core::config::IndexingConfig;
 use vera_core::discovery::ExclusionMatcher;
 use vera_core::indexing::UpdateSummary;
+use vera_core::storage::metadata::MetadataStore;
 
 /// Debounce interval: wait this long after the last file change before updating.
 const DEBOUNCE_SECS: u64 = 2;
@@ -163,6 +165,7 @@ fn start_watching_with(
     // re-triggers itself. `no_default_excludes`, or a stored `default_excludes`
     // without `.vera`, would switch that guard off.
     let index_dir = idx_dir.clone();
+    let tracked_paths = load_tracked_paths(&idx_dir, &repo_path);
 
     let updating = Arc::new(AtomicBool::new(false));
     let updating_clone = updating.clone();
@@ -190,7 +193,7 @@ fn start_watching_with(
             let has_relevant_changes = events.iter().any(|e| {
                 e.kind == DebouncedEventKind::Any
                     && !e.path.starts_with(&index_dir)
-                    && !exclusions.is_excluded(&e.path)
+                    && is_relevant_change(&e.path, &exclusions, &tracked_paths)
             });
 
             if !has_relevant_changes {
@@ -237,6 +240,29 @@ fn start_watching_with(
         _watcher: debouncer,
         updating,
     })
+}
+
+fn load_tracked_paths(idx_dir: &Path, repo_path: &Path) -> HashSet<std::path::PathBuf> {
+    let metadata_path = idx_dir.join("metadata.db");
+    let Ok(metadata) = MetadataStore::open(&metadata_path) else {
+        return HashSet::new();
+    };
+    metadata
+        .tracked_files()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| repo_path.join(path))
+        .collect()
+}
+
+/// Keep excluded descendants quiet, but let a path that was indexed before it
+/// became excluded reach the incremental scan so its old rows can be purged.
+fn is_relevant_change(
+    path: &Path,
+    exclusions: &ExclusionMatcher,
+    tracked_paths: &HashSet<std::path::PathBuf>,
+) -> bool {
+    !exclusions.is_excluded(path) || tracked_paths.contains(path)
 }
 
 /// Describe a failed `watch()` call, with the remedy for the one failure mode
@@ -302,7 +328,13 @@ fn run_incremental_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::atomic::AtomicUsize;
+
+    use vera_core::config::VeraConfig;
+    use vera_core::embedding::{EmbeddingError, EmbeddingProvider};
+    use vera_core::indexing::{index_repository, update_repository};
+    use vera_core::storage::metadata::MetadataStore;
 
     const TEST_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -328,6 +360,49 @@ mod tests {
                 elapsed_secs: 0.0,
             })
         }
+    }
+
+    struct TestProvider;
+
+    impl EmbeddingProvider for TestProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(texts.iter().map(|_| vec![0.0; 8]).collect())
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(8)
+        }
+    }
+
+    struct IndexingEngine {
+        runtime: tokio::runtime::Runtime,
+        config: VeraConfig,
+    }
+
+    impl IncrementalUpdate for IndexingEngine {
+        fn update(&self, repo_path: &Path) -> Result<UpdateSummary, anyhow::Error> {
+            self.runtime.block_on(update_repository(
+                repo_path,
+                &TestProvider,
+                &self.config,
+                "test-model",
+            ))
+        }
+    }
+
+    fn indexing_builder(config: VeraConfig) -> EngineBuilder {
+        Arc::new(move || {
+            Ok(Arc::new(IndexingEngine {
+                runtime: tokio::runtime::Runtime::new()?,
+                config: config.clone(),
+            }) as Engine)
+        })
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .block_on(future)
     }
 
     fn counting_builder(builds: Arc<AtomicUsize>, updates: Arc<AtomicUsize>) -> EngineBuilder {
@@ -481,6 +556,53 @@ mod tests {
             updates.load(Ordering::SeqCst),
             1,
             "writes into the index directory must never trigger an update cycle"
+        );
+    }
+
+    #[test]
+    fn replacing_indexed_file_with_excluded_directory_purges_chunks() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let target = repo.path().join("target");
+        std::fs::write(&target, "fn stale_target_symbol() {}\n").expect("write source");
+        let config = VeraConfig::default();
+
+        block_on(index_repository(
+            repo.path(),
+            &TestProvider,
+            &config,
+            "test-model",
+        ))
+        .expect("initial index");
+
+        let index_dir = vera_core::indexing::index_dir(&repo.path().canonicalize().unwrap());
+        let metadata = MetadataStore::open(&index_dir.join("metadata.db")).expect("metadata");
+        assert!(
+            !metadata
+                .get_chunks_by_file("target")
+                .expect("initial chunks")
+                .is_empty(),
+            "the regular file must be indexed before the transition"
+        );
+
+        let indexing = config.indexing.clone();
+        let _handle = start_watching_with(
+            repo.path(),
+            false,
+            TEST_DEBOUNCE,
+            &indexing,
+            indexing_builder(config),
+        )
+        .expect("watcher starts");
+
+        std::fs::remove_file(&target).expect("remove source");
+        std::fs::create_dir(&target).expect("replace with excluded directory");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || metadata
+                .get_chunks_by_file("target")
+                .expect("chunks after update")
+                .is_empty()),
+            "the directory transition must trigger an update that purges stale chunks"
         );
     }
 }
