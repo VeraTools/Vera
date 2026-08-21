@@ -54,8 +54,9 @@ pub async fn create_dynamic_reranker(
                 let cfg = cfg
                     .with_timeout(Duration::from_secs(30))
                     .with_max_retries(2);
-                let p = ApiReranker::new(cfg, config.retrieval.max_rerank_batch)
-                    .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
+                let p =
+                    ApiReranker::new_with_max_rerank_batch(cfg, config.retrieval.max_rerank_batch)
+                        .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
                 return Ok(Some(DynamicReranker::Api(p)));
             }
             let p = LocalReranker::new_with_ep(ep)
@@ -69,8 +70,9 @@ pub async fn create_dynamic_reranker(
                 let cfg = cfg
                     .with_timeout(Duration::from_secs(30))
                     .with_max_retries(2);
-                let p = ApiReranker::new(cfg, config.retrieval.max_rerank_batch)
-                    .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
+                let p =
+                    ApiReranker::new_with_max_rerank_batch(cfg, config.retrieval.max_rerank_batch)
+                        .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
                 Ok(Some(DynamicReranker::Api(p)))
             }
             Err(_) => Ok(None),

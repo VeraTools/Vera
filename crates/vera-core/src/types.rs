@@ -675,7 +675,12 @@ impl<'de> Deserialize<'de> for Language {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let name = String::deserialize(deserializer)?;
-        name.parse().map_err(|()| {
+        let language = if name == "dlang" {
+            Ok(Self::DLang)
+        } else {
+            name.parse()
+        };
+        language.map_err(|()| {
             serde::de::Error::invalid_value(
                 serde::de::Unexpected::Str(&name),
                 &"a language name accepted by --lang",
@@ -853,6 +858,16 @@ mod tests {
         assert_eq!(Language::Rust.to_string(), "rust");
         assert_eq!(Language::TypeScript.to_string(), "typescript");
         assert_eq!(Language::Unknown.to_string(), "unknown");
+    }
+
+    #[test]
+    fn language_legacy_dlang_json_alias_preserves_canonical_wire_name() {
+        assert_eq!(
+            serde_json::from_str::<Language>(r#""dlang""#).unwrap(),
+            Language::DLang
+        );
+        assert_eq!(serde_json::to_string(&Language::DLang).unwrap(), r#""d""#);
+        assert!("dlang".parse::<Language>().is_err());
     }
 
     #[test]
