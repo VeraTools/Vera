@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::chunk_text;
+use crate::local_models::CODERANK_QUERY_PREFIX;
 use crate::types::Chunk;
 
 // ── Error types ──────────────────────────────────────────────────────
@@ -193,7 +194,9 @@ fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
     if id.contains("qwen3-embedding") || id.contains("qwen3_embedding") {
         Some("Instruct: Given a code search query, retrieve relevant code snippets that match the query\nQuery: ".into())
     } else if id.contains("coderankembed") {
-        Some("Represent this query for retrieving relevant code: ".into())
+        // `prepare_query_text` concatenates without a separator, so the
+        // trailing space belongs here rather than in the shared constant.
+        Some(format!("{CODERANK_QUERY_PREFIX} "))
     } else if id.contains("e5-") || id.contains("e5_") {
         Some("query: ".into())
     } else if id.contains("bge-") || id.contains("bge_") {
@@ -1356,8 +1359,53 @@ mod tests {
     #[test]
     fn auto_detect_coderankembed_prefix() {
         let prefix = default_query_prefix_for_model("krlvi/CodeRankEmbed");
-        assert!(prefix.is_some());
-        assert!(prefix.unwrap().contains("Represent this query"));
+        // Exact: the published prompt in the model's
+        // `config_sentence_transformers.json`, trailing space included.
+        assert_eq!(
+            prefix.as_deref(),
+            Some("Represent this query for searching relevant code: ")
+        );
+    }
+
+    /// The local ONNX path and the API path must embed the same query
+    /// identically. They apply the prefix differently (`query_text` trims the
+    /// *prefix* and rejoins it with one space, `prepare_query_text`
+    /// concatenates a prefix that already carries its own trailing space), so
+    /// this pins the resulting text rather than the constant.
+    ///
+    /// Neither path touches the query itself, so an un-normalized query has to
+    /// survive verbatim and identically on both sides; that case is covered
+    /// here so a one-sided `trim()` cannot be added without failing.
+    #[test]
+    fn coderankembed_query_text_matches_across_local_and_api_paths() {
+        let cases = [
+            (
+                "find router code",
+                "Represent this query for searching relevant code: find router code",
+            ),
+            (
+                "  find router code  ",
+                "Represent this query for searching relevant code:   find router code  ",
+            ),
+        ];
+
+        for (query, expected) in cases {
+            let local =
+                crate::local_models::LocalEmbeddingModelConfig::coderankembed().query_text(query);
+
+            let mut config = EmbeddingProviderConfig::new(
+                "http://x".into(),
+                "krlvi/CodeRankEmbed".into(),
+                "k".into(),
+            );
+            config.query_prefix = default_query_prefix_for_model(&config.model_id);
+            let api = OpenAiProvider::new(config)
+                .unwrap()
+                .prepare_query_text(query);
+
+            assert_eq!(local, api, "paths diverged on {query:?}");
+            assert_eq!(local, expected, "unexpected prefixed text for {query:?}");
+        }
     }
 
     #[test]

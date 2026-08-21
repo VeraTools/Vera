@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_env::EnvVarGuard;
 use crate::types::{Language, SymbolType};
 
 /// Helper to create a SearchResult with given parameters.
@@ -46,6 +47,20 @@ fn config_with_timeout() {
     )
     .with_timeout(Duration::from_secs(10));
     assert_eq!(config.timeout, Duration::from_secs(10));
+}
+
+#[test]
+fn api_reranker_legacy_constructor_uses_environment_batch_size() {
+    let _env = EnvVarGuard::set(&[("VERA_MAX_RERANK_BATCH", "7")]);
+    let config = RerankerConfig::new(
+        "https://api.example.com/v1".to_string(),
+        "model-1".to_string(),
+        "key-123".to_string(),
+    );
+
+    let reranker = ApiReranker::new(config).unwrap();
+
+    assert_eq!(reranker.max_rerank_batch, 7);
 }
 
 #[test]
@@ -330,7 +345,7 @@ fn endpoint_url_builds_correctly() {
         "model".to_string(),
         "key".to_string(),
     );
-    let reranker = ApiReranker::new(config).unwrap();
+    let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
     assert_eq!(
         reranker.endpoint_url(),
         "https://api.siliconflow.com/v1/rerank"
@@ -344,7 +359,7 @@ fn endpoint_url_strips_trailing_slash() {
         "model".to_string(),
         "key".to_string(),
     );
-    let reranker = ApiReranker::new(config).unwrap();
+    let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
     assert_eq!(
         reranker.endpoint_url(),
         "https://api.siliconflow.com/v1/rerank"
@@ -387,7 +402,7 @@ async fn api_reranker_unreachable_endpoint() {
     .with_timeout(Duration::from_millis(500))
     .with_max_retries(0);
 
-    let reranker = ApiReranker::new(config).unwrap();
+    let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
     let result = reranker.rerank("test", &["document".to_string()]).await;
 
     assert!(result.is_err());
@@ -412,19 +427,25 @@ fn voyage_base_url_detection() {
 
 #[test]
 fn api_reranker_detects_voyage() {
-    let voyage = ApiReranker::new(RerankerConfig::new(
-        "https://api.voyageai.com/v1".to_string(),
-        "rerank-2".to_string(),
-        "k".to_string(),
-    ))
+    let voyage = ApiReranker::new_with_max_rerank_batch(
+        RerankerConfig::new(
+            "https://api.voyageai.com/v1".to_string(),
+            "rerank-2".to_string(),
+            "k".to_string(),
+        ),
+        20,
+    )
     .unwrap();
     assert!(voyage.is_voyage);
 
-    let other = ApiReranker::new(RerankerConfig::new(
-        "https://api.siliconflow.com/v1".to_string(),
-        "Qwen/Qwen3-Reranker-8B".to_string(),
-        "k".to_string(),
-    ))
+    let other = ApiReranker::new_with_max_rerank_batch(
+        RerankerConfig::new(
+            "https://api.siliconflow.com/v1".to_string(),
+            "Qwen/Qwen3-Reranker-8B".to_string(),
+            "k".to_string(),
+        ),
+        20,
+    )
     .unwrap();
     assert!(!other.is_voyage);
 }

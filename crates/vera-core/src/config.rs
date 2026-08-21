@@ -631,24 +631,7 @@ fn parse_model_alias_groups(value: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn set_env(key: &str, value: &str) {
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-
-    fn remove_env(key: &str) {
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
+    use crate::test_env::EnvVarGuard;
 
     #[test]
     fn default_config_is_valid() {
@@ -667,11 +650,8 @@ mod tests {
 
     #[test]
     fn graph_augmentation_env_accepts_only_truthy_values() {
-        let _guard = env_lock().lock().unwrap();
-        let previous = std::env::var_os("VERA_GRAPH_AUGMENT");
-
         for value in ["1", "true", "TRUE", "yes", "YeS"] {
-            set_env("VERA_GRAPH_AUGMENT", value);
+            let _guard = EnvVarGuard::set(&[("VERA_GRAPH_AUGMENT", value)]);
             assert!(
                 graph_augmentation_enabled(),
                 "{value} should enable the flag"
@@ -679,19 +659,11 @@ mod tests {
         }
 
         for value in ["0", "false", "no", "", "on"] {
-            set_env("VERA_GRAPH_AUGMENT", value);
+            let _guard = EnvVarGuard::set(&[("VERA_GRAPH_AUGMENT", value)]);
             assert!(
                 !graph_augmentation_enabled(),
                 "{value} should disable the flag"
             );
-        }
-
-        if let Some(value) = previous {
-            unsafe {
-                std::env::set_var("VERA_GRAPH_AUGMENT", value);
-            }
-        } else {
-            remove_env("VERA_GRAPH_AUGMENT");
         }
     }
 
@@ -721,21 +693,9 @@ mod tests {
 
     #[test]
     fn max_in_flight_environment_value_normalizes_zero_to_one() {
-        let _guard = env_lock().lock().unwrap();
-        let previous = std::env::var_os("VERA_MAX_IN_FLIGHT_INPUTS");
-        set_env("VERA_MAX_IN_FLIGHT_INPUTS", "0");
+        let _guard = EnvVarGuard::set(&[("VERA_MAX_IN_FLIGHT_INPUTS", "0")]);
 
-        let max_in_flight_inputs = default_max_in_flight_inputs();
-
-        if let Some(value) = previous {
-            unsafe {
-                std::env::set_var("VERA_MAX_IN_FLIGHT_INPUTS", value);
-            }
-        } else {
-            remove_env("VERA_MAX_IN_FLIGHT_INPUTS");
-        }
-
-        assert_eq!(max_in_flight_inputs, 1);
+        assert_eq!(default_max_in_flight_inputs(), 1);
     }
 
     #[test]
@@ -788,31 +748,22 @@ mod tests {
 
     #[test]
     fn resolve_backend_prefers_saved_backend_env() {
-        let _guard = env_lock().lock().unwrap();
-        set_env("VERA_BACKEND", "onnx-jina-cuda");
-        set_env("VERA_LOCAL", "1");
+        let _guard = EnvVarGuard::set(&[("VERA_BACKEND", "onnx-jina-cuda"), ("VERA_LOCAL", "1")]);
 
         assert_eq!(
             resolve_backend(None),
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda)
         );
-
-        remove_env("VERA_BACKEND");
-        remove_env("VERA_LOCAL");
     }
 
     #[test]
     fn resolve_backend_falls_back_to_legacy_local_env() {
-        let _guard = env_lock().lock().unwrap();
-        remove_env("VERA_BACKEND");
-        set_env("VERA_LOCAL", "1");
+        let _guard = EnvVarGuard::apply(&[("VERA_BACKEND", None), ("VERA_LOCAL", Some("1"))]);
 
         assert_eq!(
             resolve_backend(None),
             InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu)
         );
-
-        remove_env("VERA_LOCAL");
     }
 
     /// Shorthand for matching without configured alias groups.
@@ -870,11 +821,10 @@ mod tests {
 
     #[test]
     fn model_names_match_env_alias_group() {
-        let _guard = env_lock().lock().unwrap();
-        set_env(
+        let _guard = EnvVarGuard::set(&[(
             "VERA_EMBEDDING_MODEL_ALIASES",
             "text-embedding-3-large,text-embedding-3-large-2;other,other-prod",
-        );
+        )]);
 
         assert!(model_names_match(
             "text-embedding-3-large",
@@ -885,8 +835,6 @@ mod tests {
             "text-embedding-3-large",
             "text-embedding-3-small"
         ));
-
-        remove_env("VERA_EMBEDDING_MODEL_ALIASES");
     }
 
     #[test]

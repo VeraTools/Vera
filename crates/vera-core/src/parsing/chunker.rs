@@ -93,7 +93,12 @@ pub fn chunks_from_symbols(
             chunk_index += 1;
         }
 
-        covered_end_row = sym_end + 1;
+        // Extractors emit a parent (impl, class, namespace) alongside its
+        // children, and symbols are sorted by start byte, so the parent is
+        // seen first. Advancing monotonically stops a child from rewinding
+        // coverage back inside the parent, which would make every span
+        // between children look like an uncovered gap.
+        covered_end_row = covered_end_row.max(sym_end + 1);
     }
 
     // Trailing gap after last symbol
@@ -584,6 +589,110 @@ mod tests {
         // First chunk should be the gap (imports)
         assert_eq!(chunks[0].symbol_type, Some(SymbolType::Block));
         assert!(chunks[0].content.contains("use std::io"));
+    }
+
+    #[test]
+    fn nested_children_emit_no_gap_chunks() {
+        // Extractors push the `impl` and each of its methods, sorted by start
+        // byte. The span between two methods and the impl's closing brace are
+        // already inside the parent chunk and must not be emitted again.
+        let source = "impl Token {\n    /// Create a token.\n    fn new() -> Self {\n        Self\n    }\n\n    /// Cancel the token.\n    fn cancel(&self) {}\n}\n";
+        let symbols = vec![
+            RawSymbol {
+                name: Some("Token".to_string()),
+                symbol_type: SymbolType::Block,
+                start_byte: 0,
+                end_byte: source.len(),
+                start_row: 0,
+                end_row: 8,
+            },
+            RawSymbol {
+                name: Some("new".to_string()),
+                symbol_type: SymbolType::Method,
+                start_byte: 40,
+                end_byte: 80,
+                start_row: 2,
+                end_row: 4,
+            },
+            RawSymbol {
+                name: Some("cancel".to_string()),
+                symbol_type: SymbolType::Method,
+                start_byte: 110,
+                end_byte: 130,
+                start_row: 7,
+                end_row: 7,
+            },
+        ];
+        let chunks = chunks_from_symbols(
+            &symbols,
+            source,
+            "token.rs",
+            Language::Rust,
+            &default_config(),
+        );
+
+        let names: Vec<_> = chunks.iter().map(|c| c.symbol_name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("Token".to_string()),
+                Some("new".to_string()),
+                Some("cancel".to_string()),
+            ],
+            "only the parent and its two children should be chunked, got {chunks:?}"
+        );
+        assert!(
+            !chunks.iter().any(|c| c.content.trim() == "}"),
+            "the parent's closing brace must not become its own chunk"
+        );
+    }
+
+    #[test]
+    fn gap_after_nested_parent_still_captured() {
+        // Monotonic coverage must not swallow real code that follows the
+        // parent, only the spans the parent already covers.
+        let source = "impl Token {\n    fn new() -> Self {\n        Self\n    }\n}\n\nstatic REGISTRY: &str = \"tokens\";\n";
+        let symbols = vec![
+            RawSymbol {
+                name: Some("Token".to_string()),
+                symbol_type: SymbolType::Block,
+                start_byte: 0,
+                end_byte: 60,
+                start_row: 0,
+                end_row: 4,
+            },
+            RawSymbol {
+                name: Some("new".to_string()),
+                symbol_type: SymbolType::Method,
+                start_byte: 17,
+                end_byte: 55,
+                start_row: 1,
+                end_row: 3,
+            },
+        ];
+        let chunks = chunks_from_symbols(
+            &symbols,
+            source,
+            "token.rs",
+            Language::Rust,
+            &default_config(),
+        );
+
+        let names: Vec<_> = chunks.iter().map(|c| c.symbol_name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![Some("Token".to_string()), Some("new".to_string()), None],
+            "the parent and its child must still be chunked before the trailing gap, got {chunks:?}"
+        );
+
+        let trailing = chunks
+            .iter()
+            .find(|c| c.symbol_name.is_none())
+            .expect("trailing top-level code should still produce a gap chunk");
+        assert_eq!(trailing.symbol_type, Some(SymbolType::Block));
+        assert_eq!(trailing.line_start, 6);
+        assert_eq!(trailing.line_end, 7);
+        assert!(trailing.content.contains("static REGISTRY"));
     }
 
     #[test]

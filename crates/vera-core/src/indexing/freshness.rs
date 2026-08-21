@@ -48,6 +48,19 @@ impl IndexFreshness {
         }
         parts.join(", ")
     }
+
+    /// The stale-index warning shown to users, or `None` when the index covers
+    /// the tree. Single-sourced here because the CLI prints it on stderr and
+    /// the MCP server attaches it to tool results, and the two must agree.
+    pub fn stale_warning(&self) -> Option<String> {
+        if !self.is_stale() {
+            return None;
+        }
+        Some(format!(
+            "warning: index may be stale: {}. Search and grep only cover indexed files. Run `vera update .` or `vera watch .`.",
+            self.summary()
+        ))
+    }
 }
 
 pub(crate) fn record_index_snapshot(
@@ -216,6 +229,26 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn stale_warning_names_every_kind_of_drift() {
+        let freshness = IndexFreshness {
+            files_added: 1,
+            files_modified: 2,
+            files_deleted: 3,
+        };
+        assert_eq!(
+            freshness.stale_warning().unwrap(),
+            "warning: index may be stale: 1 added, 2 modified, 3 deleted. \
+             Search and grep only cover indexed files. \
+             Run `vera update .` or `vera watch .`."
+        );
+    }
+
+    #[test]
+    fn fresh_index_has_no_stale_warning() {
+        assert_eq!(IndexFreshness::default().stale_warning(), None);
     }
 
     #[test]

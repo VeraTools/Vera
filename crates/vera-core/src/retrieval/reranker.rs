@@ -160,7 +160,7 @@ impl RerankerConfig {
 pub struct ApiReranker {
     client: reqwest::Client,
     config: RerankerConfig,
-    max_rerank_batch: usize,
+    pub(crate) max_rerank_batch: usize,
     max_document_chars: usize,
     /// Whether the configured base URL points at Voyage AI.
     ///
@@ -173,12 +173,27 @@ pub struct ApiReranker {
 
 impl ApiReranker {
     /// Create a new API-based reranker from configuration.
+    ///
+    /// This preserves the original constructor contract by resolving the
+    /// batch size from `VERA_MAX_RERANK_BATCH` (defaulting to 20).
     pub fn new(config: RerankerConfig) -> Result<Self> {
-        crate::init_tls();
         let max_rerank_batch = std::env::var("VERA_MAX_RERANK_BATCH")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20);
+        Self::new_with_max_rerank_batch(config, max_rerank_batch)
+    }
+
+    /// Create a new API-based reranker with an explicit batch size.
+    ///
+    /// `max_rerank_batch` is the caller's resolved `retrieval.max_rerank_batch`.
+    /// It is a parameter rather than an environment lookup so that the value
+    /// in `~/.vera/config.json` is the one actually used; 0 disables batching.
+    pub fn new_with_max_rerank_batch(
+        config: RerankerConfig,
+        max_rerank_batch: usize,
+    ) -> Result<Self> {
+        crate::init_tls();
         let max_document_chars = std::env::var("VERA_MAX_RERANK_DOC_CHARS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -699,7 +714,7 @@ mod cancellation_tests {
             "key".to_string(),
         )
         .with_max_retries(2);
-        let reranker = ApiReranker::new(config).unwrap();
+        let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
 
@@ -745,7 +760,7 @@ mod cancellation_tests {
         )
         .with_timeout(Duration::from_secs(2))
         .with_max_retries(3);
-        let reranker = ApiReranker::new(config).unwrap();
+        let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {

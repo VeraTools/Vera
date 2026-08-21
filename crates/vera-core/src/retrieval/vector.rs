@@ -6,6 +6,8 @@
 //! metadata store. Finds semantically related code even when query terms
 //! don't appear literally in results (e.g., "memory allocation" finds `alloc`).
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use tracing::{debug, warn};
 
@@ -46,12 +48,33 @@ pub async fn search_vector_with_stores(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>, VectorSearchError> {
+    search_vector_with_stores_timed(vector_store, metadata_store, provider, query, limit)
+        .await
+        .map(|(results, _)| results)
+}
+
+/// Like [`search_vector_with_stores`], but also reports how long the query
+/// embedding took.
+///
+/// The embedding call is nested inside the vector search, so a caller that
+/// reports per-stage timings cannot otherwise separate model cost from storage
+/// cost. The returned duration covers only [`generate_query_embedding`]; it is
+/// [`Duration::ZERO`] when `limit` is 0 and no embedding is generated.
+pub async fn search_vector_with_stores_timed(
+    vector_store: &VectorStore,
+    metadata_store: &MetadataStore,
+    provider: &impl EmbeddingProvider,
+    query: &str,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, Duration), VectorSearchError> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Duration::ZERO));
     }
 
     // 1. Generate query embedding.
+    let embed_start = Instant::now();
     let query_embedding = generate_query_embedding(provider, query, vector_store.dim()).await?;
+    let embed_elapsed = embed_start.elapsed();
 
     debug!(
         query = query,
@@ -122,7 +145,7 @@ pub async fn search_vector_with_stores(
         "vector search complete"
     );
 
-    Ok(results)
+    Ok((results, embed_elapsed))
 }
 
 /// Size the KNN request for a caller-selected pool, bounded by the backend cap.

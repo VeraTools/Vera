@@ -303,8 +303,12 @@ impl Chunk {
 }
 
 /// Programming language of a source file or chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// `Serialize`/`Deserialize` are implemented in terms of `Display`/`FromStr`
+/// rather than derived, so the JSON wire name is always the same string
+/// `--lang` accepts. A derived `rename_all` lowercases the Rust variant name,
+/// which silently diverges for any variant not named after its own wire name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
     TypeScript,
@@ -657,6 +661,34 @@ impl std::str::FromStr for Language {
     }
 }
 
+impl Serialize for Language {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Language {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        let language = if name == "dlang" {
+            Ok(Self::DLang)
+        } else {
+            name.parse()
+        };
+        language.map_err(|()| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&name),
+                &"a language name accepted by --lang",
+            )
+        })
+    }
+}
+
 /// Type of symbol extracted from source code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -826,6 +858,16 @@ mod tests {
         assert_eq!(Language::Rust.to_string(), "rust");
         assert_eq!(Language::TypeScript.to_string(), "typescript");
         assert_eq!(Language::Unknown.to_string(), "unknown");
+    }
+
+    #[test]
+    fn language_legacy_dlang_json_alias_preserves_canonical_wire_name() {
+        assert_eq!(
+            serde_json::from_str::<Language>(r#""dlang""#).unwrap(),
+            Language::DLang
+        );
+        assert_eq!(serde_json::to_string(&Language::DLang).unwrap(), r#""d""#);
+        assert!("dlang".parse::<Language>().is_err());
     }
 
     #[test]
