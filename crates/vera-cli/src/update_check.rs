@@ -263,81 +263,103 @@ fn print_binary_nudge(latest: &str, status: &BinaryVersionStatus) {
 }
 
 pub fn binary_version_status(force_refresh: bool) -> BinaryVersionStatus {
-    let install_method = resolve_install_method();
-    let cache_file = match cache_path() {
-        Some(path) => path,
-        None => {
-            return BinaryVersionStatus {
-                current_version: CURRENT_VERSION,
-                latest_version: None,
-                install_method: install_method.install_method,
-                install_method_source: install_method.source,
-                detected_install_methods: install_method.detected_install_methods,
-                source: VersionCheckSource::Unavailable,
-            };
-        }
-    };
-
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    binary_version_status_inner(cache_path(), force_refresh, now, &resolve_install_method)
+}
+
+/// `binary_version_status` with the cache location, the clock and the install
+/// method fallback injected, so tests can drive it without touching `~/.vera`
+/// or spawning package managers.
+///
+/// `resolve` is only called when the cache cannot answer. That matters: the
+/// fallback ends in `detect_install_methods`, which spawns `npm`, `bun`, `pip`
+/// and `uv`, and `print_nudges` runs synchronously before the process exits.
+fn binary_version_status_inner(
+    cache_file: Option<PathBuf>,
+    force_refresh: bool,
+    now: u64,
+    resolve: &dyn Fn() -> InstallMethodResolution,
+) -> BinaryVersionStatus {
+    let Some(cache_file) = cache_file else {
+        return status_from(None, resolve(), VersionCheckSource::Unavailable);
+    };
+
     let cached = load_cache(&cache_file);
 
     if !force_refresh {
         if let Some(cached) = cached.as_ref() {
             if now.saturating_sub(cached.checked_at_secs) < CHECK_INTERVAL.as_secs() {
-                return BinaryVersionStatus {
-                    current_version: CURRENT_VERSION,
-                    latest_version: Some(cached.latest_version.clone()),
-                    install_method: cached
-                        .install_method
-                        .clone()
-                        .or(install_method.install_method.clone()),
-                    install_method_source: install_method.source,
-                    detected_install_methods: install_method.detected_install_methods.clone(),
-                    source: VersionCheckSource::Cache,
-                };
+                let resolution = cached_install_method(cached).unwrap_or_else(resolve);
+                return status_from(
+                    Some(cached.latest_version.clone()),
+                    resolution,
+                    VersionCheckSource::Cache,
+                );
             }
         }
     }
+
+    let resolution = resolve();
 
     if let Some(latest) = fetch_latest_version() {
         let cache = UpdateCache {
             latest_version: latest.clone(),
             checked_at_secs: now,
-            install_method: install_method.install_method.clone(),
+            install_method: resolution.install_method.clone(),
         };
         let _ = save_cache(&cache_file, &cache);
-        return BinaryVersionStatus {
-            current_version: CURRENT_VERSION,
-            latest_version: Some(latest),
-            install_method: install_method.install_method.clone(),
-            install_method_source: install_method.source,
-            detected_install_methods: install_method.detected_install_methods.clone(),
-            source: VersionCheckSource::Live,
-        };
+        return status_from(Some(latest), resolution, VersionCheckSource::Live);
     }
 
     if let Some(cached) = cached {
         return BinaryVersionStatus {
             current_version: CURRENT_VERSION,
             latest_version: Some(cached.latest_version),
-            install_method: cached.install_method.or(install_method.install_method),
-            install_method_source: install_method.source,
-            detected_install_methods: install_method.detected_install_methods,
+            install_method: cached.install_method.or(resolution.install_method),
+            install_method_source: resolution.source,
+            detected_install_methods: resolution.detected_install_methods,
             source: VersionCheckSource::Cache,
         };
     }
 
+    status_from(None, resolution, VersionCheckSource::Unavailable)
+}
+
+fn status_from(
+    latest_version: Option<String>,
+    resolution: InstallMethodResolution,
+    source: VersionCheckSource,
+) -> BinaryVersionStatus {
     BinaryVersionStatus {
         current_version: CURRENT_VERSION,
-        latest_version: None,
-        install_method: install_method.install_method,
-        install_method_source: install_method.source,
-        detected_install_methods: install_method.detected_install_methods,
-        source: VersionCheckSource::Unavailable,
+        latest_version,
+        install_method: resolution.install_method,
+        install_method_source: resolution.source,
+        detected_install_methods: resolution.detected_install_methods,
+        source,
     }
+}
+
+/// Rebuild an install method resolution from a cache entry, so a fresh cache
+/// answers without re-running detection.
+///
+/// The source is reported as `Heuristic`. `save_cache` only ever stores a
+/// method that `resolve_install_method` returned as `Some`, which narrows the
+/// original source to `Provenance` or `Heuristic`, but the cache does not
+/// record which, so this reports the weaker of the two. `can_apply_update` and
+/// `suggested_update_command` treat them identically; the only callers that
+/// surface the distinction, `vera upgrade` and `vera doctor`, pass
+/// `force_refresh = true` and never reach this branch.
+fn cached_install_method(cached: &UpdateCache) -> Option<InstallMethodResolution> {
+    let method = cached.install_method.clone()?;
+    Some(InstallMethodResolution {
+        detected_install_methods: vec![method.clone()],
+        install_method: Some(method),
+        source: InstallMethodSource::Heuristic,
+    })
 }
 
 pub fn suggested_update_command(install_method: Option<&str>) -> String {
@@ -553,6 +575,7 @@ fn save_cache(path: &Path, cache: &UpdateCache) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn is_newer_works() {
@@ -667,6 +690,91 @@ mod tests {
             source: VersionCheckSource::Live,
         };
         assert!(!status.can_apply_update());
+    }
+
+    /// A resolver that records how often it ran and reports nothing, standing in
+    /// for `resolve_install_method` without spawning any package manager.
+    fn counting_resolver(calls: &Cell<usize>) -> impl Fn() -> InstallMethodResolution + '_ {
+        || {
+            calls.set(calls.get() + 1);
+            InstallMethodResolution {
+                install_method: None,
+                detected_install_methods: Vec::new(),
+                source: InstallMethodSource::Unknown,
+            }
+        }
+    }
+
+    fn write_cache(dir: &Path, install_method: Option<&str>, checked_at_secs: u64) -> PathBuf {
+        let path = dir.join("update-check.json");
+        save_cache(
+            &path,
+            &UpdateCache {
+                latest_version: "99.0.0".to_string(),
+                checked_at_secs,
+                install_method: install_method.map(str::to_string),
+            },
+        )
+        .expect("cache written");
+        path
+    }
+
+    #[test]
+    fn fresh_cache_with_install_method_skips_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked_at = 1_700_000_000;
+        let cache_file = write_cache(dir.path(), Some("npm"), checked_at);
+
+        let calls = Cell::new(0);
+        let status = binary_version_status_inner(
+            Some(cache_file),
+            false,
+            checked_at + 60,
+            &counting_resolver(&calls),
+        );
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "install method detection ran even though a fresh cache carried the method"
+        );
+        assert_eq!(status.source, VersionCheckSource::Cache);
+        assert_eq!(status.latest_version.as_deref(), Some("99.0.0"));
+        assert_eq!(status.install_method.as_deref(), Some("npm"));
+        assert_eq!(status.install_method_source, InstallMethodSource::Heuristic);
+        assert_eq!(status.detected_install_methods, vec!["npm".to_string()]);
+        assert!(status.can_apply_update());
+    }
+
+    #[test]
+    fn fresh_cache_without_install_method_falls_back_to_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked_at = 1_700_000_000;
+        let cache_file = write_cache(dir.path(), None, checked_at);
+
+        let calls = Cell::new(0);
+        let status = binary_version_status_inner(
+            Some(cache_file),
+            false,
+            checked_at + 60,
+            &counting_resolver(&calls),
+        );
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(status.source, VersionCheckSource::Cache);
+        assert_eq!(status.install_method, None);
+        assert_eq!(status.install_method_source, InstallMethodSource::Unknown);
+    }
+
+    #[test]
+    fn missing_cache_path_still_resolves_the_install_method() {
+        let calls = Cell::new(0);
+        let status =
+            binary_version_status_inner(None, false, 1_700_000_000, &counting_resolver(&calls));
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(status.source, VersionCheckSource::Unavailable);
+        assert_eq!(status.latest_version, None);
     }
 
     #[test]
