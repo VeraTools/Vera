@@ -32,6 +32,27 @@ pub(crate) fn extract_name(node: &tree_sitter::Node<'_>, source: &[u8]) -> Optio
         return extract_impl_name(node, source);
     }
 
+    // Fortran containers carry their names on their header child rather than
+    // directly on the body node.
+    let header_kind = match node.kind() {
+        "module" => Some("module_statement"),
+        "program" => Some("program_statement"),
+        _ => None,
+    };
+    if let Some(header_kind) = header_kind {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == header_kind {
+                let mut header_cursor = child.walk();
+                for name in child.children(&mut header_cursor) {
+                    if name.kind() == "name" {
+                        return name.utf8_text(source).ok().map(str::to_string);
+                    }
+                }
+            }
+        }
+    }
+
     // HCL block name (second child that is an identifier or string_lit)
     if node.kind() == "block" {
         let mut cursor = node.walk();

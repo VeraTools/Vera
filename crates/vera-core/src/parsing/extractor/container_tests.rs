@@ -478,9 +478,10 @@ end module widgets
         Language::Fortran,
     );
 
-    // One module symbol, spanning the whole module: the `module_statement`
-    // header must not be recorded as a second one.
+    // One named module symbol, spanning the whole module: the
+    // `module_statement` header must not be recorded as a second one.
     let module = require_only(&symbols, SymbolType::Module);
+    assert_eq!(module.name.as_deref(), Some("widgets"));
     assert_eq!(module.start_row, 1);
     assert_nested(module, require_at(&symbols, 3, SymbolType::Function));
 }
@@ -502,6 +503,7 @@ end program main
     // As with `module`, the `program_statement` header must not be recorded as
     // a second program symbol.
     let program = require_only(&symbols, SymbolType::Block);
+    assert_eq!(program.name.as_deref(), Some("main"));
     assert_eq!(program.start_row, 1);
     assert_nested(program, require_at(&symbols, 3, SymbolType::Function));
 }
