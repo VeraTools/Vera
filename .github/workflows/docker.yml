@@ -25,6 +25,7 @@ jobs:
   build:
     name: Build (${{ matrix.variant }})
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 30
     # Job-level groups are repository-global: a manual republish cannot race
     # the release workflow's docker job on the same variant's mutable tag.
     # Scoped per variant so cpu/cuda/rocm/openvino can still publish in parallel.
@@ -77,12 +78,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Ephemeral builder: no persistent layer cache. Blacksmith sticky
+      # builder disks are billed per GB-month, and the v1 sticky rocm builder
+      # held a corrupted layer cache that failed the v1.0.1 publish with
+      # digest mismatches. The runner's own docker daemon remains the
+      # fallback below.
       - name: Set up Docker Buildx
-        uses: useblacksmith/setup-docker-builder@v2
-        with:
-          # v2 keys: fresh builders. The v1 rocm builder held a corrupted
-          # layer cache that failed the v1.0.1 publish with digest mismatches.
-          cache-key: docker-v2-${{ matrix.variant }}
+        uses: docker/setup-buildx-action@v3
 
       - name: Extract version
         id: version
@@ -93,7 +95,7 @@ jobs:
       - name: Build and push
         id: publish
         continue-on-error: true
-        uses: useblacksmith/build-push-action@v2
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -104,7 +106,7 @@ jobs:
 
       # Fallback when the buildkit path fails (seen: "unexpected commit digest"
       # on a rocm base layer whose computed digest varied per run, i.e. fetch
-      # corruption in the sticky-builder pull path, not a poisoned cache).
+      # corruption in the registry-mirror pull path, not a poisoned cache).
       # The retry prunes the builder, then builds via the runner's own docker
       # daemon, an ephemeral store with a separate registry fetch path.
       # Healthy builds never pay for this.

@@ -62,7 +62,7 @@ All stored in `.vera/` at the project root.
 - `config.rs`: `RetrievalConfig`, `IndexConfig` defaults
 - `local_models.rs`: Manages local embedding presets, custom ONNX embedding configs, and ORT/model assets under the Vera data directory (XDG-compliant)
 - `discovery/`: File discovery with gitignore support, binary/size filtering
-- `git_scope.rs`: Resolves `--changed`, `--since`, and `--base` into exact repository-relative paths
+- `git_scope.rs`: Resolves `--changed`, `--since`, and `--base` into exact paths relative to the indexed directory, which may sit below the git repository root
 - `chunk_text.rs`: Line-boundary text splitting for byte-budget enforcement
 
 ## vera-cli

@@ -54,8 +54,9 @@ pub async fn create_dynamic_reranker(
                 let cfg = cfg
                     .with_timeout(Duration::from_secs(30))
                     .with_max_retries(2);
-                let p = ApiReranker::new(cfg)
-                    .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
+                let p =
+                    ApiReranker::new_with_max_rerank_batch(cfg, config.retrieval.max_rerank_batch)
+                        .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
                 return Ok(Some(DynamicReranker::Api(p)));
             }
             let p = LocalReranker::new_with_ep(ep)
@@ -69,11 +70,47 @@ pub async fn create_dynamic_reranker(
                 let cfg = cfg
                     .with_timeout(Duration::from_secs(30))
                     .with_max_retries(2);
-                let p = ApiReranker::new(cfg)
-                    .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
+                let p =
+                    ApiReranker::new_with_max_rerank_batch(cfg, config.retrieval.max_rerank_batch)
+                        .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
                 Ok(Some(DynamicReranker::Api(p)))
             }
             Err(_) => Ok(None),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_env::EnvVarGuard;
+
+    #[tokio::test]
+    async fn api_reranker_batches_by_the_configured_value_not_the_environment() {
+        // Held across the await and dropped on any unwind, so the credentials
+        // and the batch value never outlive the test.
+        let _env = EnvVarGuard::set(&[
+            ("RERANKER_MODEL_BASE_URL", "http://127.0.0.1:19998/v1"),
+            ("RERANKER_MODEL_ID", "test-model"),
+            ("RERANKER_MODEL_API_KEY", "test-key"),
+            // The value the old second env lookup would have produced.
+            ("VERA_MAX_RERANK_BATCH", "20"),
+        ]);
+
+        let mut config = VeraConfig::default();
+        config.retrieval.reranking_enabled = true;
+        config.retrieval.max_rerank_batch = 8;
+
+        let reranker = create_dynamic_reranker(&config, InferenceBackend::Api)
+            .await
+            .unwrap();
+
+        let Some(DynamicReranker::Api(api)) = reranker else {
+            panic!("expected an API reranker for InferenceBackend::Api");
+        };
+        assert_eq!(
+            api.max_rerank_batch, 8,
+            "retrieval.max_rerank_batch must reach the reranker"
+        );
     }
 }

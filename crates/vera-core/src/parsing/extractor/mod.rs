@@ -279,9 +279,30 @@ fn collect_symbols(
             }
         }
 
-        // For Rust impl blocks, extract methods inside but also keep the whole block
-        if lang == Language::Rust && kind == "impl_item" {
-            extract_impl_methods(node, source, lang, symbols);
+        // For Rust impl and trait blocks, extract methods inside but also keep
+        // the whole block
+        if lang == Language::Rust && (kind == "impl_item" || kind == "trait_item") {
+            extract_rust_block_methods(node, source, lang, symbols, sym_type);
+            return;
+        }
+
+        // A Rust `mod name { ... }` is a container, not a leaf. Record the
+        // module, then keep walking so the items declared inside it are
+        // extracted as symbols of their own instead of being swallowed by the
+        // module's span. `mod name;` has no body and simply yields nothing more.
+        //
+        // Descend into the `declaration_list` rather than the `mod_item`, the
+        // way `extract_rust_block_methods` does: recursing from the `mod_item`
+        // spends one depth level on the module and a second on its body list,
+        // so three levels of nesting would exhaust the shared budget before
+        // reaching the items inside.
+        if lang == Language::Rust && kind == "mod_item" {
+            let name = extract_name(&node, source);
+            symbols.push(RawSymbol::at(&node, name, sym_type));
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                collect_symbols_cursor(&mut cursor, source, lang, symbols, depth + 1);
+            }
             return;
         }
 

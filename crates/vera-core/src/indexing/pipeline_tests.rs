@@ -471,3 +471,98 @@ async fn index_permission_error_continues() {
         let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
     }
 }
+
+/// Freshness keys, duplicated here because `freshness` keeps them private.
+const INDEXING_CONFIG_META_KEY: &str = "indexing_config";
+const INDEX_REFRESHED_AT_META_KEY: &str = "index_refreshed_at_unix_ms";
+
+fn store_index_into(idx_dir: &Path) -> Result<()> {
+    let indexing_config = crate::config::IndexingConfig::default();
+    store_index(
+        idx_dir,
+        &[],
+        &[],
+        &[("src/lib.rs".to_string(), "hash-a".to_string())],
+        &[],
+        &[],
+        IndexBuildMetadata {
+            file_states: &[],
+            indexing_config: &indexing_config,
+            model_name: "mock-model",
+        },
+    )
+}
+
+/// A failed store rebuild must not leave the index certified current.
+///
+/// Both stores are deleted and repopulated by `store_index`. The failure is
+/// injected by leaving a plain file where the store expects a directory (and a
+/// directory where it expects a file), which makes the reset step fail after
+/// the preceding stores have already been written. This proves the hashes and
+/// the freshness stamp land after both stores; it does not simulate a kill
+/// signal, and `store_index` has no seam for one.
+#[test]
+fn store_index_defers_hashes_and_freshness_until_stores_are_rebuilt() {
+    for poison in ["vector", "bm25"] {
+        let dir = TempDir::new().unwrap();
+        let idx_dir = dir.path().join(".vera");
+        fs::create_dir_all(&idx_dir).unwrap();
+        match poison {
+            // `remove_file` fails on a directory.
+            "vector" => fs::create_dir(idx_dir.join(VECTOR_DB)).unwrap(),
+            // `remove_dir_all` fails on a plain file.
+            _ => fs::write(idx_dir.join(BM25_SUBDIR), "not a directory").unwrap(),
+        }
+
+        let err = store_index_into(&idx_dir).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to reset"),
+            "{poison}: unexpected failure: {rendered}"
+        );
+
+        let store = MetadataStore::open(&idx_dir.join(METADATA_DB)).unwrap();
+        assert_eq!(
+            store.get_file_hash("src/lib.rs").unwrap(),
+            None,
+            "{poison}: hashes were committed before the stores were rebuilt"
+        );
+        assert_eq!(
+            store.get_index_meta(INDEX_REFRESHED_AT_META_KEY).unwrap(),
+            None,
+            "{poison}: the index was stamped fresh before the stores were rebuilt"
+        );
+        assert_eq!(
+            store.get_index_meta(INDEXING_CONFIG_META_KEY).unwrap(),
+            None,
+            "{poison}: the freshness snapshot was recorded before the stores were rebuilt"
+        );
+    }
+}
+
+/// The deferred writes still happen when the rebuild succeeds.
+#[test]
+fn store_index_records_hashes_and_freshness_on_success() {
+    let dir = TempDir::new().unwrap();
+    let idx_dir = dir.path().join(".vera");
+
+    store_index_into(&idx_dir).unwrap();
+
+    let store = MetadataStore::open(&idx_dir.join(METADATA_DB)).unwrap();
+    assert_eq!(
+        store.get_file_hash("src/lib.rs").unwrap().as_deref(),
+        Some("hash-a")
+    );
+    assert!(
+        store
+            .get_index_meta(INDEX_REFRESHED_AT_META_KEY)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_index_meta(INDEXING_CONFIG_META_KEY)
+            .unwrap()
+            .is_some()
+    );
+}

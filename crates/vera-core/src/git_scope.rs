@@ -1,7 +1,7 @@
 //! Git-aware path scoping for changed-file workflows.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -17,26 +17,92 @@ pub enum GitScope {
     Base(String),
 }
 
-/// Resolve a git scope to an exact set of repository-relative paths.
-pub fn resolve_scope(repo_root: &Path, scope: &GitScope) -> Result<HashSet<String>> {
-    ensure_git_repo(repo_root)?;
+/// Resolve a git scope to an exact set of paths relative to `index_root`.
+///
+/// The index stores paths relative to the directory that was indexed, which is
+/// not necessarily the git repository root. Every git command therefore runs at
+/// the repository root, so all output shares one base, and the result is
+/// re-rooted onto the index root before it is returned.
+pub fn resolve_scope(index_root: &Path, scope: &GitScope) -> Result<HashSet<String>> {
+    let layout = RepoLayout::resolve(index_root)?;
+    let toplevel = layout.toplevel.as_path();
 
-    match scope {
-        GitScope::Changed => resolve_changed_files(repo_root),
+    let files = match scope {
+        GitScope::Changed => resolve_changed_files(toplevel)?,
         GitScope::Since(rev) => {
             validate_revision(rev)?;
-            resolve_diff_files(repo_root, rev)
+            resolve_diff_files(toplevel, rev)?
         }
         GitScope::Base(rev) => {
             validate_revision(rev)?;
-            let merge_base = run_git(repo_root, &["merge-base", "HEAD", rev])?;
+            let merge_base = run_git(toplevel, &["merge-base", "HEAD", rev])?;
             let merge_base = merge_base.trim();
             if merge_base.is_empty() {
                 bail!("git merge-base returned an empty revision for {rev}");
             }
-            resolve_diff_files(repo_root, merge_base)
+            resolve_diff_files(toplevel, merge_base)?
         }
+    };
+
+    let mut files = layout.reroot(files);
+    add_platform_path_variants(&mut files);
+    Ok(files)
+}
+
+/// Where the indexed directory sits inside the git repository containing it.
+struct RepoLayout {
+    /// Absolute path to the repository root. Every git command runs here so
+    /// that no output depends on `diff.relative` or on git's per-command choice
+    /// of base.
+    toplevel: PathBuf,
+    /// The index root relative to the repository root, `/`-separated and ending
+    /// in `/`. Empty when the index root *is* the repository root.
+    prefix: String,
+}
+
+impl RepoLayout {
+    fn resolve(index_root: &Path) -> Result<Self> {
+        // Two calls rather than one multi-flag call: `git rev-parse` separates
+        // its answers by newline, and a repository path may contain one.
+        let toplevel = run_git(index_root, &["rev-parse", "--show-toplevel"])
+            .context("failed to verify git repository for changed-file scope")?;
+        let toplevel = strip_trailing_newline(&toplevel);
+        if toplevel.is_empty() {
+            bail!(
+                "git found no work tree for {} (a bare repository has no files to scope)",
+                index_root.display()
+            );
+        }
+
+        let prefix = run_git(index_root, &["rev-parse", "--show-prefix"])
+            .context("failed to locate the indexed directory inside its git repository")?;
+
+        Ok(Self {
+            toplevel: PathBuf::from(toplevel),
+            prefix: strip_trailing_newline(&prefix).to_string(),
+        })
     }
+
+    /// Translate repository-root-relative paths to index-root-relative ones,
+    /// dropping the files that live outside the indexed directory.
+    fn reroot(&self, paths: HashSet<String>) -> HashSet<String> {
+        if self.prefix.is_empty() {
+            return paths;
+        }
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                path.strip_prefix(&self.prefix)
+                    .filter(|rest| !rest.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .collect()
+    }
+}
+
+/// `git rev-parse` terminates its answer with a line ending.
+fn strip_trailing_newline(output: &str) -> &str {
+    output.trim_end_matches(['\r', '\n'])
 }
 
 /// Reject revisions that git would parse as options (e.g. `--output=...`).
@@ -49,13 +115,7 @@ fn validate_revision(rev: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_git_repo(repo_root: &Path) -> Result<()> {
-    let _ = run_git(repo_root, &["rev-parse", "--show-toplevel"])
-        .context("failed to verify git repository for changed-file scope")?;
-    Ok(())
-}
-
-fn resolve_changed_files(repo_root: &Path) -> Result<HashSet<String>> {
+fn resolve_changed_files(toplevel: &Path) -> Result<HashSet<String>> {
     let mut files = HashSet::new();
     for args in [
         vec![
@@ -69,15 +129,14 @@ fn resolve_changed_files(repo_root: &Path) -> Result<HashSet<String>> {
         vec!["diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "--"],
         vec!["ls-files", "--others", "--exclude-standard", "-z", "--"],
     ] {
-        files.extend(parse_git_paths(&run_git(repo_root, &args)?));
+        files.extend(parse_git_paths(&run_git(toplevel, &args)?));
     }
-    add_platform_path_variants(&mut files);
     Ok(files)
 }
 
-fn resolve_diff_files(repo_root: &Path, revision: &str) -> Result<HashSet<String>> {
+fn resolve_diff_files(toplevel: &Path, revision: &str) -> Result<HashSet<String>> {
     let output = run_git(
-        repo_root,
+        toplevel,
         &[
             "diff",
             "--name-only",
@@ -87,15 +146,13 @@ fn resolve_diff_files(repo_root: &Path, revision: &str) -> Result<HashSet<String
             "--",
         ],
     )?;
-    let mut files = parse_git_paths(&output);
-    add_platform_path_variants(&mut files);
-    Ok(files)
+    Ok(parse_git_paths(&output))
 }
 
-fn run_git(repo_root: &Path, args: &[&str]) -> Result<String> {
+fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
-        .current_dir(repo_root)
+        .current_dir(cwd)
         .output()
         .with_context(|| format!("failed to run git {}", args.join(" ")))?;
 
@@ -227,10 +284,161 @@ mod tests {
         assert!(base.is_err());
     }
 
+    #[test]
+    fn reroot_drops_paths_outside_the_indexed_directory() {
+        let layout = RepoLayout {
+            toplevel: PathBuf::from("/repo"),
+            prefix: "pkg/".to_string(),
+        };
+
+        let rerooted = layout.reroot(HashSet::from([
+            "pkg/src/main.rs".to_string(),
+            "pkg".to_string(),
+            "pkgsuffix/sibling.rs".to_string(),
+            "other/elsewhere.rs".to_string(),
+            "README.md".to_string(),
+        ]));
+
+        assert_eq!(sorted_slash_paths(&rerooted), ["src/main.rs"]);
+    }
+
+    #[test]
+    fn resolve_changed_scope_from_a_subdirectory_index_root_reroots_every_half() {
+        let repo = init_monorepo();
+        let index_root = repo.path().join("pkg");
+
+        // One file per half of `resolve_changed_files`, so a half left on the
+        // repository-root base is a missing member rather than an empty set.
+        std::fs::write(
+            index_root.join("src/tracked.rs"),
+            "fn tracked() { println!(\"modified\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(index_root.join("src/staged.rs"), "fn staged() {}\n").unwrap();
+        git(repo.path(), &["add", "pkg/src/staged.rs"]).unwrap();
+        std::fs::write(index_root.join("src/untracked.rs"), "fn untracked() {}\n").unwrap();
+
+        // Changed, but outside the indexed directory.
+        std::fs::write(
+            repo.path().join("other/elsewhere.rs"),
+            "fn elsewhere() { println!(\"modified\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("README.md"), "changed\n").unwrap();
+
+        let paths = resolve_scope(&index_root, &GitScope::Changed).unwrap();
+
+        assert_eq!(
+            sorted_slash_paths(&paths),
+            ["src/staged.rs", "src/tracked.rs", "src/untracked.rs"]
+        );
+    }
+
+    #[test]
+    fn resolve_since_scope_from_a_subdirectory_index_root_reroots_paths() {
+        let repo = init_monorepo();
+        let index_root = repo.path().join("pkg");
+        let head = run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(
+            index_root.join("src/tracked.rs"),
+            "fn tracked() { println!(\"changed\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("other/elsewhere.rs"),
+            "fn elsewhere() { println!(\"changed\"); }\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "second commit");
+
+        let paths = resolve_scope(&index_root, &GitScope::Since(head.trim().to_string())).unwrap();
+
+        assert_eq!(sorted_slash_paths(&paths), ["src/tracked.rs"]);
+    }
+
+    #[test]
+    fn resolve_base_scope_from_a_subdirectory_index_root_reroots_paths() {
+        let repo = init_monorepo();
+        let index_root = repo.path().join("pkg");
+        run_git(repo.path(), &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(
+            index_root.join("src/tracked.rs"),
+            "fn tracked() { println!(\"feature\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("other/elsewhere.rs"),
+            "fn elsewhere() { println!(\"feature\"); }\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "feature commit");
+
+        let paths = resolve_scope(&index_root, &GitScope::Base("HEAD~1".to_string())).unwrap();
+
+        assert_eq!(sorted_slash_paths(&paths), ["src/tracked.rs"]);
+    }
+
+    #[test]
+    fn resolve_changed_scope_at_the_repository_root_keeps_subdirectory_prefixes() {
+        let repo = init_monorepo();
+        std::fs::write(
+            repo.path().join("pkg/src/tracked.rs"),
+            "fn tracked() { println!(\"modified\"); }\n",
+        )
+        .unwrap();
+
+        let paths = resolve_scope(repo.path(), &GitScope::Changed).unwrap();
+
+        assert_eq!(sorted_slash_paths(&paths), ["pkg/src/tracked.rs"]);
+    }
+
+    #[test]
+    fn resolve_scope_outside_a_git_repository_reports_the_missing_repository() {
+        let dir = TempDir::new().unwrap();
+
+        let err = resolve_scope(dir.path(), &GitScope::Changed).unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failed to verify git repository for changed-file scope"),
+            "{message}"
+        );
+    }
+
+    /// Windows keeps a `\`-spelled variant of every path alongside the `/` one;
+    /// compare only the canonical spelling.
+    fn sorted_slash_paths(paths: &HashSet<String>) -> Vec<String> {
+        let mut sorted: Vec<String> = paths
+            .iter()
+            .filter(|path| !path.contains('\\'))
+            .cloned()
+            .collect();
+        sorted.sort();
+        sorted
+    }
+
     fn init_repo() -> TempDir {
         let repo = TempDir::new().unwrap();
         git(repo.path(), &["init"]).unwrap();
         std::fs::write(repo.path().join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        commit_all(repo.path(), "initial commit");
+        repo
+    }
+
+    /// A repository whose root sits one level above the directory that gets
+    /// indexed, plus a sibling directory that must never enter the scope.
+    fn init_monorepo() -> TempDir {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init"]).unwrap();
+        std::fs::create_dir_all(repo.path().join("pkg/src")).unwrap();
+        std::fs::create_dir_all(repo.path().join("other")).unwrap();
+        std::fs::write(repo.path().join("pkg/src/tracked.rs"), "fn tracked() {}\n").unwrap();
+        std::fs::write(
+            repo.path().join("other/elsewhere.rs"),
+            "fn elsewhere() {}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("README.md"), "initial\n").unwrap();
         commit_all(repo.path(), "initial commit");
         repo
     }

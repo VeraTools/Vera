@@ -275,19 +275,21 @@ pub(super) fn refine_go_type_spec(node: &tree_sitter::Node<'_>, source: &[u8]) -
     }
 }
 
-/// Extract individual methods from a Rust `impl` block as separate symbols.
-pub(super) fn extract_impl_methods(
-    impl_node: tree_sitter::Node<'_>,
+/// Extract individual methods from a Rust `impl` or `trait` block as separate
+/// symbols, keeping the block itself indexable as `container_type`.
+pub(super) fn extract_rust_block_methods(
+    block_node: tree_sitter::Node<'_>,
     source: &[u8],
     lang: Language,
     symbols: &mut Vec<RawSymbol>,
+    container_type: SymbolType,
 ) {
-    let name = extract_name(&impl_node, source);
-    symbols.push(RawSymbol::at(&impl_node, name, SymbolType::Block));
+    let name = extract_name(&block_node, source);
+    symbols.push(RawSymbol::at(&block_node, name, container_type));
 
-    let mut cursor = impl_node.walk();
+    let mut cursor = block_node.walk();
 
-    for child in impl_node.children(&mut cursor) {
+    for child in block_node.children(&mut cursor) {
         if child.kind() == "declaration_list" {
             let mut inner_cursor = child.walk();
             for item in child.children(&mut inner_cursor) {

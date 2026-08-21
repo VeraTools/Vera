@@ -66,16 +66,13 @@ pub fn load_runtime_config() -> anyhow::Result<vera_core::config::VeraConfig> {
 
 pub fn warn_if_index_stale(repo_path: &Path, indexing_config: &vera_core::config::IndexingConfig) {
     match vera_core::indexing::detect_staleness(repo_path, indexing_config) {
-        Ok(freshness) if freshness.is_stale() => {
-            let stderr = std::io::stderr();
-            let mut err = stderr.lock();
-            let _ = writeln!(
-                err,
-                "warning: index may be stale: {}. Search and grep only cover indexed files. Run `vera update .` or `vera watch .`.",
-                freshness.summary()
-            );
+        Ok(freshness) => {
+            if let Some(warning) = freshness.stale_warning() {
+                let stderr = std::io::stderr();
+                let mut err = stderr.lock();
+                let _ = writeln!(err, "{warning}");
+            }
         }
-        Ok(_) => {}
         Err(err) => {
             tracing::debug!(error = %err, "failed to check index freshness");
         }
@@ -273,7 +270,7 @@ pub struct LocalEmbeddingModelFlags {
     #[arg(long = "embedding-dim", value_name = "DIM")]
     pub embedding_dim: Option<usize>,
     /// Pooling strategy for token-level output models.
-    #[arg(long = "embedding-pooling", value_name = "POOLING", value_parser = ["mean", "cls"])]
+    #[arg(long = "embedding-pooling", value_name = "POOLING", value_parser = ["mean", "cls", "last-token"])]
     pub embedding_pooling: Option<String>,
     /// Tokenizer truncation length for local embedding inference.
     #[arg(long = "embedding-max-length", value_name = "TOKENS")]
