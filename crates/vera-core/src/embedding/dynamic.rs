@@ -22,7 +22,10 @@ pub enum DynamicProvider {
     /// every passage unprefixed while queries stayed prefixed, with no error,
     /// no log, and an unchanged `model_identity` to keep the staleness guard
     /// quiet.
+    // The stub stays crate-private; the variant exists only under cfg(test),
+    // so the visibility mismatch cannot leak into the public API.
     #[cfg(test)]
+    #[allow(private_interfaces)]
     Stub(tests::StubProvider),
 }
 

@@ -535,7 +535,8 @@ mod tests {
         // non-ONNX backend rejects the flags. A flag missing from it is
         // silently ignored when it is the only one passed, so each one is
         // checked alone rather than in combination.
-        let mutators: Vec<(&str, fn(&mut LocalEmbeddingModelFlags))> = vec![
+        type FlagMutator = fn(&mut LocalEmbeddingModelFlags);
+        let mutators: Vec<(&str, FlagMutator)> = vec![
             ("--code-rank-embed", |f| f.code_rank_embed = true),
             ("--embedding-repo", |f| {
                 f.embedding_repo = Some("org/repo".to_string())
