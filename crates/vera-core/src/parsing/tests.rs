@@ -105,6 +105,27 @@ fn rust_impl_methods_emit_no_gap_chunks() {
 }
 
 #[test]
+fn rust_inline_module_children_preserve_only_the_trailing_gap() {
+    let source = r#"mod nested {
+    fn first() {}
+
+    // Covered by the module chunk, not a separate gap.
+    fn second() {}
+}
+
+use std::fmt;
+"#;
+    let chunks = parse(source, "nested.rs", Language::Rust);
+    let names: Vec<_> = chunks
+        .iter()
+        .map(|chunk| chunk.symbol_name.as_deref())
+        .collect();
+
+    assert_eq!(names, [Some("nested"), Some("first"), Some("second"), None]);
+    assert_eq!(chunks.last().unwrap().content.trim(), "use std::fmt;");
+}
+
+#[test]
 fn rust_enum_and_trait() {
     let source = r#"enum Color {
     Red,
