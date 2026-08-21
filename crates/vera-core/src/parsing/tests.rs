@@ -65,6 +65,46 @@ impl Point {
 }
 
 #[test]
+fn rust_impl_methods_emit_no_gap_chunks() {
+    let source = r#"impl CancellationToken {
+    /// Create a token.
+    fn new() -> Self {
+        Self
+    }
+
+    /// Cancel the token.
+    fn cancel(&self) {}
+}
+"#;
+    let chunks = parse(source, "cancellation.rs", Language::Rust);
+
+    let impl_block = find_chunk(&chunks, "impl CancellationToken");
+    assert_eq!(impl_block.symbol_type, Some(SymbolType::Block));
+    assert!(
+        impl_block.content.contains("fn cancel"),
+        "impl chunk should cover the whole body: {impl_block:?}"
+    );
+    for method in ["new", "cancel"] {
+        let chunk = find_chunk(&chunks, method);
+        assert_eq!(
+            chunk.symbol_type,
+            Some(SymbolType::Method),
+            "`{method}` should be chunked as a method: {chunk:?}"
+        );
+    }
+
+    let unnamed: Vec<_> = chunks.iter().filter(|c| c.symbol_name.is_none()).collect();
+    assert!(
+        unnamed.is_empty(),
+        "spans inside the impl are already covered by its chunk: {unnamed:?}"
+    );
+    assert!(
+        !chunks.iter().any(|c| c.content.trim() == "}"),
+        "the impl's closing brace must not become its own chunk: {chunks:?}"
+    );
+}
+
+#[test]
 fn rust_enum_and_trait() {
     let source = r#"enum Color {
     Red,

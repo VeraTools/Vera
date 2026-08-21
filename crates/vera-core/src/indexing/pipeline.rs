@@ -610,12 +610,6 @@ fn store_index(
         .insert_chunks(chunks)
         .context("failed to insert chunk metadata")?;
 
-    // Store file content hashes for incremental indexing, batched into a
-    // single transaction instead of one commit per file.
-    metadata_store
-        .set_file_hashes_batch(file_hashes)
-        .context("failed to store file hashes")?;
-
     metadata_store
         .insert_file_states(metadata.file_states)
         .context("failed to store file index states")?;
@@ -632,8 +626,6 @@ fn store_index(
     metadata_store
         .set_index_meta("embedding_dim", &dim.to_string())
         .context("failed to store embedding_dim")?;
-    super::freshness::record_index_snapshot(&metadata_store, metadata.indexing_config)
-        .context("failed to store index freshness metadata")?;
 
     debug!(chunks = chunks.len(), "metadata stored");
 
@@ -672,6 +664,23 @@ fn store_index(
         .context("failed to insert BM25 documents")?;
 
     debug!(docs = chunks.len(), "BM25 index built");
+
+    // Hashes and the freshness stamp are what certify the index current, so
+    // they are written only once every store has been rebuilt. Both stores are
+    // deleted and repopulated above; committing the hashes first would leave a
+    // crash or a Ctrl-C in that window with a complete metadata store, current
+    // hashes and a missing or half-built vector/BM25 store, which
+    // `detect_staleness` cannot see and `vera update` skips. `metadata_store`
+    // was cleared above, hashes and index metadata included, so a failure
+    // before final publication leaves both absent, every file reads as new and
+    // the next run reprocesses. A failure during the final metadata writes can
+    // happen only after both stores are complete. `update.rs` keeps the same
+    // order.
+    metadata_store
+        .set_file_hashes_batch(file_hashes)
+        .context("failed to store file hashes")?;
+    super::freshness::record_index_snapshot(&metadata_store, metadata.indexing_config)
+        .context("failed to store index freshness metadata")?;
 
     Ok(())
 }
