@@ -70,9 +70,18 @@ pub enum Commands {
 
     /// Start the Vera HTTP API server for remote embedding and reranking.
     #[command(long_about = "Start the Vera HTTP API server.\n\n\
-                      Loads the embedding model and reranker ONCE at startup (using the \
-                      selected backend), then exposes them via HTTP so any unmodified \
-                      vera client can use this host for compute.\n\n\
+                      Loads the embedding model at startup and keeps it (using the \
+                      selected backend), then exposes it via HTTP so any unmodified vera \
+                      client can use this host for compute.\n\n\
+                      The reranker is built at startup too, to check it works, but that \
+                      copy is discarded rather than kept: a server that only answers \
+                      /v1/embeddings would otherwise hold it for nothing. Startup \
+                      therefore pays for both models, and the first /v1/rerank request \
+                      pays to load the reranker again.\n\n\
+                      A loaded model is held in memory and reused across requests. It is \
+                      unloaded after --idle-timeout seconds of inactivity and reloaded on \
+                      the next request that needs it; see that flag for the values that \
+                      keep it loaded indefinitely or rebuild it per request.\n\n\
                       Standard client setup (no client changes needed):\n  \
                       1. Start server:  vera serve --onnx-jina-cuda\n  \
                       2. Configure client:\n  \
@@ -105,10 +114,12 @@ pub enum Commands {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Seconds of inactivity before the model is unloaded from memory.
-        /// 0 = disable cache (reload per request, same behaviour as vera search).
-        /// -1 = keep loaded indefinitely.
-        #[arg(long, default_value = "0")]
+        /// Seconds of inactivity before a model is unloaded from memory.
+        /// 0 = rebuild the model on every request, and hold one live model per
+        /// concurrent request; only useful to pick up model files replaced under
+        /// a running server. Any negative value, -1 included, keeps models
+        /// loaded indefinitely.
+        #[arg(long, default_value_t = 300, allow_negative_numbers = true)]
         idle_timeout: i64,
 
         #[command(flatten)]
@@ -234,6 +245,9 @@ pub enum Commands {
                       API environment variables, and whether the current repository \
                       has a `.vera/` index. `--probe` adds a deeper read-only local \
                       backend probe and never downloads or repairs missing assets.\n\n\
+                      Exits 1 if any check fails, so `vera doctor && vera index .` \
+                      stops on a broken setup. Warnings do not affect the exit \
+                      code.\n\n\
                       Examples:\n  \
                       vera doctor\n  \
                       vera doctor --probe\n  \

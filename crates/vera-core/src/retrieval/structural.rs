@@ -10,6 +10,7 @@ use tree_sitter::Parser;
 
 use crate::corpus::{ContentClass, classify_content};
 use crate::parsing::languages;
+use crate::path_containment::{canonical_project_root, resolve_indexed_path};
 use crate::retrieval::apply_filters;
 use crate::retrieval::file_scan::{
     allows_class, bounded_byte_snippet, language_for_path, smallest_symbol_chunk_for_line,
@@ -56,9 +57,7 @@ pub fn search_structural(
 
     let metadata_path = index_dir.join("metadata.db");
     let store = MetadataStore::open(&metadata_path)?;
-    let repo_root = index_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from index dir"))?;
+    let repo_root = canonical_project_root(index_dir)?;
     let filters = structural_filters(filters);
 
     match kind {
@@ -67,15 +66,15 @@ pub fn search_structural(
             search_definitions(&store, symbol, limit, &filters)
         }
         StructuralSearchKind::EnvReads => {
-            search_env_reads(repo_root, &store, query, limit, &filters)
+            search_env_reads(&repo_root, &store, query, limit, &filters)
         }
         StructuralSearchKind::RouteHandlers => {
             reject_query(kind, query)?;
-            search_route_handlers(repo_root, &store, limit, &filters)
+            search_route_handlers(&repo_root, &store, limit, &filters)
         }
         StructuralSearchKind::SqlQueries => {
             reject_query(kind, query)?;
-            search_sql_queries(repo_root, &store, limit, &filters)
+            search_sql_queries(&repo_root, &store, limit, &filters)
         }
         StructuralSearchKind::Implementations => {
             let target = required_query(kind, query)?;
@@ -93,17 +92,18 @@ fn structural_filters(filters: &SearchFilters) -> SearchFilters {
 }
 
 fn required_query(kind: StructuralSearchKind, query: Option<&str>) -> Result<&str> {
-    query
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{} requires a query", kind_label(kind)))
+    non_blank(query).ok_or_else(|| anyhow::anyhow!("{} requires a query", kind_label(kind)))
+}
+
+fn non_blank(query: Option<&str>) -> Option<&str> {
+    query.map(str::trim).filter(|value| !value.is_empty())
 }
 
 /// `ROUTE_PATTERNS` and `SQL_PATTERNS` carry no capture group, so unlike `ENV_PATTERNS`
 /// there is no term-bearing entity for a query to narrow against. Dropping the argument
 /// instead of rejecting it makes an unfiltered result set read as a match failure.
 fn reject_query(kind: StructuralSearchKind, query: Option<&str>) -> Result<()> {
-    match query.map(str::trim).filter(|value| !value.is_empty()) {
+    match non_blank(query) {
         Some(value) => bail!(
             "{} accepts no query term; got {value:?}. Narrow with path, language, or scope filters instead.",
             kind_label(kind)
@@ -152,7 +152,7 @@ fn search_env_reads(
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
-    let target = query.map(str::trim).filter(|value| !value.is_empty());
+    let target = non_blank(query);
     search_regex_intent(
         repo_root,
         store,
@@ -280,7 +280,9 @@ where
             continue;
         }
 
-        let file_abs = repo_root.join(&file_rel);
+        let Some(file_abs) = resolve_indexed_path(repo_root, &file_rel) else {
+            continue;
+        };
         let content = match crate::discovery::read_source_lossy(&file_abs) {
             Ok(content) => content,
             Err(e) => {

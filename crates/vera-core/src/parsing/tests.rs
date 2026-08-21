@@ -65,6 +65,67 @@ impl Point {
 }
 
 #[test]
+fn rust_impl_methods_emit_no_gap_chunks() {
+    let source = r#"impl CancellationToken {
+    /// Create a token.
+    fn new() -> Self {
+        Self
+    }
+
+    /// Cancel the token.
+    fn cancel(&self) {}
+}
+"#;
+    let chunks = parse(source, "cancellation.rs", Language::Rust);
+
+    let impl_block = find_chunk(&chunks, "impl CancellationToken");
+    assert_eq!(impl_block.symbol_type, Some(SymbolType::Block));
+    assert!(
+        impl_block.content.contains("fn cancel"),
+        "impl chunk should cover the whole body: {impl_block:?}"
+    );
+    for method in ["new", "cancel"] {
+        let chunk = find_chunk(&chunks, method);
+        assert_eq!(
+            chunk.symbol_type,
+            Some(SymbolType::Method),
+            "`{method}` should be chunked as a method: {chunk:?}"
+        );
+    }
+
+    let unnamed: Vec<_> = chunks.iter().filter(|c| c.symbol_name.is_none()).collect();
+    assert!(
+        unnamed.is_empty(),
+        "spans inside the impl are already covered by its chunk: {unnamed:?}"
+    );
+    assert!(
+        !chunks.iter().any(|c| c.content.trim() == "}"),
+        "the impl's closing brace must not become its own chunk: {chunks:?}"
+    );
+}
+
+#[test]
+fn rust_inline_module_children_preserve_only_the_trailing_gap() {
+    let source = r#"mod nested {
+    fn first() {}
+
+    // Covered by the module chunk, not a separate gap.
+    fn second() {}
+}
+
+use std::fmt;
+"#;
+    let chunks = parse(source, "nested.rs", Language::Rust);
+    let names: Vec<_> = chunks
+        .iter()
+        .map(|chunk| chunk.symbol_name.as_deref())
+        .collect();
+
+    assert_eq!(names, [Some("nested"), Some("first"), Some("second"), None]);
+    assert_eq!(chunks.last().unwrap().content.trim(), "use std::fmt;");
+}
+
+#[test]
 fn rust_enum_and_trait() {
     let source = r#"enum Color {
     Red,
@@ -394,6 +455,62 @@ export function App() {
     assert!(
         refs.iter().any(|r| r.callee == "Hello"),
         "JSX usage should be recorded as a call site: {refs:?}"
+    );
+}
+
+#[test]
+fn jsx_dotted_components_index_under_the_rightmost_segment() {
+    // Pins the naming convention for dotted JSX components.
+    //
+    // `<Icons.Arrow />` is recorded as `Arrow`, not `Icons.Arrow`. That is not
+    // an accident of `extract_callee` — it is what makes the call site link to
+    // the definition. A component re-exported as `Icons.Arrow` is *defined*
+    // somewhere as `Arrow` (`export function Arrow`), and definitions are
+    // indexed under that bare name, as is every other member call
+    // (`obj.method()` records `method`). Recording `Icons.Arrow` would leave
+    // the reference matching no definition, which is the invisibility this
+    // whole path exists to fix.
+    //
+    // A lowercase root stays a component too: `<icons.Arrow />` is a member
+    // expression, and a member expression is always a value lookup. Only a
+    // bare lowercase identifier is an intrinsic host element.
+    let source = r#"import * as Icons from "./icons";
+import * as icons from "./icons";
+
+export function Toolbar() {
+    return (
+        <div className="bar">
+            <Icons.Arrow />
+            <icons.Chevron />
+            <span />
+            <My-element />
+        </div>
+    );
+}
+"#;
+    let (_, refs, diagnostics) = parse_file_with_diagnostics(
+        source,
+        "src/toolbar.tsx",
+        Language::TypeScript,
+        &default_config(),
+    )
+    .unwrap();
+
+    assert!(
+        !diagnostics.tree_has_error,
+        "tsx should parse without errors"
+    );
+    let mut callees: Vec<&str> = refs.iter().map(|r| r.callee.as_str()).collect();
+    callees.sort_unstable();
+
+    // An exact set, not `contains`: a root segment leaking in as its own
+    // reference (`Icons`, `icons`) is precisely the failure mode worth
+    // catching, and a containment check would not see it. `div`/`span` are
+    // intrinsic by the lowercase rule and `My-element` by the hyphen rule.
+    assert_eq!(
+        callees,
+        vec!["Arrow", "Chevron"],
+        "expected exactly the two dotted components, rightmost segment only"
     );
 }
 

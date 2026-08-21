@@ -284,6 +284,97 @@ fn rrf_distinct_results_no_overlap() {
 }
 
 #[test]
+fn rrf_ties_break_on_file_path_then_line_range() {
+    // Equal weights make the ties bit-identical: a result found only in BM25 at rank r
+    // and one found only in the vector list at rank r both score 1/(k + r). Fusion
+    // collects into a HashMap, so without an explicit tie-break the order of each pair
+    // is the HashMap seed, which is fresh per process.
+    let bm25 = vec![
+        make_result("z_bm25.rs", 1, 10, 5.0, None),
+        make_result("a_bm25.rs", 1, 10, 4.0, None),
+        make_result("shared.rs", 200, 210, 3.0, None),
+        make_result("shared.rs", 300, 1000, 2.0, None),
+    ];
+    let vector = vec![
+        make_result("m_vec.rs", 1, 10, 0.9, None),
+        make_result("b_vec.rs", 1, 10, 0.8, None),
+        make_result("shared.rs", 30, 40, 0.7, None),
+        make_result("shared.rs", 300, 305, 0.6, None),
+    ];
+
+    // Each call builds a fresh HashMap, and std gives every HashMap in a thread its own
+    // hash keys, so repeating the call samples several orders within this one process.
+    for _ in 0..8 {
+        let results = fuse_rrf(&bm25, &vector, 60.0, 10);
+
+        let order: Vec<(&str, u32, u32)> = results
+            .iter()
+            .map(|result| {
+                (
+                    result.file_path.as_str(),
+                    result.line_start,
+                    result.line_end,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            order,
+            vec![
+                // rank 1 tie, ascending file_path
+                ("m_vec.rs", 1, 10),
+                ("z_bm25.rs", 1, 10),
+                // rank 2 tie, ascending file_path
+                ("a_bm25.rs", 1, 10),
+                ("b_vec.rs", 1, 10),
+                // rank 3 tie, same file, ascending line_start numerically (a lexicographic
+                // compare of the "path:start:end" key would put 200 before 30)
+                ("shared.rs", 30, 40),
+                ("shared.rs", 200, 210),
+                // rank 4 tie, same file and same line_start, so only line_end separates
+                // them; 305 before 1000 is again the numeric order, not the lexicographic
+                // one. A comparator that stopped at (file_path, line_start) would leave
+                // this pair on the HashMap seed.
+                ("shared.rs", 300, 305),
+                ("shared.rs", 300, 1000),
+            ],
+            "tied RRF scores must order by (file_path, line_start, line_end)"
+        );
+    }
+}
+
+#[test]
+fn rrf_multi_source_ties_break_on_file_path() {
+    // The multi-query path fuses more than two lists, so a single rank can carry a tie
+    // as wide as the number of sources. Six disjoint sets, one hit each at rank 1, give
+    // a six-way bit-identical tie whose order is otherwise the HashMap seed.
+    let sets: Vec<Vec<SearchResult>> = ["e.rs", "c.rs", "f.rs", "a.rs", "d.rs", "b.rs"]
+        .iter()
+        .map(|file| vec![make_result(file, 1, 10, 1.0, None)])
+        .collect();
+    let refs: Vec<&[SearchResult]> = sets.iter().map(|set| set.as_slice()).collect();
+
+    let results = fuse_rrf_multi_weighted(&refs, &[1.0; 6], 60.0, 10);
+
+    let order: Vec<&str> = results
+        .iter()
+        .map(|result| result.file_path.as_str())
+        .collect();
+
+    assert_eq!(
+        order,
+        vec!["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f.rs"],
+        "a tie across all sources must order by file_path, not by insertion or hash order"
+    );
+    for result in &results {
+        assert!(
+            (result.score - 1.0 / 61.0).abs() < 1e-10,
+            "all six must tie"
+        );
+    }
+}
+
+#[test]
 fn rrf_different_chunks_same_file_are_separate() {
     // Two different chunks from the same file should be treated as separate.
     let bm25 = vec![
@@ -449,6 +540,144 @@ async fn search_hybrid_keeps_intent_out_of_bm25() {
             result.file_path == "auth.rs" && result.content.contains("authenticate")
         }),
         "BM25 should return the authenticate chunk for the raw query"
+    );
+}
+
+/// An embedding provider that spends a known amount of time in `embed_batch`,
+/// so the model cost dominates the span the storage stages share with it and
+/// its attribution is decidable from the reported stages alone.
+struct SlowProvider {
+    inner: crate::embedding::test_helpers::MockProvider,
+    delay: std::time::Duration,
+}
+
+impl crate::embedding::EmbeddingProvider for SlowProvider {
+    async fn embed_batch(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbeddingError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.embed_batch(texts).await
+    }
+
+    fn expected_dim(&self) -> Option<usize> {
+        self.inner.expected_dim()
+    }
+}
+
+// Regression for issue #105: `embedding` and `vector` were both assigned the
+// span that covers the embedding, the store opens, the KNN query and
+// hydration, so `--timing` printed one measurement twice.
+//
+// The split itself is asserted by `charge_vector_span_partitions_the_span`
+// below, on values rather than on a clock. It has to be, because the span the
+// two stages are cut from is internal to `search_hybrid` and no measurement
+// available to this test stands in for it. The wall time of the whole call
+// does not: BM25 runs concurrently with the vector arm and is awaited after
+// it, so that wall time is the slower arm's. Guarding on the reported BM25
+// stage does not repair the substitution, because `bm25_elapsed` starts inside
+// the `spawn_blocking` closure and so measures the arm's duration, not when it
+// finished relative to the vector arm.
+//
+// Nor is the storage stage small enough to be bounded by the injected model
+// cost. Measured on this fixture, `vector` is 1.6 to 2.9 ms standalone but
+// 262.7 ms inside the 794-test suite, against a 300 ms sleep: a 1.14x margin.
+// Every bound of that family, absolute or relative to a second run, sits on
+// the wrong side of that number, so this test asserts none of them.
+//
+// What is left here is machine-independent and worth keeping: the provider
+// cost reaches `embedding`, the storage cost still reaches `vector`, and the
+// two are no longer one value reported twice, which is the symptom #105 was
+// filed for.
+#[tokio::test]
+async fn search_hybrid_charges_embedding_delay_to_embedding_not_vector() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (index_dir, dim) = setup_test_index(tmp.path()).await;
+
+    let delay = std::time::Duration::from_millis(300);
+    let provider = SlowProvider {
+        inner: crate::embedding::test_helpers::MockProvider::new(dim),
+        delay,
+    };
+
+    let (_results, timings) = search_hybrid(
+        &index_dir,
+        &provider,
+        "authenticate",
+        "authenticate",
+        &SearchFilters::default(),
+        5,
+        60.0,
+        dim,
+        50,
+    )
+    .await
+    .unwrap();
+
+    let embedding = timings.embedding.expect("embedding stage must be reported");
+    let vector = timings.vector.expect("vector stage must be reported");
+
+    // `sleep` never returns early, so this is a property of the provider rather
+    // than of the machine: the model cost reaches `embedding`.
+    assert!(
+        embedding >= delay,
+        "embedding must carry the provider cost: {embedding:?} < {delay:?}"
+    );
+
+    // Taking the embedding out must not empty the stage: the store opens, the
+    // KNN query and hydration are still charged to `vector`. This presence has
+    // to be asserted before the non-identity below, which a zeroed `vector`
+    // would otherwise satisfy.
+    assert!(
+        vector > std::time::Duration::ZERO,
+        "vector must still carry the storage cost: {vector:?}"
+    );
+
+    // The reported symptom. Under the bug both stages were assigned the same
+    // `Duration` value, so this fails on the bug whatever the machine is doing;
+    // reaching it legitimately would need the storage cost to equal the model
+    // cost to the nanosecond.
+    assert_ne!(
+        embedding, vector,
+        "the two stages must not be one measurement printed twice"
+    );
+}
+
+// The split itself, on values. `search_hybrid` cannot expose the span it cuts,
+// so this asserts the cut where it is decidable: given a span and the embedding
+// measurement taken inside it, the two stages must partition the span. Under
+// the bug each stage got the whole span, which this rejects without a clock.
+//
+// `charge_vector_span` writes both `HybridTimings` fields rather than returning
+// two values for the caller to assign, so this test covers the assignment as
+// well as the arithmetic. That is deliberate. While the caller did the
+// assigning, a caller that kept the remainder on `vector` but charged the whole
+// span to `embedding` passed this test and the one above together, which is a
+// second way to make `embedding` unattributable. The three durations here are
+// distinct so neither field can hold the whole span by coincidence.
+#[test]
+fn charge_vector_span_partitions_the_span() {
+    let span = std::time::Duration::from_millis(500);
+    let embed = std::time::Duration::from_millis(300);
+
+    let mut timings = HybridTimings::default();
+    charge_vector_span(&mut timings, span, Some(embed));
+
+    assert_eq!(
+        (timings.embedding, timings.vector),
+        (Some(embed), Some(std::time::Duration::from_millis(200))),
+        "embedding takes the model cost and vector takes the remainder"
+    );
+
+    // A vector search that failed reports no embedding, so the whole span is
+    // storage cost rather than being dropped.
+    let mut failed = HybridTimings::default();
+    charge_vector_span(&mut failed, span, None);
+
+    assert_eq!(
+        (failed.embedding, failed.vector),
+        (None, Some(span)),
+        "an unmeasured embedding leaves the whole span on vector"
     );
 }
 

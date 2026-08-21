@@ -19,6 +19,12 @@ pub(super) const EMBEDDING_MAX_LENGTH: usize = 512;
 pub(super) const ONNX_HEADER_MAX_BYTES: usize = 4 * 1024;
 pub(super) const ONNX_HEADER_MAX_FIELDS: usize = 256;
 
+/// jina-embeddings-v5-text-nano-retrieval is asymmetric: `config_sentence_transformers.json`
+/// declares `{"query": "Query: ", "document": "Document: "}` and the model card requires both
+/// sides for the retrieval variant.
+pub(super) const JINA_QUERY_PREFIX: &str = "Query:";
+pub(super) const JINA_DOCUMENT_PREFIX: &str = "Document:";
+
 pub(super) const CODERANK_EMBEDDING_REPO: &str = "Zenabius/CodeRankEmbed-onnx";
 pub(super) const CODERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code:";
 
@@ -38,6 +44,7 @@ pub const LOCAL_EMBEDDING_DIM_ENV: &str = "VERA_LOCAL_EMBEDDING_DIM";
 pub const LOCAL_EMBEDDING_POOLING_ENV: &str = "VERA_LOCAL_EMBEDDING_POOLING";
 pub const LOCAL_EMBEDDING_MAX_LENGTH_ENV: &str = "VERA_LOCAL_EMBEDDING_MAX_LENGTH";
 pub const LOCAL_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_LOCAL_EMBEDDING_QUERY_PREFIX";
+pub const LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "VERA_LOCAL_EMBEDDING_DOCUMENT_PREFIX";
 pub const LEGACY_EMBEDDING_QUERY_PREFIX_ENV: &str = "VERA_EMBEDDING_QUERY_PREFIX";
 
 pub(super) const RERANKER_REPO: &str = "jinaai/jina-reranker-v2-base-multilingual";
@@ -92,6 +99,9 @@ pub(super) static MODEL_DOWNLOAD_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 pub enum LocalEmbeddingPooling {
     Mean,
     Cls,
+    /// Take the final unpadded token. Required by jina-embeddings-v5, whose
+    /// `1_Pooling/config.json` sets `pooling_mode_lasttoken`.
+    LastToken,
 }
 
 impl fmt::Display for LocalEmbeddingPooling {
@@ -99,6 +109,7 @@ impl fmt::Display for LocalEmbeddingPooling {
         match self {
             Self::Mean => write!(f, "mean"),
             Self::Cls => write!(f, "cls"),
+            Self::LastToken => write!(f, "last-token"),
         }
     }
 }
@@ -110,8 +121,9 @@ impl std::str::FromStr for LocalEmbeddingPooling {
         match value.trim().to_ascii_lowercase().as_str() {
             "mean" => Ok(Self::Mean),
             "cls" => Ok(Self::Cls),
+            "last-token" | "lasttoken" | "last_token" => Ok(Self::LastToken),
             other => Err(format!(
-                "invalid pooling mode: {other} (expected `mean` or `cls`)"
+                "invalid pooling mode: {other} (expected `mean`, `cls` or `last-token`)"
             )),
         }
     }
@@ -137,6 +149,8 @@ pub struct LocalEmbeddingModelConfig {
     pub max_length: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +172,7 @@ impl LocalEmbeddingModelConfig {
         onnx_data_file: Option<&str>,
         pooling: LocalEmbeddingPooling,
         query_prefix: Option<&str>,
+        document_prefix: Option<&str>,
     ) -> Self {
         Self {
             source: LocalEmbeddingSource::HuggingFace {
@@ -170,15 +185,21 @@ impl LocalEmbeddingModelConfig {
             pooling,
             max_length: EMBEDDING_MAX_LENGTH,
             query_prefix: query_prefix.map(str::to_string),
+            document_prefix: document_prefix.map(str::to_string),
         }
     }
 
+    /// `jina-embeddings-v5-text-nano-retrieval` pools on the final token, not
+    /// the mean: `1_Pooling/config.json` sets `pooling_mode_lasttoken`, and the
+    /// ONNX graph carries a matching `lasttoken_squeeze` + normalize path whose
+    /// result it exposes as a second `sentence_embedding` output.
     pub fn jina() -> Self {
         Self::preset(
             EMBEDDING_REPO,
             Some(EMBEDDING_ONNX_DATA_FILE),
-            LocalEmbeddingPooling::Mean,
-            None,
+            LocalEmbeddingPooling::LastToken,
+            Some(JINA_QUERY_PREFIX),
+            Some(JINA_DOCUMENT_PREFIX),
         )
     }
 
@@ -188,7 +209,50 @@ impl LocalEmbeddingModelConfig {
             None,
             LocalEmbeddingPooling::Cls,
             Some(CODERANK_QUERY_PREFIX),
+            None,
         )
+    }
+
+    /// The exact model config `vera setup` froze into `config.json` for jina
+    /// before the pooling fix.
+    ///
+    /// Frozen literals, never the `EMBEDDING_*` constants. This describes a
+    /// file already sitting on someone's disk, so it must not follow the live
+    /// preset: deriving it from the constants means the day one of them moves
+    /// — raising `EMBEDDING_MAX_LENGTH` for #67, renaming an ONNX export — the
+    /// literal stops matching any real pre-fix config and the migration
+    /// silently never fires again, leaving every such install mean-pooled with
+    /// no error. `legacy_jina_literal_stays_pinned_when_the_constants_move` is
+    /// the tripwire for that.
+    fn legacy_jina_before_pooling_fix() -> Self {
+        Self {
+            source: LocalEmbeddingSource::HuggingFace {
+                repo: "jinaai/jina-embeddings-v5-text-nano-retrieval".to_string(),
+            },
+            onnx_file: "onnx/model_quantized.onnx".to_string(),
+            onnx_data_file: Some("onnx/model_quantized.onnx_data".to_string()),
+            tokenizer_file: "tokenizer.json".to_string(),
+            embedding_dim: 768,
+            pooling: LocalEmbeddingPooling::Mean,
+            max_length: 512,
+            query_prefix: None,
+            document_prefix: None,
+        }
+    }
+
+    /// Repair a stored config that froze jina's old mean-pooling default.
+    ///
+    /// `vera setup` writes the resolved model config to `config.json` and that
+    /// copy wins over the preset, so an install created before this fix would
+    /// keep mean-pooling jina forever. Only the exact old preset is upgraded;
+    /// a config differing in any field is treated as deliberate and left
+    /// alone.
+    pub fn repair_stored_defaults(self) -> Self {
+        if self == Self::legacy_jina_before_pooling_fix() {
+            Self::jina()
+        } else {
+            self
+        }
     }
 
     pub fn from_huggingface_repo(repo: impl Into<String>) -> Self {
@@ -199,10 +263,10 @@ impl LocalEmbeddingModelConfig {
     }
 
     pub fn from_directory(path: PathBuf) -> Self {
-        Self {
-            source: LocalEmbeddingSource::Directory { path },
-            ..Self::default()
-        }
+        let source = LocalEmbeddingSource::Directory { path };
+        let mut defaults = Self::defaults_for_source(&source);
+        defaults.source = source;
+        defaults
     }
 
     /// Switch to the FP16 ONNX model when running on a GPU execution provider.
@@ -277,8 +341,18 @@ impl LocalEmbeddingModelConfig {
     }
 
     pub fn model_identity(&self) -> String {
+        // Presets keep a readable identity, but pooling has to stay in it.
+        // Vectors pooled two different ways are not comparable, so a pooling
+        // change must invalidate an existing index rather than silently query
+        // mean-pooled rows with last-token vectors.
         if self == &Self::jina() || self == &Self::coderankembed() {
-            return self.display_name();
+            return format!(
+                "{}|pooling={}|qp={}|dp={}",
+                self.display_name(),
+                self.pooling,
+                Self::prefix_identity(self.query_prefix.as_deref()),
+                Self::prefix_identity(self.document_prefix.as_deref()),
+            );
         }
 
         let source = match &self.source {
@@ -287,26 +361,64 @@ impl LocalEmbeddingModelConfig {
         };
         let onnx_data = self.onnx_data_file.as_deref().unwrap_or("-");
         format!(
-            "{source}|onnx={}|onnx_data={onnx_data}|tokenizer={}|pooling={}|dim={}|max_length={}",
-            self.onnx_file, self.tokenizer_file, self.pooling, self.embedding_dim, self.max_length
+            "{source}|onnx={}|onnx_data={onnx_data}|tokenizer={}|pooling={}|dim={}|max_length={}|qp={}|dp={}",
+            self.onnx_file,
+            self.tokenizer_file,
+            self.pooling,
+            self.embedding_dim,
+            self.max_length,
+            Self::prefix_identity(self.query_prefix.as_deref()),
+            Self::prefix_identity(self.document_prefix.as_deref()),
         )
     }
 
-    pub fn query_text(&self, query: &str) -> String {
-        let Some(prefix) = self
-            .query_prefix
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return query.to_string();
-        };
+    /// The canonical form of a configured prefix: trimmed, and absent once
+    /// nothing is left of it.
+    ///
+    /// Both the text that gets embedded and the identity that guards the index
+    /// go through here, so two configs that embed byte-identical text can never
+    /// disagree about whether the index is stale.
+    fn normalize_prefix(prefix: Option<&str>) -> Option<&str> {
+        prefix.map(str::trim).filter(|value| !value.is_empty())
+    }
 
-        if prefix.chars().last().is_some_and(char::is_whitespace) {
-            format!("{prefix}{query}")
-        } else {
-            format!("{prefix} {query}")
+    /// Encode a prefix for `model_identity`.
+    ///
+    /// Length-delimited, because `|qp=` and `|dp=` are otherwise ordinary text:
+    /// a prefix containing one moved the field boundary, so
+    /// `qp="a" dp="b|dp=c"` and `qp="a|dp=b" dp="c"` encoded to the same
+    /// string. The absent case gets a marker no encoded value can spell, since
+    /// a present prefix always starts with its length; `unwrap_or("-")` used to
+    /// give an unprefixed config and one prefixed with a literal `-` the same
+    /// identity, so the staleness guard let their vectors share a table.
+    fn prefix_identity(prefix: Option<&str>) -> String {
+        match Self::normalize_prefix(prefix) {
+            Some(value) => format!("{}:{value}", value.len()),
+            None => "none".to_string(),
         }
+    }
+
+    /// Join a configured prefix to a text with exactly one space.
+    ///
+    /// The prefix is trimmed first, so a trailing space in the configured
+    /// value cannot double up. That trim is also why there is no
+    /// whitespace-preserving branch: a trimmed prefix can never end in
+    /// whitespace by the time it is joined.
+    fn apply_prefix(prefix: Option<&str>, text: &str) -> String {
+        let Some(prefix) = Self::normalize_prefix(prefix) else {
+            return text.to_string();
+        };
+        format!("{prefix} {text}")
+    }
+
+    pub fn query_text(&self, query: &str) -> String {
+        Self::apply_prefix(self.query_prefix.as_deref(), query)
+    }
+
+    /// Prefix an indexed passage. Mirrors `query_text` and is applied only on
+    /// the indexing path, so a query never receives it.
+    pub fn document_text(&self, document: &str) -> String {
+        Self::apply_prefix(self.document_prefix.as_deref(), document)
     }
 
     pub fn cached_asset_paths(&self) -> Result<LocalEmbeddingAssetPaths> {
@@ -328,8 +440,25 @@ impl LocalEmbeddingModelConfig {
             LocalEmbeddingSource::HuggingFace { repo } if repo == CODERANK_EMBEDDING_REPO => {
                 Self::coderankembed()
             }
-            _ => Self::default(),
+            LocalEmbeddingSource::HuggingFace { repo } if repo == EMBEDDING_REPO => Self::jina(),
+            _ => Self::generic_defaults(),
         }
+    }
+
+    /// Asset shape for a repo Vera has no preset for: jina's file layout and
+    /// dimensions, with mean pooling.
+    ///
+    /// Held separate from `jina()` so that jina's own pooling can be correct
+    /// without changing how every custom repo is pooled. `from_source`
+    /// overwrites `source`, so only the non-source fields are inherited.
+    fn generic_defaults() -> Self {
+        Self::preset(
+            EMBEDDING_REPO,
+            Some(EMBEDDING_ONNX_DATA_FILE),
+            LocalEmbeddingPooling::Mean,
+            None,
+            None,
+        )
     }
 
     fn apply_env_overrides(defaults: Self) -> Result<Self> {
@@ -348,7 +477,12 @@ impl LocalEmbeddingModelConfig {
             embedding_dim: parse_env_usize(LOCAL_EMBEDDING_DIM_ENV, defaults.embedding_dim)?,
             pooling: parse_pooling_env(LOCAL_EMBEDDING_POOLING_ENV, defaults.pooling)?,
             max_length: parse_env_usize(LOCAL_EMBEDDING_MAX_LENGTH_ENV, defaults.max_length)?,
-            query_prefix: parse_query_prefix_from_env().or_else(|| defaults.query_prefix.clone()),
+            query_prefix: query_prefix_from_env(defaults.query_prefix.clone(), explicit_model_env),
+            document_prefix: env_optional_override(
+                LOCAL_EMBEDDING_DOCUMENT_PREFIX_ENV,
+                defaults.document_prefix.clone(),
+                explicit_model_env,
+            ),
         })
     }
 }
@@ -418,6 +552,13 @@ fn env_optional_override(
     resolve_optional_env_value(value.as_deref(), default, explicit_model_env)
 }
 
+/// Resolve a field whose absence is meaningful.
+///
+/// Unlike `env_override`, a variable that is set but empty is not the same as
+/// an unset one: it is the opt-out, and returns `None` without consulting the
+/// default. An unset variable falls back to the preset default unless the
+/// caller spelled the model out through the environment, in which case nothing
+/// is inherited from the preset.
 fn resolve_optional_env_value(
     value: Option<&str>,
     default: Option<String>,
@@ -458,9 +599,23 @@ pub(super) fn parse_pooling_env(
     }
 }
 
-pub(super) fn parse_query_prefix_from_env() -> Option<String> {
-    env_override(LOCAL_EMBEDDING_QUERY_PREFIX_ENV)
-        .or_else(|| env_override(LEGACY_EMBEDDING_QUERY_PREFIX_ENV))
+/// Resolve the query prefix from the canonical variable, then the legacy one.
+///
+/// The canonical variable is consulted even when it is empty: an empty value is
+/// the opt-out, so it has to suppress the legacy variable rather than fall
+/// through to it.
+pub(super) fn query_prefix_from_env(
+    default: Option<String>,
+    explicit_model_env: bool,
+) -> Option<String> {
+    match std::env::var(LOCAL_EMBEDDING_QUERY_PREFIX_ENV) {
+        Ok(value) => resolve_optional_env_value(Some(&value), default, explicit_model_env),
+        Err(_) => env_optional_override(
+            LEGACY_EMBEDDING_QUERY_PREFIX_ENV,
+            default,
+            explicit_model_env,
+        ),
+    }
 }
 
 pub fn normalize_huggingface_repo(value: &str) -> Result<String> {

@@ -28,6 +28,7 @@ pub fn init_tls() {
 
 pub mod indexing;
 pub mod parsing;
+pub(crate) mod path_containment;
 pub mod presentation;
 pub mod retrieval;
 pub mod storage;
@@ -42,3 +43,6 @@ pub mod local_models;
 
 /// Index statistics collection.
 pub mod stats;
+
+#[cfg(test)]
+mod test_env;

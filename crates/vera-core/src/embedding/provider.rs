@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::chunk_text;
+use crate::local_models::CODERANK_QUERY_PREFIX;
 use crate::types::Chunk;
 
 // ── Error types ──────────────────────────────────────────────────────
@@ -76,6 +77,12 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Rewrite query text for providers that require asymmetric query prefixes.
     fn prepare_query_text(&self, query: &str) -> String {
         query.to_string()
+    }
+
+    /// Rewrite passage text for providers that require asymmetric document
+    /// prefixes. Applied on the indexing path only.
+    fn prepare_document_text(&self, document: &str) -> String {
+        document.to_string()
     }
 
     /// Return the maximum number of inputs the provider accepts per request.
@@ -193,7 +200,9 @@ fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
     if id.contains("qwen3-embedding") || id.contains("qwen3_embedding") {
         Some("Instruct: Given a code search query, retrieve relevant code snippets that match the query\nQuery: ".into())
     } else if id.contains("coderankembed") {
-        Some("Represent this query for retrieving relevant code: ".into())
+        // `prepare_query_text` concatenates without a separator, so the
+        // trailing space belongs here rather than in the shared constant.
+        Some(format!("{CODERANK_QUERY_PREFIX} "))
     } else if id.contains("e5-") || id.contains("e5_") {
         Some("query: ".into())
     } else if id.contains("bge-") || id.contains("bge_") {
@@ -655,6 +664,10 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CachedEmbeddingProvider<P> {
         self.inner.prepare_query_text(query)
     }
 
+    fn prepare_document_text(&self, document: &str) -> String {
+        self.inner.prepare_document_text(document)
+    }
+
     fn max_batch_size(&self) -> Option<usize> {
         self.inner.max_batch_size()
     }
@@ -1032,6 +1045,8 @@ where
     let mut indexed_chunks: Vec<(usize, &Chunk)> = chunks.iter().enumerate().collect();
     indexed_chunks.sort_by_key(|(_, c)| c.content.len());
 
+    let body_budget = budget_after_prefix(max_chunk_bytes, document_prefix_overhead(provider));
+
     let batch_inputs: Vec<Vec<EmbeddingBatchItem>> = indexed_chunks
         .chunks(batch_size)
         .map(|batch| {
@@ -1040,7 +1055,8 @@ where
                 .map(|(orig_idx, chunk)| EmbeddingBatchItem {
                     original_index: *orig_idx,
                     chunk_id: chunk.id.clone(),
-                    text: chunk_to_embedding_text(chunk, max_chunk_bytes),
+                    text: provider
+                        .prepare_document_text(&chunk_to_embedding_text(chunk, body_budget)),
                 })
                 .collect()
         })
@@ -1100,6 +1116,33 @@ fn chunk_to_embedding_text(chunk: &Chunk, max_bytes: usize) -> String {
     } else {
         chunk_text::build_embedding_text(chunk)
     }
+}
+
+/// Measure how many bytes `prepare_document_text` adds to a passage.
+///
+/// Read off the provider rather than off the model config, so it stays correct
+/// for any implementation of the hook, including the identity default.
+fn document_prefix_overhead<P: EmbeddingProvider>(provider: &P) -> usize {
+    const PROBE: &str = "x";
+    provider
+        .prepare_document_text(PROBE)
+        .len()
+        .saturating_sub(PROBE.len())
+}
+
+/// Shrink the chunk byte budget so the document prefix fits inside it.
+///
+/// The prefix spends the same context window the budget exists to protect, so
+/// it has to be reserved before truncation rather than added after it.
+///
+/// `0` means "unbounded" to [`chunk_to_embedding_text`], so a prefix at least
+/// as large as the budget floors at 1 instead of saturating to 0, which would
+/// silently switch truncation off entirely.
+fn budget_after_prefix(max_chunk_bytes: usize, prefix_overhead: usize) -> usize {
+    if max_chunk_bytes == 0 {
+        return 0;
+    }
+    max_chunk_bytes.saturating_sub(prefix_overhead).max(1)
 }
 
 // ── Sanitization ─────────────────────────────────────────────────────
@@ -1356,8 +1399,53 @@ mod tests {
     #[test]
     fn auto_detect_coderankembed_prefix() {
         let prefix = default_query_prefix_for_model("krlvi/CodeRankEmbed");
-        assert!(prefix.is_some());
-        assert!(prefix.unwrap().contains("Represent this query"));
+        // Exact: the published prompt in the model's
+        // `config_sentence_transformers.json`, trailing space included.
+        assert_eq!(
+            prefix.as_deref(),
+            Some("Represent this query for searching relevant code: ")
+        );
+    }
+
+    /// The local ONNX path and the API path must embed the same query
+    /// identically. They apply the prefix differently (`query_text` trims the
+    /// *prefix* and rejoins it with one space, `prepare_query_text`
+    /// concatenates a prefix that already carries its own trailing space), so
+    /// this pins the resulting text rather than the constant.
+    ///
+    /// Neither path touches the query itself, so an un-normalized query has to
+    /// survive verbatim and identically on both sides; that case is covered
+    /// here so a one-sided `trim()` cannot be added without failing.
+    #[test]
+    fn coderankembed_query_text_matches_across_local_and_api_paths() {
+        let cases = [
+            (
+                "find router code",
+                "Represent this query for searching relevant code: find router code",
+            ),
+            (
+                "  find router code  ",
+                "Represent this query for searching relevant code:   find router code  ",
+            ),
+        ];
+
+        for (query, expected) in cases {
+            let local =
+                crate::local_models::LocalEmbeddingModelConfig::coderankembed().query_text(query);
+
+            let mut config = EmbeddingProviderConfig::new(
+                "http://x".into(),
+                "krlvi/CodeRankEmbed".into(),
+                "k".into(),
+            );
+            config.query_prefix = default_query_prefix_for_model(&config.model_id);
+            let api = OpenAiProvider::new(config)
+                .unwrap()
+                .prepare_query_text(query);
+
+            assert_eq!(local, api, "paths diverged on {query:?}");
+            assert_eq!(local, expected, "unexpected prefixed text for {query:?}");
+        }
     }
 
     #[test]
@@ -1603,5 +1691,150 @@ mod tests {
 
         assert!(matches!(result, Err(EmbeddingError::Cancelled)));
         assert_eq!(progress_events.load(Ordering::SeqCst), 0);
+    }
+
+    /// Records the texts it is asked to embed and prefixes passages, so the
+    /// test can prove the indexing funnel actually calls the document hook
+    /// rather than merely defining it.
+    struct RecordingProvider {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl EmbeddingProvider for RecordingProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![0.0]).collect())
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(1)
+        }
+
+        fn prepare_document_text(&self, document: &str) -> String {
+            format!("Document: {document}")
+        }
+
+        fn prepare_query_text(&self, query: &str) -> String {
+            format!("Query: {query}")
+        }
+    }
+
+    #[tokio::test]
+    async fn indexing_applies_the_document_prefix_and_not_the_query_prefix() {
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "fn main() {}".to_string(),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+
+        embed_chunks_concurrent_with_progress_and_cancellation(
+            &provider,
+            &chunks,
+            1,
+            1,
+            0,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("embedding should succeed");
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one embedded passage");
+        assert!(
+            seen[0].starts_with("Document: "),
+            "indexing path did not apply the document prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            !seen[0].contains("Query: "),
+            "indexed passage was given the query prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("fn main() {}"),
+            "prefix replaced the chunk body instead of prefixing it: {:?}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_document_prefix_fits_inside_the_chunk_byte_budget() {
+        const BUDGET: usize = 200;
+        let chunks = vec![crate::types::Chunk {
+            id: "chunk-0".to_string(),
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 200,
+            // Far past the budget, so the bounded builder is the thing that
+            // decides the length. Short lines keep the line-boundary cut from
+            // landing well inside the budget and hiding the overshoot.
+            content: "ab\n".repeat(400),
+            language: crate::types::Language::Rust,
+            symbol_type: None,
+            symbol_name: None,
+        }];
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+
+        embed_chunks_concurrent_with_progress_and_cancellation(
+            &provider,
+            &chunks,
+            1,
+            1,
+            BUDGET,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("embedding should succeed");
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one embedded passage");
+        assert!(
+            seen[0].starts_with("Document: "),
+            "the passage lost its document prefix: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("Code:\nab\nab"),
+            "the reservation ate the chunk body: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[0].len() <= BUDGET,
+            "prefixed passage is {} bytes against a {BUDGET}-byte budget",
+            seen[0].len()
+        );
+    }
+
+    #[test]
+    fn a_prefix_larger_than_the_budget_still_leaves_a_budget() {
+        // 0 means "unbounded" to chunk_to_embedding_text, so saturating to it
+        // would turn an over-long prefix into no truncation at all.
+        assert_eq!(budget_after_prefix(8, 10), 1);
+        assert_eq!(budget_after_prefix(8, 8), 1);
+        assert_eq!(budget_after_prefix(200, 10), 190);
+        // An unbounded budget stays unbounded.
+        assert_eq!(budget_after_prefix(0, 10), 0);
+    }
+
+    #[test]
+    fn the_prefix_overhead_is_measured_from_the_provider() {
+        let provider = RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+        assert_eq!(document_prefix_overhead(&provider), "Document: ".len());
+        // A provider that takes the identity default reserves nothing.
+        assert_eq!(document_prefix_overhead(&CancelThenSucceedProvider), 0);
     }
 }

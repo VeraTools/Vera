@@ -516,9 +516,15 @@ fn resolve_local_embedding_model(
     if let Some(max_length) = flags.embedding_max_length {
         model.max_length = max_length;
     }
+    // An empty value is kept rather than collapsed to `None`: it is the only
+    // way to turn a preset's prefix off, and `None` would be restored from the
+    // preset on the next run. Everything downstream treats an empty prefix as
+    // no prefix.
+    if let Some(document_prefix) = flags.embedding_document_prefix.as_ref() {
+        model.document_prefix = Some(document_prefix.trim().to_string());
+    }
     if let Some(query_prefix) = flags.embedding_query_prefix.as_ref() {
-        model.query_prefix =
-            Some(query_prefix.trim().to_string()).filter(|value| !value.is_empty());
+        model.query_prefix = Some(query_prefix.trim().to_string());
     }
 
     Ok(model)
@@ -781,5 +787,33 @@ mod tests {
             false,
             false
         ));
+    }
+
+    /// `--embedding-query-prefix ""` is the only way to turn a preset's prefix
+    /// off. Collapsing it to `None` made `config.json` omit the key entirely,
+    /// and the preset put jina's prefix back on the very next run.
+    #[test]
+    fn an_explicitly_emptied_prefix_flag_is_not_collapsed_to_absent() {
+        let flags = LocalEmbeddingModelFlags {
+            embedding_query_prefix: Some(String::new()),
+            embedding_document_prefix: Some("   ".to_string()),
+            ..LocalEmbeddingModelFlags::default()
+        };
+
+        let model = resolve_local_embedding_model(&flags).unwrap();
+
+        assert_eq!(
+            model.query_prefix.as_deref(),
+            Some(""),
+            "the flag defaulted back to jina's preset query prefix"
+        );
+        assert_eq!(
+            model.document_prefix.as_deref(),
+            Some(""),
+            "the flag defaulted back to jina's preset document prefix"
+        );
+        // Kept, but still nothing: an empty prefix embeds the text unchanged.
+        assert_eq!(model.query_text("find main"), "find main");
+        assert_eq!(model.document_text("fn main() {}"), "fn main() {}");
     }
 }

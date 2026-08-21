@@ -151,12 +151,10 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
         detail: index_dir.display().to_string(),
     });
 
-    let overall_ok = checks
-        .iter()
-        .all(|check| !matches!(check.status, CheckStatus::Fail));
+    let verdict = check_verdict(&checks);
     let report = DoctorReport {
         version,
-        overall_ok,
+        overall_ok: verdict.is_ok(),
         checks,
     };
 
@@ -176,7 +174,37 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    verdict
+}
+
+/// The single source of the `overall_ok` field and the process exit code, so the
+/// two cannot disagree.
+///
+/// Only `fail` checks count. Warnings and skips are excluded deliberately:
+/// `version-check` warns whenever GitHub cannot be reached, and `config-file`,
+/// `saved-backend` and `current-index` warn on a working install that has no
+/// stored config or no index in the current directory. Exiting non-zero on those
+/// would make `vera doctor` report failure on a healthy machine, which is worse
+/// for the `vera doctor && vera index .` case than always exiting 0.
+fn check_verdict(checks: &[DoctorCheck]) -> anyhow::Result<()> {
+    let failed = failed_check_names(checks);
+    if failed.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "vera doctor found {} failing check{}: {}",
+        failed.len(),
+        if failed.len() == 1 { "" } else { "s" },
+        failed.join(", ")
+    )
+}
+
+fn failed_check_names(checks: &[DoctorCheck]) -> Vec<&'static str> {
+    checks
+        .iter()
+        .filter(|check| matches!(check.status, CheckStatus::Fail))
+        .map(|check| check.name)
+        .collect()
 }
 
 fn check_env_group(name: &'static str, keys: &[&'static str]) -> DoctorCheck {
@@ -592,4 +620,91 @@ fn one_line_error(err: &anyhow::Error) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(name: &'static str, status: CheckStatus) -> DoctorCheck {
+        DoctorCheck {
+            name,
+            status,
+            detail: String::new(),
+        }
+    }
+
+    /// The four statuses a real run mixes, with two failures among them.
+    fn mixed_checks() -> Vec<DoctorCheck> {
+        vec![
+            check("version-check", CheckStatus::Warn),
+            check("config-file", CheckStatus::Ok),
+            check("probe-dependencies", CheckStatus::Skip),
+            check("onnx-runtime", CheckStatus::Fail),
+            check("local-models", CheckStatus::Fail),
+        ]
+    }
+
+    #[test]
+    fn failing_checks_produce_an_error_naming_every_one_of_them() {
+        let checks = mixed_checks();
+        assert_eq!(
+            failed_check_names(&checks),
+            vec!["onnx-runtime", "local-models"],
+            "fixture must carry exactly the two failures the assertions below expect"
+        );
+
+        let err = match check_verdict(&checks) {
+            Ok(()) => panic!(
+                "vera doctor reported success while these checks failed: {:?}",
+                failed_check_names(&checks)
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert_eq!(
+            err, "vera doctor found 2 failing checks: onnx-runtime, local-models",
+            "the error main turns into exit 1 must name both failures"
+        );
+    }
+
+    #[test]
+    fn a_single_failure_is_named_in_the_singular() {
+        let checks = vec![
+            check("version-check", CheckStatus::Warn),
+            check("onnx-runtime", CheckStatus::Fail),
+        ];
+        let err = match check_verdict(&checks) {
+            Ok(()) => panic!("vera doctor reported success while onnx-runtime failed"),
+            Err(err) => err.to_string(),
+        };
+        assert_eq!(err, "vera doctor found 1 failing check: onnx-runtime");
+    }
+
+    #[test]
+    fn warnings_and_skips_alone_keep_the_exit_code_at_zero() {
+        let mut checks = mixed_checks();
+        checks.retain(|check| !matches!(check.status, CheckStatus::Fail));
+
+        // Presence first: without a warn and a skip in the fixture this test
+        // would pass against an implementation that failed on either.
+        assert!(
+            checks
+                .iter()
+                .any(|check| matches!(check.status, CheckStatus::Warn)),
+            "fixture must contain a warn check"
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|check| matches!(check.status, CheckStatus::Skip)),
+            "fixture must contain a skip check"
+        );
+        assert!(failed_check_names(&checks).is_empty());
+
+        assert!(
+            check_verdict(&checks).is_ok(),
+            "a warning must not fail the run: version-check, config-file, \
+             saved-backend and current-index all warn on a healthy machine"
+        );
+    }
 }

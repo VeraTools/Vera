@@ -42,6 +42,13 @@ pub fn ensure_ort_runtime(lib_path: Option<&std::path::Path>) -> Result<()> {
     }
 }
 
+/// Return whether ONNX Runtime has already been initialized successfully.
+pub(crate) fn ort_runtime_initialized() -> bool {
+    ORT_INIT_RESULT
+        .get()
+        .is_some_and(std::result::Result::is_ok)
+}
+
 /// Returns the pip package name for EPs that require pip-based installation, or None
 /// for EPs that have pre-built GitHub release archives.
 pub(super) fn pip_package_for_ep(ep: OnnxExecutionProvider) -> Option<&'static str> {

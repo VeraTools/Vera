@@ -98,6 +98,137 @@ trait Drawable {
     assert_eq!(symbols[0].name.as_deref(), Some("Drawable"));
 }
 
+/// A `#[cfg(test)] mod tests { ... }` block holding the shapes that used to be
+/// swallowed by the module symbol: a free function, a struct, and an impl.
+const INLINE_MOD_SOURCE: &str = r#"
+fn helper() -> i32 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> i32 {
+        helper()
+    }
+
+    struct Case {
+        value: i32,
+    }
+
+    impl Case {
+        fn run(&self) -> i32 {
+            fixture()
+        }
+    }
+}
+"#;
+
+#[test]
+fn rust_inline_mod_does_not_swallow_inner_symbols() {
+    let symbols = parse_and_extract(INLINE_MOD_SOURCE, Language::Rust);
+    let named: Vec<(&str, SymbolType)> = symbols
+        .iter()
+        .filter_map(|s| s.name.as_deref().map(|n| (n, s.symbol_type)))
+        .collect();
+
+    // Presence first: an extractor that returned nothing must not pass this.
+    assert!(
+        named.contains(&("helper", SymbolType::Function)),
+        "expected the top-level function, got {named:?}"
+    );
+    assert!(
+        named.contains(&("fixture", SymbolType::Function)),
+        "expected the function inside the inline mod, got {named:?}"
+    );
+    assert!(
+        named.contains(&("Case", SymbolType::Struct)),
+        "expected the struct inside the inline mod, got {named:?}"
+    );
+    assert!(
+        named.contains(&("run", SymbolType::Method)),
+        "expected the impl method inside the inline mod, got {named:?}"
+    );
+    // The module itself stays indexable, as `impl` blocks do.
+    assert!(
+        named.contains(&("tests", SymbolType::Module)),
+        "expected the module symbol itself, got {named:?}"
+    );
+
+    // Only then: the module no longer spans the inner symbols on its own.
+    let module = symbols
+        .iter()
+        .find(|s| s.symbol_type == SymbolType::Module)
+        .expect("module symbol");
+    let fixture = symbols
+        .iter()
+        .find(|s| s.name.as_deref() == Some("fixture"))
+        .expect("fixture symbol");
+    assert!(
+        fixture.start_byte > module.start_byte && fixture.end_byte < module.end_byte,
+        "fixture should be nested strictly inside the module span"
+    );
+}
+
+#[test]
+fn rust_inline_mod_attributes_calls_to_the_calling_function() {
+    let grammar = tree_sitter_grammar(Language::Rust).unwrap();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).unwrap();
+    let tree = parser.parse(INLINE_MOD_SOURCE, None).unwrap();
+    let refs = crate::parsing::references::extract_references(
+        &tree,
+        INLINE_MOD_SOURCE.as_bytes(),
+        Language::Rust,
+    );
+
+    let callers = |callee: &str| -> Vec<Option<String>> {
+        refs.iter()
+            .filter(|r| r.callee == callee)
+            .map(|r| r.caller.clone())
+            .collect()
+    };
+
+    // Presence first: the calls have to be seen at all.
+    assert_eq!(
+        callers("helper"),
+        vec![Some("fixture".to_string())],
+        "call to helper should be attributed to the calling function, not the module"
+    );
+    assert_eq!(
+        callers("fixture"),
+        vec![Some("run".to_string())],
+        "call to fixture should be attributed to the calling method, not the module"
+    );
+}
+
+#[test]
+fn rust_trait_extracts_default_methods() {
+    let source = r#"
+trait Greeter {
+    fn name(&self) -> String;
+
+    fn greet(&self) -> String {
+        format!("hi {}", self.name())
+    }
+}
+"#;
+    let symbols = parse_and_extract(source, Language::Rust);
+    let named: Vec<(&str, SymbolType)> = symbols
+        .iter()
+        .filter_map(|s| s.name.as_deref().map(|n| (n, s.symbol_type)))
+        .collect();
+    assert!(
+        named.contains(&("Greeter", SymbolType::Trait)),
+        "expected the trait symbol, got {named:?}"
+    );
+    assert!(
+        named.contains(&("greet", SymbolType::Method)),
+        "expected the default method body, got {named:?}"
+    );
+}
+
 #[test]
 fn python_extracts_functions_and_class_methods() {
     let source = r#"
@@ -1736,5 +1867,47 @@ enum Role {
     assert!(
         symbols.iter().any(|s| s.symbol_type == SymbolType::Struct),
         "Prisma should extract models as structs"
+    );
+}
+
+/// Three levels of inline `mod` around a single function. Each nesting level
+/// costs the shared depth budget, so the innermost item is the one at risk.
+const NESTED_INLINE_MOD_SOURCE: &str = r#"
+mod outer {
+    mod middle {
+        mod inner {
+            fn buried() -> i32 {
+                1
+            }
+        }
+    }
+}
+"#;
+
+#[test]
+fn rust_nested_inline_mods_reach_the_innermost_item() {
+    let symbols = parse_and_extract(NESTED_INLINE_MOD_SOURCE, Language::Rust);
+    let named: Vec<(&str, SymbolType)> = symbols
+        .iter()
+        .filter_map(|s| s.name.as_deref().map(|n| (n, s.symbol_type)))
+        .collect();
+
+    // Presence first: the enclosing modules must be there, or an extractor that
+    // returned nothing would satisfy the assertion below by accident.
+    assert!(
+        named.contains(&("outer", SymbolType::Module)),
+        "expected the outermost module, got {named:?}"
+    );
+    assert!(
+        named.contains(&("middle", SymbolType::Module)),
+        "expected the second-level module, got {named:?}"
+    );
+    assert!(
+        named.contains(&("inner", SymbolType::Module)),
+        "expected the third-level module, got {named:?}"
+    );
+    assert!(
+        named.contains(&("buried", SymbolType::Function)),
+        "expected the function inside three levels of inline mod, got {named:?}"
     );
 }

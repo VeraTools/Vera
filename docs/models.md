@@ -12,7 +12,7 @@ Vera has two local backend families:
 | Option | Command | Notes |
 | --- | --- | --- |
 | Potion Code | `vera setup --potion-code` | CPU-first local backend. Uses [`minishlab/potion-code-16M`](https://huggingface.co/minishlab/potion-code-16M), returns 256-dim embeddings, and skips ONNX Runtime. |
-| Jina v5 nano retrieval | `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag | GPU local backend. Faster indexing than larger ONNX embedding models and strongest end-to-end benchmark coverage in Vera so far. |
+| Jina v5 nano retrieval | `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag | GPU local backend. Faster indexing than larger ONNX embedding models and strongest end-to-end benchmark coverage in Vera so far. The retrieval variant is asymmetric, so Vera prefixes queries with `Query:` and indexed passages with `Document:`. |
 | CodeRankEmbed | `vera setup --onnx-jina-cuda --code-rank-embed` | Optional ONNX embedding preset. Useful when you want a code-specific bi-encoder or you are testing without reranking. On Vera's short 6-task no-rerank check it beat the Jina preset on retrieval quality, but indexing was much slower. |
 
 The Jina ONNX family uses this local reranker:
@@ -76,9 +76,10 @@ Use this when you already downloaded or exported the model yourself.
 | `--embedding-no-onnx-data` | Use models that do not ship an external data file |
 | `--embedding-tokenizer-file <path>` | Relative path to the tokenizer file |
 | `--embedding-dim <n>` | Embedding dimension stored in the index |
-| `--embedding-pooling mean|cls` | Pooling method for token-level outputs |
+| `--embedding-pooling <mode>` | Pooling method for token-level outputs: `mean`, `cls`, or `last-token` |
 | `--embedding-max-length <n>` | Tokenizer truncation length |
 | `--embedding-query-prefix <text>` | Optional prefix prepended to local embedding queries |
+| `--embedding-document-prefix <text>` | Optional prefix prepended to indexed passages |
 
 ## Required Files
 
@@ -152,6 +153,7 @@ On macOS Apple Silicon, CoreML auto-detects unified memory by reading `sysctl hw
 ## Notes
 
 - Custom ONNX options only affect Jina ONNX local embeddings. API mode and Potion Code are unchanged.
-- Query prefixes only apply to ONNX local embedding queries, not API embeddings.
+- Query prefixes only apply to ONNX local embedding queries, not API embeddings. Document prefixes apply to indexed passages, and only on the local ONNX path.
+- The stored embedding model identity covers every `--embedding-*` setting, not just the model name, so changing pooling or either prefix also requires a re-index.
 - If you switch local embedding models without configured aliases, re-index the repo so the stored vectors match the active model.
 - If your network blocks CLI downloads, use [manual-install.md](manual-install.md).
