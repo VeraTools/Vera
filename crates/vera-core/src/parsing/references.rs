@@ -3,6 +3,34 @@
 //! Walks the AST looking for function/method call expressions and records
 //! the callee name, source file, and line number. These lightweight edges
 //! power `vera references`, `vera impact`, and `vera dead-code`.
+//!
+//! # Naming convention for dotted callees
+//!
+//! A callee is stored under its **rightmost segment**. `obj.method()` records
+//! `method`, and JSX follows the same rule, so `<Icons.Arrow />` records
+//! `Arrow` rather than `Icons.Arrow`.
+//!
+//! This is what makes a reference link to a definition. Definitions are
+//! indexed under their bare declared name — a component reached as
+//! `Icons.Arrow` is declared somewhere as `export function Arrow` — and
+//! `find_callers` matches the callee against that name. Storing the full
+//! member path would leave the reference matching no definition, which is the
+//! invisibility that indexing JSX call sites exists to fix.
+//!
+//! A lowercase root does not change this: `<icons.Arrow />` is a member
+//! expression, and a member expression is always a value lookup — the
+//! intrinsic test never applies to one.
+//!
+//! For *bare* tags there are two intrinsic forms, not one: a name starting
+//! with a lowercase ASCII letter (`<div />`), and any name containing a hyphen
+//! whatever its case (`<My-element />`, `<my-element />`), which is the
+//! custom-element form. Both are host elements and stay out of the call graph.
+//! See `is_jsx_host_element`.
+//!
+//! The trade-off is deliberate: two components sharing a final segment
+//! (`Icons.Arrow` and `Shapes.Arrow`) collapse onto one name. Separating them
+//! needs import and module resolution, which this layer does not do — it reads
+//! one file at a time with no cross-file symbol table.
 
 use crate::types::Language;
 
