@@ -498,66 +498,24 @@ mod tests {
     use super::*;
     use crate::storage::bm25::{Bm25Document, Bm25Index};
     use crate::storage::metadata::MetadataStore;
+    use crate::test_env::EnvVarGuard;
     use crate::types::Language;
     use crate::types::{Chunk, SymbolType};
-    use std::ffi::OsString;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-    const EMBEDDING_ENV_KEYS: [&str; 3] = [
-        "EMBEDDING_MODEL_BASE_URL",
-        "EMBEDDING_MODEL_ID",
-        "EMBEDDING_MODEL_API_KEY",
-    ];
-
-    fn set_test_embedding_env(model_id: &str) -> Vec<(&'static str, Option<OsString>)> {
-        let saved = EMBEDDING_ENV_KEYS
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect::<Vec<_>>();
-        unsafe {
-            std::env::set_var("EMBEDDING_MODEL_BASE_URL", "http://127.0.0.1:0");
-            std::env::set_var("EMBEDDING_MODEL_ID", model_id);
-            std::env::set_var("EMBEDDING_MODEL_API_KEY", "dummy-key");
-        }
-        saved
-    }
-
-    const RERANKER_ENV_KEYS: [&str; 3] = [
-        "RERANKER_MODEL_BASE_URL",
-        "RERANKER_MODEL_ID",
-        "RERANKER_MODEL_API_KEY",
-    ];
-
-    fn set_test_reranker_env() -> Vec<(&'static str, Option<OsString>)> {
-        let saved = RERANKER_ENV_KEYS
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect::<Vec<_>>();
-        unsafe {
-            std::env::set_var("RERANKER_MODEL_BASE_URL", "http://127.0.0.1:0");
-            std::env::set_var("RERANKER_MODEL_ID", "dummy-reranker-model");
-            std::env::set_var("RERANKER_MODEL_API_KEY", "dummy-key");
-        }
-        saved
-    }
-
-    fn restore_test_env(saved: Vec<(&'static str, Option<OsString>)>) {
-        unsafe {
-            for (key, value) in saved {
-                if let Some(value) = value {
-                    std::env::set_var(key, value);
-                } else {
-                    std::env::remove_var(key);
-                }
-            }
-        }
+    /// Point the API embedding provider at a dead local port. The guard holds
+    /// the environment lock and puts the three variables back on any unwind.
+    fn set_test_embedding_env(model_id: &str) -> EnvVarGuard {
+        EnvVarGuard::set(&[
+            ("EMBEDDING_MODEL_BASE_URL", "http://127.0.0.1:0"),
+            ("EMBEDDING_MODEL_ID", model_id),
+            ("EMBEDDING_MODEL_API_KEY", "dummy-key"),
+        ])
     }
 
     #[test]
     fn test_dimension_mismatch_and_inference() {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env_guard = set_test_embedding_env("dummy-api-model");
         let dir = tempdir().unwrap();
         let index_dir = dir.path();
 
@@ -601,9 +559,7 @@ mod tests {
         }
 
         // 2. Test metadata-dimension inference path (API provider returns None for expected_dim)
-        // Set up dummy environment variables for API provider construction.
-        let saved_env = set_test_embedding_env("dummy-api-model");
-
+        // The dummy provider credentials are already set by the guard above.
         store
             .set_index_meta("model_name", "dummy-api-model")
             .unwrap();
@@ -623,13 +579,11 @@ mod tests {
             crate::config::InferenceBackend::Api,
         );
         assert!(res.is_ok(), "Expected Ok but got {:?}", res);
-        restore_test_env(saved_env);
     }
 
     #[test]
     fn model_metadata_mismatch_falls_back_to_bm25() {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let saved_env = set_test_embedding_env("active-api-model");
+        let _env_guard = set_test_embedding_env("active-api-model");
         let dir = tempdir().unwrap();
         let index_dir = dir.path();
 
@@ -676,7 +630,6 @@ mod tests {
         assert_eq!(results[0].file_path, "src/auth.rs");
         assert!(timings.bm25.is_some());
         assert!(timings.vector.is_none());
-        restore_test_env(saved_env);
     }
 
     #[test]
@@ -797,9 +750,14 @@ mod tests {
     /// directly via the build counter rather than any search output.
     #[tokio::test]
     async fn reranker_is_built_only_for_queries_that_rerank() {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let saved_embedding = set_test_embedding_env("dummy-api-model");
-        let saved_reranker = set_test_reranker_env();
+        let _env_guard = EnvVarGuard::set(&[
+            ("EMBEDDING_MODEL_BASE_URL", "http://127.0.0.1:0"),
+            ("EMBEDDING_MODEL_ID", "dummy-api-model"),
+            ("EMBEDDING_MODEL_API_KEY", "dummy-key"),
+            ("RERANKER_MODEL_BASE_URL", "http://127.0.0.1:0"),
+            ("RERANKER_MODEL_ID", "dummy-reranker-model"),
+            ("RERANKER_MODEL_API_KEY", "dummy-key"),
+        ]);
 
         let config = VeraConfig::default();
         let filters = SearchFilters::default();
@@ -845,9 +803,6 @@ mod tests {
                 .is_some()
         );
         assert_eq!(context.reranker_build_count(), 1);
-
-        restore_test_env(saved_reranker);
-        restore_test_env(saved_embedding);
     }
 
     #[test]

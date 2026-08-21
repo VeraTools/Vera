@@ -266,7 +266,11 @@ pub fn run(
             json_output,
         ),
         AgentCommand::Remove => remove(client, scope, json_output),
-        AgentCommand::Sync => sync(json_output),
+        AgentCommand::Sync => sync(
+            client.unwrap_or(AgentClient::All),
+            scope.unwrap_or(AgentScope::All),
+            json_output,
+        ),
     }
 }
 
@@ -920,17 +924,82 @@ fn skill_path_for(
     Ok(base.join(VERA_SKILL_NAME))
 }
 
-fn sync(json_output: bool) -> anyhow::Result<()> {
-    sync_with_options(json_output, true, false)
+fn sync(client: AgentClient, scope: AgentScope, json_output: bool) -> anyhow::Result<()> {
+    sync_with_options(client, scope, json_output, true, false)
 }
 
 /// Automatic staleness sync: refresh skill installs only, without touching
 /// project markdown or writing over the user's command output.
 pub(crate) fn sync_skills_only() -> anyhow::Result<()> {
-    sync_with_options(false, false, true)
+    sync_with_options(AgentClient::All, AgentScope::All, false, false, true)
+}
+
+#[derive(Debug)]
+struct SyncOutcome {
+    updated: Vec<PathBuf>,
+    refreshed_snippets: Vec<PathBuf>,
+    /// `--scope all` was asked for but only the global half could run.
+    project_scope_skipped: bool,
+}
+
+/// Whether project-scoped paths under `cwd` can be resolved at all.
+///
+/// `getcwd` still succeeds on Linux for a directory the process has no search
+/// permission on, so `project_cwd` can be `Some` for a directory every
+/// `Path::exists()` probe underneath reports as missing. Stat a path inside it
+/// so that access error is not read as "nothing is installed".
+fn project_root_is_searchable(cwd: &Path) -> bool {
+    fs::metadata(cwd.join(".")).is_ok()
+}
+
+fn sync_to_roots(
+    client: AgentClient,
+    scope: AgentScope,
+    project_cwd: Option<&Path>,
+    home: &Path,
+    refresh_project_snippets: bool,
+) -> anyhow::Result<SyncOutcome> {
+    let project_cwd = project_cwd.filter(|cwd| project_root_is_searchable(cwd));
+    let scan_scope = match (scope, project_cwd) {
+        (AgentScope::Project, None) => {
+            bail!("--scope project needs a readable current directory")
+        }
+        (AgentScope::All, None) => AgentScope::Global,
+        (scope, _) => scope,
+    };
+    let cwd = project_cwd.unwrap_or(home);
+    let statuses: Vec<ClientInstallStatus> =
+        collect_client_install_statuses(scan_scope, cwd, home)?
+            .into_iter()
+            .filter(|status| client == AgentClient::All || status.client == client)
+            .collect();
+
+    let mut updated = Vec::new();
+    for location in stale_locations_from_statuses(&statuses, cwd, home)? {
+        install_skill_to(&location.path)?;
+        updated.push(location.path);
+    }
+
+    // Refresh managed markdown snippets whenever a project directory is
+    // available, regardless of which skill installs were stale. They live in
+    // the project directory, so a global-scoped sync must leave them alone.
+    let refreshed_snippets = match project_cwd {
+        Some(cwd) if refresh_project_snippets && scan_scope != AgentScope::Global => {
+            refresh_existing_vera_snippets(&find_agent_configs(cwd))?
+        }
+        _ => Vec::new(),
+    };
+
+    Ok(SyncOutcome {
+        updated,
+        refreshed_snippets,
+        project_scope_skipped: scope == AgentScope::All && scan_scope == AgentScope::Global,
+    })
 }
 
 fn sync_with_options(
+    client: AgentClient,
+    scope: AgentScope,
     json_output: bool,
     refresh_project_snippets: bool,
     quiet: bool,
@@ -938,35 +1007,30 @@ fn sync_with_options(
     let home = state::user_home_dir()?;
     let project_cwd = std::env::current_dir().ok();
     let current_version = env!("CARGO_PKG_VERSION");
-    let scan_scope = if project_cwd.is_some() {
-        AgentScope::All
-    } else {
-        AgentScope::Global
-    };
-    let cwd = project_cwd.clone().unwrap_or_else(|| home.clone());
-    let statuses = collect_client_install_statuses(scan_scope, &cwd, &home)?;
-    let stale_locations = stale_locations_from_statuses(&statuses, &cwd, &home)?;
-
-    let mut updated = Vec::new();
-    for location in &stale_locations {
-        install_skill_to(&location.path)?;
-        updated.push(location.path.clone());
-    }
-
-    let refreshed_snippets = if refresh_project_snippets {
-        // Refresh managed markdown snippets whenever a project directory is
-        // available, regardless of which skill installs were stale.
-        project_cwd
-            .as_deref()
-            .map(|cwd| refresh_existing_vera_snippets(&find_agent_configs(cwd)))
-            .transpose()?
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let SyncOutcome {
+        updated,
+        refreshed_snippets,
+        project_scope_skipped,
+    } = sync_to_roots(
+        client,
+        scope,
+        project_cwd.as_deref(),
+        &home,
+        refresh_project_snippets,
+    )?;
 
     if quiet {
         return Ok(());
+    }
+
+    // Half of what `--scope all` asked for could not run. The global half is
+    // still work the user wants, so proceed, but do not let the project half
+    // vanish into a report that reads as a complete success.
+    if project_scope_skipped {
+        eprintln!(
+            "Warning: --scope all needs a readable current directory for the project scope. \
+             Synced global scope only."
+        );
     }
 
     if json_output {
@@ -1664,5 +1728,207 @@ mod tests {
         assert_eq!(stale_locations.len(), 1);
         assert_eq!(stale_locations[0].client, AgentClient::Claude);
         assert_eq!(stale_locations[0].scope, AgentScope::Global);
+    }
+
+    const SCOPED_SYNC_FIXTURE: &[(AgentClient, AgentScope)] = &[
+        (AgentClient::Claude, AgentScope::Global),
+        (AgentClient::Claude, AgentScope::Project),
+        (AgentClient::Gemini, AgentScope::Global),
+        (AgentClient::Gemini, AgentScope::Project),
+    ];
+
+    #[test]
+    fn sync_to_roots_only_writes_the_requested_client_and_scope() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+
+        for &(client, scope) in SCOPED_SYNC_FIXTURE {
+            let path = skill_path_for(client, scope, &cwd, &home).unwrap();
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("SKILL.md"), "stale").unwrap();
+            fs::write(path.join(".version"), "0.0.0").unwrap();
+        }
+
+        let outcome = sync_to_roots(
+            AgentClient::Claude,
+            AgentScope::Project,
+            Some(cwd.as_path()),
+            &home,
+            true,
+        )
+        .unwrap();
+
+        let target = skill_path_for(AgentClient::Claude, AgentScope::Project, &cwd, &home).unwrap();
+        assert_eq!(outcome.updated, vec![target.clone()]);
+
+        for &(client, scope) in SCOPED_SYNC_FIXTURE {
+            let path = skill_path_for(client, scope, &cwd, &home).unwrap();
+            let version = fs::read_to_string(path.join(".version")).unwrap();
+            let expected = if path == target {
+                env!("CARGO_PKG_VERSION")
+            } else {
+                "0.0.0"
+            };
+            assert_eq!(
+                version,
+                expected,
+                "{client:?}/{scope:?} at {} was rewritten by a sync scoped to claude/project",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn sync_to_roots_leaves_project_markdown_alone_when_scoped_global() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+
+        let stale = skill_path_for(AgentClient::Claude, AgentScope::Global, &cwd, &home).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("SKILL.md"), "stale").unwrap();
+        fs::write(stale.join(".version"), "0.0.0").unwrap();
+
+        let claude_md = cwd.join("CLAUDE.md");
+        let managed = format!(
+            "# Project\n\n## Code Search\n\n{VERA_SNIPPET_BEGIN_MARKER}\n\nOld generated content.\n{VERA_SNIPPET_END_MARKER}\n"
+        );
+        fs::write(&claude_md, &managed).unwrap();
+
+        let outcome = sync_to_roots(
+            AgentClient::All,
+            AgentScope::Global,
+            Some(cwd.as_path()),
+            &home,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.updated, vec![stale]);
+        assert!(outcome.refreshed_snippets.is_empty());
+        assert_eq!(fs::read_to_string(&claude_md).unwrap(), managed);
+    }
+
+    /// Restores a directory's mode on unwind so a failing test cannot leave an
+    /// unreadable directory behind for `TempDir` to fail cleaning up.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_to_roots_rejects_a_project_scope_it_cannot_search() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+
+        let stale = skill_path_for(AgentClient::Claude, AgentScope::Project, &cwd, &home).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("SKILL.md"), "stale").unwrap();
+        fs::write(stale.join(".version"), "0.0.0").unwrap();
+
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestoreMode(cwd.clone());
+        if fs::metadata(cwd.join(".")).is_ok() {
+            // Running as root, or on a filesystem that ignores mode bits.
+            return;
+        }
+
+        let error = sync_to_roots(
+            AgentClient::All,
+            AgentScope::Project,
+            Some(cwd.as_path()),
+            &home,
+            true,
+        )
+        .expect_err("an unsearchable project directory must not report success");
+        assert!(
+            error.to_string().contains("current directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// `--scope all` keeps the global half rather than failing outright, so the
+    /// only thing standing between "half the request ran" and a report that
+    /// reads as complete success is this flag.
+    #[cfg(unix)]
+    #[test]
+    fn sync_to_roots_flags_a_project_scope_all_could_not_search() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+
+        for &(client, scope) in SCOPED_SYNC_FIXTURE {
+            let path = skill_path_for(client, scope, &cwd, &home).unwrap();
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("SKILL.md"), "stale").unwrap();
+            fs::write(path.join(".version"), "0.0.0").unwrap();
+        }
+
+        let searchable = sync_to_roots(
+            AgentClient::All,
+            AgentScope::All,
+            Some(cwd.as_path()),
+            &home,
+            true,
+        )
+        .unwrap();
+        assert!(
+            !searchable.project_scope_skipped,
+            "a searchable project directory must not report a skipped scope"
+        );
+
+        for &(client, scope) in SCOPED_SYNC_FIXTURE {
+            let path = skill_path_for(client, scope, &cwd, &home).unwrap();
+            fs::write(path.join(".version"), "0.0.0").unwrap();
+        }
+
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestoreMode(cwd.clone());
+        if fs::metadata(cwd.join(".")).is_ok() {
+            // Running as root, or on a filesystem that ignores mode bits.
+            return;
+        }
+
+        let outcome = sync_to_roots(
+            AgentClient::All,
+            AgentScope::All,
+            Some(cwd.as_path()),
+            &home,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            outcome.project_scope_skipped,
+            "--scope all silently degraded to global for an unsearchable project directory"
+        );
+        let global: Vec<PathBuf> = SCOPED_SYNC_FIXTURE
+            .iter()
+            .filter(|(_, scope)| *scope == AgentScope::Global)
+            .map(|(client, scope)| skill_path_for(*client, *scope, &cwd, &home).unwrap())
+            .collect();
+        assert_eq!(
+            outcome.updated, global,
+            "the global half of --scope all must still run"
+        );
     }
 }

@@ -1683,6 +1683,54 @@ mod tests {
         for lang in &all_langs {
             let s = lang.to_string();
             assert_eq!(parse_language(&s), *lang, "Failed roundtrip for {s}");
+
+            // The JSON wire name must be the exact string `--lang` accepts,
+            // not a substring of it: `vera search --json` reports this value
+            // and agents feed it straight back as a filter.
+            let json = serde_json::to_string(lang).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{s}\""),
+                "serde name for {lang:?} diverges from Display"
+            );
+            assert_eq!(
+                serde_json::from_str::<Language>(&json).unwrap(),
+                *lang,
+                "Failed serde roundtrip for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_type_serde_name_matches_display() {
+        // SymbolType keeps its derived `rename_all = "snake_case"`; this pins
+        // the agreement so a future variant cannot diverge unnoticed.
+        let all_types = vec![
+            SymbolType::Function,
+            SymbolType::Method,
+            SymbolType::Class,
+            SymbolType::Struct,
+            SymbolType::Enum,
+            SymbolType::Trait,
+            SymbolType::Interface,
+            SymbolType::TypeAlias,
+            SymbolType::Constant,
+            SymbolType::Variable,
+            SymbolType::Module,
+            SymbolType::Block,
+        ];
+        for symbol_type in &all_types {
+            let s = symbol_type.to_string();
+            assert_eq!(
+                serde_json::to_string(symbol_type).unwrap(),
+                format!("\"{s}\""),
+                "serde name for {symbol_type:?} diverges from Display"
+            );
+            assert_eq!(
+                parse_symbol_type(&s),
+                *symbol_type,
+                "Failed roundtrip for {s}"
+            );
         }
     }
 

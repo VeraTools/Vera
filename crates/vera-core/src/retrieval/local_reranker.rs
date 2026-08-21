@@ -20,24 +20,50 @@ pub struct LocalReranker {
 
 impl LocalReranker {
     pub async fn new_with_ep(ep: OnnxExecutionProvider) -> Result<Self, RerankerError> {
-        let ort_path = crate::local_models::ensure_ort_library_for_ep(ep)
-            .await
-            .map_err(|e| RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
+        // Resolve before acquiring anything. No prebuilt reranker export runs
+        // on the CoreML GPU, so `reranker_execution_provider` maps CoreMl to
+        // Cpu; acquiring and dependency-checking the requested provider's
+        // library would validate one library and then build a session that
+        // wants another. `ensure_ort_runtime` is a process-wide OnceLock, so
+        // only the first path passed to it in a process is actually loaded,
+        // which makes that mismatch silent rather than loud.
+        let requested_ep = ep;
+        let ep = crate::local_models::reranker_execution_provider(requested_ep);
+        // A CoreML embedding provider may have already initialized ORT with
+        // its CoreML-capable runtime. The reranker is CPU-only under CoreML,
+        // but that process-wide runtime is still valid for its CPU session;
+        // requiring the separate CPU cache here would make initialization
+        // depend on an unused download. A cold start still acquires the CPU
+        // runtime, and other providers retain their existing acquisition path.
+        let ort_path = if should_acquire_ort_library(
+            requested_ep,
+            crate::local_models::ort::ort_runtime_initialized(),
+        ) {
+            Some(
+                crate::local_models::ensure_ort_library_for_ep(ep)
+                    .await
+                    .map_err(|e| RerankerError::ApiError {
+                        status: 500,
+                        message: e.to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        if let Some(ort_path) = ort_path.as_deref() {
+            crate::local_models::ensure_ort_runtime(Some(ort_path)).map_err(|e| {
+                RerankerError::ApiError {
+                    status: 500,
+                    message: e.to_string(),
+                }
             })?;
-        crate::local_models::ensure_ort_runtime(Some(&ort_path)).map_err(|e| {
-            RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            }
-        })?;
-        crate::local_models::ensure_provider_dependencies(ep, &ort_path).map_err(|e| {
-            RerankerError::ApiError {
-                status: 500,
-                message: e.to_string(),
-            }
-        })?;
+            crate::local_models::ensure_provider_dependencies(ep, ort_path).map_err(|e| {
+                RerankerError::ApiError {
+                    status: 500,
+                    message: e.to_string(),
+                }
+            })?;
+        }
 
         let components = load_reranker_components(ep).await;
         let (session, tokenizer) = match components {
@@ -74,6 +100,7 @@ impl LocalReranker {
     }
 
     pub fn probe_session(ep: OnnxExecutionProvider) -> Result<()> {
+        let ep = crate::local_models::reranker_execution_provider(ep);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let (onnx_path, _) = default_asset_paths()?;
@@ -82,6 +109,7 @@ impl LocalReranker {
     }
 
     pub fn probe_inference(ep: OnnxExecutionProvider) -> Result<()> {
+        let ep = crate::local_models::reranker_execution_provider(ep);
         let ort_path = crate::local_models::ort_library_path_for_ep(ep)?;
         crate::local_models::ensure_ort_runtime(Some(&ort_path))?;
         let (onnx_path, tokenizer_path) = default_asset_paths()?;
@@ -250,8 +278,12 @@ fn load_tokenizer(tokenizer_path: std::path::PathBuf) -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("Tokenizer init failed: {}", e))
 }
 
+/// Build a session on an already-resolved execution provider.
+///
+/// `ep` must come from `reranker_execution_provider`. Resolving again here
+/// would put the same contract in two places that could drift apart; all three
+/// callers resolve at their entry point.
 fn build_session(ep: OnnxExecutionProvider, onnx_path: std::path::PathBuf) -> Result<Session> {
-    let ep = crate::local_models::reranker_execution_provider(ep);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -373,9 +405,54 @@ fn register_execution_provider(
     }
 }
 
+fn should_acquire_ort_library(
+    requested_ep: OnnxExecutionProvider,
+    runtime_initialized: bool,
+) -> bool {
+    requested_ep != OnnxExecutionProvider::CoreMl || !runtime_initialized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Loads neither model assets nor ONNX Runtime, so it always runs and
+    /// always asserts. Deliberate: `test_local_reranker` below early-returns
+    /// when ONNX Runtime is not on the default lookup path, and would pass
+    /// without checking anything on a machine that lacks it.
+    #[test]
+    fn resolution_is_idempotent_so_build_session_need_not_repeat_it() {
+        use crate::config::OnnxExecutionProvider as Ep;
+        use crate::local_models::reranker_execution_provider as resolve;
+
+        // `build_session` no longer re-resolves; it trusts what the entry
+        // points pass. Resolving an already-resolved provider must therefore
+        // be a no-op, or a second pass anywhere would change the answer.
+        for requested in [Ep::CoreMl, Ep::Cpu, Ep::Cuda] {
+            let once = resolve(requested);
+            assert_eq!(once, resolve(once), "resolving {requested} twice differed");
+        }
+
+        // The mapping this exists for: no prebuilt reranker export runs on the
+        // CoreML GPU, so CoreML must resolve to CPU before any library is
+        // acquired. Other providers are left alone.
+        assert_eq!(resolve(Ep::CoreMl), Ep::Cpu);
+        assert_eq!(resolve(Ep::Cuda), Ep::Cuda);
+        assert_eq!(resolve(Ep::Cpu), Ep::Cpu);
+    }
+
+    #[test]
+    fn coreml_reranker_reuses_an_initialized_runtime_without_cpu_acquisition() {
+        use crate::config::OnnxExecutionProvider as Ep;
+
+        assert!(!should_acquire_ort_library(Ep::CoreMl, true));
+        assert!(should_acquire_ort_library(Ep::CoreMl, false));
+        assert!(should_acquire_ort_library(Ep::Cpu, true));
+        assert!(should_acquire_ort_library(Ep::Cuda, true));
+        assert!(should_acquire_ort_library(Ep::Rocm, true));
+        assert!(should_acquire_ort_library(Ep::OpenVino, true));
+        assert!(should_acquire_ort_library(Ep::DirectMl, true));
+    }
 
     #[tokio::test]
     async fn test_local_reranker() {

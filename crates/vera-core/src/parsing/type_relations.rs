@@ -155,7 +155,7 @@ fn relation_header(chunk: &Chunk) -> String {
             .unwrap_or_default()
             .to_string()
     } else {
-        signatures::extract_signature(&chunk.content, chunk.language)
+        signatures::extract_signature_for_path(&chunk.content, chunk.language, &chunk.file_path)
     };
     normalize_header(&raw)
 }
