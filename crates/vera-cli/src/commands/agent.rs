@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -1539,6 +1539,19 @@ fn offer_agents_md_snippet(selected_clients: &[AgentClient]) -> anyhow::Result<(
     }
 
     if existing.iter().any(|config| config.mentions_vera) {
+        return Ok(());
+    }
+
+    // Prompts need a terminal; without one every `cliclack` call fails with a
+    // bare "not connected". The install itself is already complete at this
+    // point, so a scripted run must not exit non-zero over an optional snippet
+    // offer — skip it instead (the same decision `setup.rs` makes up front).
+    let interactive = std::io::stdin().is_terminal();
+    if !interactive {
+        cliclack::log::info(format!(
+            "No agent config file mentions Vera; run `vera agent install` in a terminal to add usage instructions to {preferred_name}.",
+            preferred_name = preferred_config_filename(selected_clients),
+        ))?;
         return Ok(());
     }
 
