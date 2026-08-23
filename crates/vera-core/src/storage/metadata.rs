@@ -163,6 +163,10 @@ impl MetadataStore {
     /// creates the file and `init_schema` then writes DDL, so a read command
     /// against a crashed or half-written index used to report an empty index as
     /// a success and leave a fresh db behind.
+    ///
+    /// The connection is read-only and no schema is written; the required
+    /// tables are validated instead, so a zero-byte or truncated file fails as
+    /// broken rather than masquerading as an empty index.
     pub fn open_existing(db_path: &std::path::Path) -> Result<Self> {
         if !db_path.is_file() {
             anyhow::bail!(
@@ -170,7 +174,36 @@ impl MetadataStore {
                 db_path.display()
             );
         }
-        Self::open(db_path)
+        let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open metadata db: {}", db_path.display()))?;
+        let store = Self { conn };
+        store.validate_schema(db_path)?;
+        Ok(store)
+    }
+
+    /// Fail on a file that exists but was not written by `init_schema`
+    /// (zero-byte leftover of a crashed create, truncated download).
+    fn validate_schema(&self, db_path: &std::path::Path) -> Result<()> {
+        let tables: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .with_context(|| {
+                format!(
+                    "index metadata at {} is not a readable SQLite database",
+                    db_path.display()
+                )
+            })?;
+        if tables == 0 {
+            anyhow::bail!(
+                "index metadata at {} has no schema (the index is incomplete; run `vera index <path>` to rebuild it)",
+                db_path.display()
+            );
+        }
+        Ok(())
     }
 
     /// Create an in-memory metadata store (useful for testing).
@@ -1241,6 +1274,20 @@ mod tests {
         // The create-or-open path still fabricates when explicitly asked to.
         MetadataStore::open(&db_path).unwrap();
         assert!(db_path.exists());
+
+        // A real store opens read-only and serves reads.
+        MetadataStore::open_existing(&db_path).unwrap();
+
+        // A zero-byte leftover of a crashed create exists but has no schema:
+        // it must fail without being modified.
+        let truncated = dir.path().join("truncated.db");
+        std::fs::write(&truncated, b"").unwrap();
+        let result = MetadataStore::open_existing(&truncated);
+        assert!(result.is_err(), "schema-less db must not open");
+        assert!(
+            std::fs::read(&truncated).unwrap().is_empty(),
+            "a failed open must not modify the file"
+        );
     }
     use super::*;
 
