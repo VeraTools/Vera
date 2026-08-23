@@ -246,16 +246,23 @@ pub fn markdown_section_chunks(source: &str, file_path: &str) -> Vec<Chunk> {
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
-        let fence_run = trimmed
-            .chars()
-            .take_while(|c| *c == '`' || *c == '~')
-            .count();
+        // The run is counted over the FIRST character only: a mixed run like
+        // "``~~" is not a fence marker. A closer must be the marker run alone
+        // (trailing whitespace allowed); an opener may carry an info string
+        // ("```python").
+        let marker = trimmed.chars().next();
+        let fence_run = marker
+            .filter(|ch| matches!(ch, '`' | '~'))
+            .map_or(0, |ch| trimmed.chars().take_while(|c| *c == ch).count());
         if fence_run >= 3 {
-            let ch = trimmed.chars().next();
-            let is_closer = in_fence && ch == fence_char && fence_run >= fence_len;
+            let rest = &trimmed[fence_run..];
+            let is_closer = in_fence
+                && marker == fence_char
+                && fence_run >= fence_len
+                && rest.trim().is_empty();
             if !in_fence || is_closer {
                 in_fence = !in_fence;
-                fence_char = if in_fence { ch } else { None };
+                fence_char = if in_fence { marker } else { None };
                 fence_len = if in_fence { fence_run } else { 0 };
             }
             continue;
@@ -916,6 +923,35 @@ mod tests {
         let chunks = markdown_section_chunks(source, "README.md");
 
         assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks[1].symbol_name.as_deref(), Some("After"));
+    }
+
+    /// "```python" inside an open backtick fence is CONTENT, not a closer:
+    /// CommonMark forbids an info string on a closing fence. The "# comment"
+    /// lines around it must stay inside the fenced section.
+    #[test]
+    fn markdown_fence_with_info_string_does_not_close() {
+        let source = concat!(
+            "```sh\n",
+            "# shell comment\n",
+            "case:\n",
+            "```python\n",
+            "# python comment\n",
+            "print()\n",
+            "```\n",
+            "\n",
+            "# After\n",
+        );
+        let chunks = markdown_section_chunks(source, "README.md");
+
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        let fenced = &chunks[0];
+        assert!(
+            fenced.content.contains("# python comment"),
+            "{:?}",
+            fenced.content
+        );
+        assert!(fenced.content.contains("```python"), "{:?}", fenced.content);
         assert_eq!(chunks[1].symbol_name.as_deref(), Some("After"));
     }
 }
