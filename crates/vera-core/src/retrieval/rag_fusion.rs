@@ -101,9 +101,20 @@ async fn execute_rag_fusion_with_context(
     let hints_dir = index_dir.to_path_buf();
     let hints_query = query.to_string();
     let context_hints =
-        tokio::task::spawn_blocking(move || bm25_context_hints(&hints_dir, &hints_query))
+        match tokio::task::spawn_blocking(move || bm25_context_hints(&hints_dir, &hints_query))
             .await
-            .unwrap_or_default();
+        {
+            Ok(hints) => hints,
+            // Fail-open is deliberate (the pre-filter is optional context), but a
+            // panicking task must not vanish silently.
+            Err(join_error) => {
+                tracing::warn!(
+                    error = %join_error,
+                    "BM25 pre-filter task failed; continuing without context hints"
+                );
+                Vec::new()
+            }
+        };
     debug!(
         hints = context_hints.len(),
         "BM25 pre-filter produced context hints for query expansion"
