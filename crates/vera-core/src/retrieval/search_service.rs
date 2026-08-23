@@ -225,7 +225,9 @@ impl SearchContext {
 
         // Check metadata mismatch
         let metadata_path = index_dir.join("metadata.db");
-        if let Ok(metadata_store) = crate::storage::metadata::MetadataStore::open(&metadata_path) {
+        if let Ok(metadata_store) =
+            crate::storage::metadata::MetadataStore::open_existing(&metadata_path)
+        {
             if let (Some(s_model), Some(s_dim)) = (
                 metadata_store.get_index_meta("model_name").unwrap_or(None),
                 metadata_store
@@ -466,7 +468,7 @@ fn run_bm25_only(
     let bm25_start = Instant::now();
     let bm25_index =
         Bm25Index::open(&index_dir.join("bm25")).context("failed to open BM25 index for search")?;
-    let metadata_store = MetadataStore::open(&index_dir.join("metadata.db"))
+    let metadata_store = MetadataStore::open_existing(&index_dir.join("metadata.db"))
         .context("failed to open metadata store for search")?;
     let results = search_bm25_with_stores_and_filters(
         &bm25_index,

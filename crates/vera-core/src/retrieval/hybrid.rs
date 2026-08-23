@@ -111,7 +111,7 @@ pub async fn search_hybrid(
         let result = Bm25Index::open(&bm25_dir)
             .context("failed to open BM25 index for search")
             .and_then(|index| {
-                let store = MetadataStore::open(&metadata_path)
+                let store = MetadataStore::open_existing(&metadata_path)
                     .context("failed to open metadata store for BM25 search")?;
                 search_bm25_with_stores_and_filters(
                     &index,
@@ -137,8 +137,8 @@ pub async fn search_hybrid(
     let vector_start = Instant::now();
     let vector_outcome = match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
         Ok(vector_store) => {
-            let vector_store_result =
-                MetadataStore::open(&vector_metadata_path).context("failed to open metadata store");
+            let vector_store_result = MetadataStore::open_existing(&vector_metadata_path)
+                .context("failed to open metadata store");
             match vector_store_result {
                 Ok(vector_metadata) => {
                     match search_vector_with_stores_timed(

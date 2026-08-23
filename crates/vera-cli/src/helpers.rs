@@ -174,7 +174,10 @@ pub fn prepare_indexed_repo(
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
     let index_dir = vera_core::indexing::index_dir(&cwd);
-    if !index_dir.exists() {
+    // Presence of `.vera/` alone is not validity: after a crash mid-index or a
+    // deleted db the directory exists but holds no metadata. Read commands must
+    // say "no index" rather than fabricate an empty one further down.
+    if !index_dir.join("metadata.db").is_file() {
         anyhow::bail!(
             "no index found in current directory.\n\
              Hint: run `vera index <path>` first to create an index."

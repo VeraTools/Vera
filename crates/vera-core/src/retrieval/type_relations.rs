@@ -26,7 +26,7 @@ pub fn search_explicit_implementations(
     }
 
     let metadata_path = index_dir.join("metadata.db");
-    let store = MetadataStore::open(&metadata_path)?;
+    let store = MetadataStore::open_existing(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
     let symbol = super::structural::normalize_impl_target(symbol);
     let relations = store.find_type_relations(&symbol)?;

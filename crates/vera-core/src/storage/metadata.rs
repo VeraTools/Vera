@@ -158,6 +158,21 @@ impl MetadataStore {
         Ok(store)
     }
 
+    /// Open an existing metadata store for reading. Unlike [`Self::open`], a
+    /// missing database is an error, not something to fabricate: `Connection::open`
+    /// creates the file and `init_schema` then writes DDL, so a read command
+    /// against a crashed or half-written index used to report an empty index as
+    /// a success and leave a fresh db behind.
+    pub fn open_existing(db_path: &std::path::Path) -> Result<Self> {
+        if !db_path.is_file() {
+            anyhow::bail!(
+                "no index metadata found at {} (run `vera index <path>` to create it)",
+                db_path.display()
+            );
+        }
+        Self::open(db_path)
+    }
+
     /// Create an in-memory metadata store (useful for testing).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("failed to open in-memory metadata db")?;
@@ -1199,6 +1214,34 @@ fn collect_rows<T>(
 
 #[cfg(test)]
 mod tests {
+
+    /// A missing database must be an error, and the failed open must not leave
+    /// a fabricated (empty, schema-stamped) db behind: reads repair nothing.
+    #[test]
+    fn open_existing_errors_on_missing_db_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("metadata.db");
+
+        let result = MetadataStore::open_existing(&db_path);
+
+        assert!(result.is_err(), "missing db must not open");
+        assert!(
+            !db_path.exists(),
+            "a failed read-side open must not create the file"
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("missing db must not open"),
+        };
+        assert!(
+            error.to_string().contains("no index metadata found"),
+            "error should point at re-indexing: {error:#}"
+        );
+
+        // The create-or-open path still fabricates when explicitly asked to.
+        MetadataStore::open(&db_path).unwrap();
+        assert!(db_path.exists());
+    }
     use super::*;
 
     fn sample_chunks() -> Vec<Chunk> {

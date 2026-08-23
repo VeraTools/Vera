@@ -36,8 +36,8 @@ pub fn search_bm25(index_dir: &Path, query: &str, limit: usize) -> Result<Vec<Se
     let metadata_path = index_dir.join("metadata.db");
 
     let bm25_index = Bm25Index::open(&bm25_dir).context("failed to open BM25 index for search")?;
-    let metadata_store =
-        MetadataStore::open(&metadata_path).context("failed to open metadata store for search")?;
+    let metadata_store = MetadataStore::open_existing(&metadata_path)
+        .context("failed to open metadata store for search")?;
 
     search_bm25_with_stores(&bm25_index, &metadata_store, query, limit)
 }

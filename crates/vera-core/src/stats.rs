@@ -115,7 +115,7 @@ pub fn collect_stats(repo_path: &Path) -> Result<IndexStats> {
     // Open metadata store.
     let metadata_path = idx_dir.join("metadata.db");
     let metadata_store =
-        MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
+        MetadataStore::open_existing(&metadata_path).context("failed to open metadata store")?;
 
     // Collect counts.
     let file_count = metadata_store
@@ -182,7 +182,8 @@ pub fn collect_overview_filtered(
     }
 
     let metadata_path = idx_dir.join("metadata.db");
-    let store = MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
+    let store =
+        MetadataStore::open_existing(&metadata_path).context("failed to open metadata store")?;
 
     let index_size_bytes = compute_dir_size(&idx_dir)?;
     let index_size_human = format_bytes(index_size_bytes);
@@ -468,7 +469,8 @@ fn open_metadata(repo_path: &Path) -> Result<MetadataStore> {
             idx_dir.display()
         );
     }
-    MetadataStore::open(&idx_dir.join("metadata.db")).context("failed to open metadata store")
+    MetadataStore::open_existing(&idx_dir.join("metadata.db"))
+        .context("failed to open metadata store")
 }
 
 /// Find all call sites that reference a given symbol name.

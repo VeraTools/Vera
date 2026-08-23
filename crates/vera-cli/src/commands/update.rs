@@ -59,7 +59,9 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
 
     // Check metadata mismatch
     let metadata_path = repo_path.join(".vera").join("metadata.db");
-    if let Ok(metadata_store) = vera_core::storage::metadata::MetadataStore::open(&metadata_path) {
+    if let Ok(metadata_store) =
+        vera_core::storage::metadata::MetadataStore::open_existing(&metadata_path)
+    {
         if let (Some(s_model), Some(s_dim)) = (
             metadata_store.get_index_meta("model_name").unwrap_or(None),
             metadata_store

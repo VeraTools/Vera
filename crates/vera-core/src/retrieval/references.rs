@@ -25,7 +25,7 @@ pub fn search_callers(
     }
 
     let metadata_path = index_dir.join("metadata.db");
-    let store = MetadataStore::open(&metadata_path)?;
+    let store = MetadataStore::open_existing(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
     let callers = store.find_callers(symbol)?;
     let mut results = Vec::new();

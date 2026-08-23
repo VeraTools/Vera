@@ -29,7 +29,7 @@ pub(crate) fn augment_exact_match_candidates(
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     let metadata_path = index_dir.join("metadata.db");
-    let Ok(store) = MetadataStore::open(&metadata_path) else {
+    let Ok(store) = MetadataStore::open_existing(&metadata_path) else {
         return Ok(apply_query_ranking_with_filters(
             query, results, stage, filters,
         ));

@@ -39,7 +39,7 @@ pub fn search_regex(
         .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {e}"))?;
 
     let metadata_path = index_dir.join("metadata.db");
-    let store = MetadataStore::open(&metadata_path)?;
+    let store = MetadataStore::open_existing(&metadata_path)?;
     let mut files = store.indexed_files()?;
     sort_files_by_scan_priority(&mut files, filters);
 
