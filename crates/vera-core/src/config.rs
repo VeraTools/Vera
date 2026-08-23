@@ -510,21 +510,21 @@ fn detect_rocm_gpu_info() -> GpuInfo {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut vram_free_mb = None;
     let mut fingerprint_line = None;
-    for line in stdout.lines().skip(1) {
+    for line in stdout.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("GPU") {
+        if trimmed.is_empty() {
             continue;
         }
-        if fingerprint_line.is_none() {
+        // Product row: not a GPU index header and not a memory table.
+        let lower = trimmed.to_ascii_lowercase();
+        if fingerprint_line.is_none() && !lower.contains("gpu") && !lower.contains("memory") {
             fingerprint_line = Some(trimmed.replace(", ", "|").replace(',', "|"));
         }
         if vram_free_mb.is_none() {
-            // rocm-smi reports bytes; convert to MB.
-            vram_free_mb = line
-                .split(',')
-                .filter_map(|s| s.trim().parse::<u64>().ok())
-                .next()
-                .map(|bytes| bytes / (1024 * 1024));
+            if let Some(bytes) = parse_rocm_free_memory_bytes(trimmed) {
+                // rocm-smi reports bytes; convert to MB.
+                vram_free_mb = Some(bytes / (1024 * 1024));
+            }
         }
     }
     GpuInfo {
@@ -532,6 +532,49 @@ fn detect_rocm_gpu_info() -> GpuInfo {
         fingerprint: fingerprint_line
             .unwrap_or_else(|| host_fingerprint(OnnxExecutionProvider::Rocm)),
     }
+}
+
+/// Extract the free-VRAM byte count from one rocm-smi CSV row.
+///
+/// Rows carry their labels inline (`GPU[0],vram total used memory (bytes),123,
+/// vram total free memory (bytes),456`) or label/value pairs split by a colon
+/// (`vram total free memory (bytes): 456`). The old parser skipped every row
+/// because they all start with `GPU`, and even unfiltered would have taken the
+/// FIRST numeric column - the used bytes - as free.
+fn parse_rocm_free_memory_bytes(line: &str) -> Option<u64> {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("free memory") {
+        return None;
+    }
+    for (index, field) in line.split(',').enumerate() {
+        let trimmed_field = field.trim();
+        let after_label = if trimmed_field.to_ascii_lowercase().contains("free memory") {
+            trimmed_field
+                .split(':')
+                .next_back()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string()
+        } else if index > 0
+            && line
+                .split(',')
+                .nth(index.wrapping_sub(1))
+                .is_some_and(|previous| previous.to_ascii_lowercase().contains("free memory"))
+        {
+            trimmed_field.to_string()
+        } else {
+            continue;
+        };
+        let digits: String = after_label
+            .trim_start_matches(['+', '-'])
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if !digits.is_empty() {
+            return digits.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 fn host_fingerprint(ep: OnnxExecutionProvider) -> String {
@@ -630,6 +673,60 @@ fn parse_model_alias_groups(value: &str) -> Vec<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Frozen samples of real `rocm-smi --showproductname --showmeminfo vram
+    /// --csv` output shapes. The old parser skipped rows starting with "GPU"
+    /// (all of them) and would have read the used-bytes column as free.
+    #[test]
+    fn rocm_free_memory_parses_label_value_rows() {
+        // One-row CSV: labels and values alternate.
+        let single_row = "GPU[0],vram total used memory (bytes),6871947673,vram total free memory (bytes),13743895347";
+        assert_eq!(parse_rocm_free_memory_bytes(single_row), Some(13743895347));
+
+        // Label/value split across columns with the colon form.
+        let colon_form = "GPU[0]\nvram total free memory (bytes): 13743895347";
+        assert_eq!(
+            parse_rocm_free_memory_bytes("vram total free memory (bytes): 13743895347"),
+            Some(13743895347)
+        );
+        let _ = colon_form;
+
+        // Used-memory lines must not match.
+        assert_eq!(
+            parse_rocm_free_memory_bytes("GPU[0],vram total used memory (bytes),6871947673"),
+            None
+        );
+        assert_eq!(
+            parse_rocm_free_memory_bytes("Product name,AMD Radeon"),
+            None
+        );
+    }
+
+    /// The product row is preferred for the fingerprint; GPU header rows never are.
+    #[test]
+    fn rocm_fingerprint_ignores_gpu_header_lines() {
+        let stdout = "GPU,Product name\n0,AMD Radeon RX 7900\nGPU,vram total used memory (bytes),1,vram total free memory (bytes),2";
+
+        let mut fingerprint_line = None;
+        let mut vram_free_mb = None;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if fingerprint_line.is_none() && !lower.contains("gpu") && !lower.contains("memory") {
+                fingerprint_line = Some(trimmed.replace(", ", "|").replace(',', "|"));
+            }
+            if vram_free_mb.is_none() {
+                if let Some(bytes) = parse_rocm_free_memory_bytes(trimmed) {
+                    vram_free_mb = Some(bytes / (1024 * 1024));
+                }
+            }
+        }
+        assert_eq!(fingerprint_line.as_deref(), Some("0|AMD Radeon RX 7900"));
+        assert_eq!(vram_free_mb, Some(2 / (1024 * 1024)));
+    }
     use super::*;
     use crate::test_env::EnvVarGuard;
 
