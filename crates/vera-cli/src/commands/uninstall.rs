@@ -74,11 +74,17 @@ fn run_at(
     let mut removed = Vec::new();
 
     // 1. Remove agent skill files (all clients, all scopes).
+    // A location-resolution error means installed skills may exist that we
+    // never even looked at: it must count as an incomplete uninstall, not be
+    // swapped for an empty success.
     let skill_removal = match agent::remove_all_skills(cwd, home) {
         Ok(removal) => removal,
         Err(e) => {
             tracing::warn!("failed to resolve agent skill locations: {e:#}");
-            agent::SkillRemoval::default()
+            agent::SkillRemoval {
+                reports: Vec::new(),
+                failures: vec![e.context("failed to resolve agent skill locations")],
+            }
         }
     };
     // Uninstall continues past a skill that cannot be deleted, so the failure is
