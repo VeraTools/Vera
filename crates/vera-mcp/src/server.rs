@@ -30,12 +30,24 @@ use crate::tools;
 /// The server processes messages one at a time (no concurrency) and never
 /// panics — all errors are returned as JSON-RPC error responses.
 pub fn run_server(reader: &mut dyn BufRead, writer: &mut dyn Write) {
+    run_server_with_frame_limit(reader, writer, MAX_FRAME_BYTES);
+}
+
+/// Maximum accepted request frame. Newline-delimited JSON has no inherent
+/// length bound, so an uncapped `read_line` lets one giant line from a buggy
+/// or hostile client grow memory until the process dies.
+const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+
+fn run_server_with_frame_limit(
+    reader: &mut dyn BufRead,
+    writer: &mut dyn Write,
+    max_frame_bytes: usize,
+) {
     let mut initialized = false;
-    let mut line = String::new();
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
+        let mut frame = Vec::with_capacity(1024);
+        match reader.read_until(b'\n', &mut frame) {
             Ok(0) => {
                 // EOF — client closed stdin.
                 tracing::info!("Client closed connection (EOF)");
@@ -47,6 +59,33 @@ pub fn run_server(reader: &mut dyn BufRead, writer: &mut dyn Write) {
                 break;
             }
         }
+
+        // An oversized frame is rejected and drained to its terminating
+        // newline (the first read may have stopped before it), then the server
+        // keeps serving instead of dying.
+        if frame.len() > max_frame_bytes {
+            tracing::warn!(
+                bytes = frame.len(),
+                limit = max_frame_bytes,
+                "Request frame exceeded the size limit"
+            );
+            while !frame.ends_with(b"\n") {
+                frame.clear();
+                match reader.read_until(b'\n', &mut frame) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let err = RpcError::new(
+                Value::Null,
+                PARSE_ERROR,
+                format!("Request too large: exceeds {max_frame_bytes} bytes"),
+            );
+            write_message(writer, &err);
+            continue;
+        }
+
+        let line = String::from_utf8_lossy(&frame);
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -451,5 +490,60 @@ mod tests {
         assert_eq!(responses.len(), 2);
         let result = &responses[1];
         assert_eq!(result["result"]["isError"], true);
+    }
+
+    /// An oversized frame must be answered with a parse error and drained to
+    /// its newline, after which the server still serves the next message.
+    #[test]
+    fn oversized_frame_is_rejected_and_server_keeps_serving() {
+        let oversized = format!("\"{}\"", "x".repeat(200));
+        let input = format!("{oversized}\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}}\n");
+        let mut reader = std::io::BufReader::new(Cursor::new(input));
+        let mut output = Vec::new();
+
+        run_server_with_frame_limit(&mut reader, &mut output, 64);
+
+        let output_str = String::from_utf8(output).unwrap();
+        let responses: Vec<Value> = output_str
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(
+            responses.len(),
+            2,
+            "the next message must still be served: {output_str}"
+        );
+        assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
+        assert!(
+            responses[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("too large"),
+            "{output_str}"
+        );
+        // The follow-up ping was handled normally.
+        assert_eq!(responses[1]["id"], 1);
+        assert!(responses[1]["result"].is_object());
+    }
+
+    /// A frame at or under the limit is processed normally.
+    #[test]
+    fn frame_within_limit_is_served() {
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}
+"#;
+        let mut reader = std::io::BufReader::new(Cursor::new(input.to_string()));
+        let mut output = Vec::new();
+
+        run_server_with_frame_limit(&mut reader, &mut output, 64);
+
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["id"], 1);
     }
 }
