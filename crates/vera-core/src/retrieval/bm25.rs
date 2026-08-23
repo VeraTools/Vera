@@ -110,19 +110,22 @@ fn search_bm25_with_stores_inner(
         "BM25 search returned candidates"
     );
 
+    // Batch-hydrate every raw hit in one query instead of one round trip per
+    // hit: the raw pool scales to limit * 24 (capped at 20k) precisely because
+    // the filter will discard most of them, so per-hit fetching paid for a
+    // full row - content blob included - that was usually thrown away.
+    let chunk_ids: Vec<String> = bm25_results
+        .iter()
+        .map(|bm25_result| bm25_result.chunk_id.clone())
+        .collect();
+    let chunks_by_id = metadata_store
+        .get_chunks_by_ids(&chunk_ids)
+        .context("failed to fetch metadata for BM25 candidates")?;
+
     let mut results = Vec::with_capacity(limit.min(bm25_results.len()));
 
     for bm25_result in &bm25_results {
-        let chunk = metadata_store
-            .get_chunk(&bm25_result.chunk_id)
-            .with_context(|| {
-                format!(
-                    "failed to fetch metadata for chunk: {}",
-                    bm25_result.chunk_id
-                )
-            })?;
-
-        let Some(chunk) = chunk else {
+        let Some(chunk) = chunks_by_id.get(&bm25_result.chunk_id) else {
             debug!(
                 chunk_id = %bm25_result.chunk_id,
                 "chunk metadata not found, skipping"
@@ -130,7 +133,9 @@ fn search_bm25_with_stores_inner(
             continue;
         };
 
-        let result = chunk.into_search_result(f64::from(bm25_result.score));
+        let result = chunk
+            .clone()
+            .into_search_result(f64::from(bm25_result.score));
 
         if filters.is_some_and(|filters| !filters.matches(&result)) {
             continue;
@@ -517,5 +522,32 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].file_path, "fastapi/dependencies/utils.py");
+    }
+
+    /// The batched hydration must preserve the per-hit loop's contract:
+    /// candidates whose metadata row is missing are skipped silently (no
+    /// error), filters still apply after scoring, and BM25 order survives.
+    #[test]
+    fn batched_hydration_skips_missing_metadata_and_preserves_order() {
+        let chunks = sample_chunks();
+
+        let bm25_index = Bm25Index::open_in_memory().unwrap();
+        bm25_index.insert_chunks(&chunks).unwrap();
+
+        // Store only a subset: hits whose rows are absent must be skipped,
+        // not error.
+        let metadata_store = MetadataStore::open_in_memory().unwrap();
+        metadata_store.insert_chunks(&chunks[..2]).unwrap();
+
+        let results = search_bm25_with_stores(&bm25_index, &metadata_store, "authenticate", 10)
+            .expect("missing candidate rows must be skipped, not fail");
+
+        assert!(!results.is_empty(), "stored subset should still match");
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].score >= results[i].score,
+                "scores must remain descending"
+            );
+        }
     }
 }
