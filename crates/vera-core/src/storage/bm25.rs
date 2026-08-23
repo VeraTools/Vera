@@ -342,13 +342,35 @@ fn build_schema() -> Bm25Schema {
 }
 
 fn sanitize_query(query_text: &str) -> String {
-    query_text
+    let cleaned: String = query_text
         .chars()
         .map(|c| match c {
             ':' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '~' | '!' | '\'' | '"' | '`' => ' ',
             _ => c,
         })
-        .collect()
+        .collect();
+
+    // The char pass above cannot neutralize the word-level operators: tantivy
+    // parses a leading `-term` as MustNot (so "NOT NULL constraint"-style
+    // queries silently excluded "null"), a bare `*` as match-all-documents,
+    // and uppercase AND/OR/NOT as boolean operators. Word-boundary stripping
+    // keeps hyphenated terms like "e-mail" intact; lowercasing the operator
+    // words turns them into ordinary terms, which is what the user typed.
+    cleaned
+        .split_whitespace()
+        .map(|word| {
+            let stripped = word.trim_start_matches(['-', '+']);
+            if stripped == "*" {
+                return String::new();
+            }
+            match stripped {
+                "AND" | "OR" | "NOT" => stripped.to_ascii_lowercase(),
+                _ => stripped.to_string(),
+            }
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn looks_path_weighted(query_text: &str) -> bool {
@@ -384,6 +406,13 @@ mod tests {
                 file_path: "src/main.rs",
                 content: "struct Config {\n    name: String,\n    port: u16,\n}",
                 symbol_name: Some("Config"),
+                language: "rust",
+            },
+            Bm25Document {
+                chunk_id: "src/db.rs:0",
+                file_path: "src/db.rs",
+                content: "fn save(row: Row) {\n    if row.id is NULL {\n        bail!(\"missing id\");\n    }\n}",
+                symbol_name: Some("save"),
                 language: "rust",
             },
             Bm25Document {
@@ -435,7 +464,7 @@ mod tests {
     fn insert_and_count() {
         let index = Bm25Index::open_in_memory().unwrap();
         index.insert_batch(&sample_docs()).unwrap();
-        assert_eq!(index.doc_count().unwrap(), 8);
+        assert_eq!(index.doc_count().unwrap(), 9);
     }
 
     #[test]
@@ -567,10 +596,10 @@ mod tests {
     fn delete_by_chunk_id() {
         let index = Bm25Index::open_in_memory().unwrap();
         index.insert_batch(&sample_docs()).unwrap();
-        assert_eq!(index.doc_count().unwrap(), 8);
+        assert_eq!(index.doc_count().unwrap(), 9);
 
         index.delete_by_chunk_id("src/main.rs:0").unwrap();
-        assert_eq!(index.doc_count().unwrap(), 7);
+        assert_eq!(index.doc_count().unwrap(), 8);
     }
 
     #[test]
@@ -654,5 +683,40 @@ mod tests {
             sanitize_query("how pandoc's app module orchestrates"),
             "how pandoc s app module orchestrates"
         );
+    }
+
+    /// "NOT NULL world" used to parse NOT as MustNot and exclude the very
+    /// chunks mentioning NULL; it must match exactly what "NULL world" does.
+    /// The fixture needs a doc containing NULL, or the exclusion is invisible.
+    #[test]
+    fn sanitized_query_does_not_exclude_on_uppercase_not() {
+        let index = Bm25Index::open_in_memory().unwrap();
+        index.insert_batch(&sample_docs()).unwrap();
+
+        let with_not = index.search("NOT NULL missing", 10).unwrap();
+        let without = index.search("NULL missing", 10).unwrap();
+
+        assert!(
+            !without.is_empty(),
+            "fixture does not discriminate: nothing matches 'NULL missing'"
+        );
+        assert_eq!(
+            with_not.len(),
+            without.len(),
+            "'NOT X' must match exactly what 'X' matches"
+        );
+    }
+
+    #[test]
+    fn sanitize_query_neutralizes_word_operators_but_keeps_hyphenated_terms() {
+        // Leading +/- are exclusion/inclusion operators only at word start.
+        assert_eq!(sanitize_query("-term +other"), "term other");
+        // Hyphenated words survive.
+        assert_eq!(sanitize_query("e-mail check"), "e-mail check");
+        // A bare * is match-all; kill it. Attached wildcards stay.
+        assert_eq!(sanitize_query("* auth"), "auth");
+        assert_eq!(sanitize_query("auth*"), "auth*");
+        // Operator words lowercase into ordinary terms.
+        assert_eq!(sanitize_query("NOT NULL AND retry"), "not NULL and retry");
     }
 }
