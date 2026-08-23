@@ -208,9 +208,21 @@ fn failed_check_names(checks: &[DoctorCheck]) -> Vec<&'static str> {
 }
 
 fn check_env_group(name: &'static str, keys: &[&'static str]) -> DoctorCheck {
+    check_env_group_with(name, keys, |key| std::env::var(key).ok())
+}
+
+/// Presence with validity: unset and empty/whitespace-only both count as
+/// absent, matching `setup::read_api_env_var`. An `EMBEDDING_MODEL_API_KEY=""`
+/// leftover in a shellrc used to score as present and earn an ok verdict for a
+/// configuration that cannot work.
+fn check_env_group_with(
+    name: &'static str,
+    keys: &[&'static str],
+    get: impl Fn(&str) -> Option<String>,
+) -> DoctorCheck {
     let present = keys
         .iter()
-        .filter(|key| std::env::var_os(key).is_some())
+        .filter(|key| get(key).is_some_and(|value| !value.trim().is_empty()))
         .count();
 
     let status = match present {
@@ -706,5 +718,46 @@ mod tests {
             "a warning must not fail the run: version-check, config-file, \
              saved-backend and current-index all warn on a healthy machine"
         );
+    }
+
+    #[test]
+    fn empty_env_values_count_as_absent_not_present() {
+        let keys = ["BASE_URL", "MODEL_ID", "API_KEY"];
+        let env = |key: &str| -> Option<String> {
+            match key {
+                "BASE_URL" => Some("https://api.example.com".into()),
+                // Shellrc leftovers: set but empty / whitespace-only.
+                "MODEL_ID" => Some(String::new()),
+                "API_KEY" => Some("   ".into()),
+                _ => None,
+            }
+        };
+
+        let check = check_env_group_with("embedding-api", &keys, env);
+
+        assert!(
+            matches!(check.status, CheckStatus::Fail),
+            "one valid value out of three must fail, got {:?}: {}",
+            check.status,
+            check.detail
+        );
+        assert_eq!(check.detail, "1/3 variables present");
+    }
+
+    #[test]
+    fn all_valid_env_values_score_ok() {
+        let keys = ["BASE_URL", "MODEL_ID"];
+        let check = check_env_group_with("embedding-api", &keys, |key| {
+            Some(format!("value-for-{key}"))
+        });
+
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn no_env_values_at_all_warns() {
+        let check = check_env_group_with("embedding-api", &["BASE_URL"], |_| None);
+
+        assert!(matches!(check.status, CheckStatus::Warn));
     }
 }
