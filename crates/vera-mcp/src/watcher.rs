@@ -261,8 +261,10 @@ fn start_watching_with_runtime(
             // Skip if already updating, but remember that changes arrived:
             // the running update's final scan happened before these events, so
             // dropping the batch here would leave the index stale until some
-            // unrelated future change. The runner re-runs once when it sees
-            // the flag.
+            // unrelated future change. Record the flag first, then try to take
+            // over the trailing run ourselves: if the active runner exited
+            // between our failed CAS and this point, nobody else will observe
+            // the dirty flag, so we must start the cycle here.
             if updating_clone
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
                 .is_err()
@@ -273,6 +275,25 @@ fn start_watching_with_runtime(
                     eprintln!(
                         "[watch] update already running, changes will be picked up next cycle"
                     );
+                }
+                if updating_clone
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let repo = repo_clone.clone();
+                    let flag = updating_clone.clone();
+                    let dirty_flag = dirty_clone.clone();
+                    let engine = Arc::clone(&engine);
+                    std::thread::spawn(move || {
+                        run_incremental_update(
+                            &engine,
+                            &repo,
+                            &runtime,
+                            &flag,
+                            &dirty_flag,
+                            progress_logs,
+                        );
+                    });
                 }
                 return;
             }
