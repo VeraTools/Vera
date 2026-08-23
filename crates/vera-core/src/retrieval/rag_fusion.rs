@@ -94,15 +94,29 @@ async fn execute_rag_fusion_with_context(
 
     // BM25 pre-filter: run a cheap keyword search to gather codebase context
     // (symbol names and file paths) that helps the LLM generate better rewrites.
-    let context_hints = bm25_context_hints(index_dir, query);
+    // Both this and query expansion block (SQLite/Tantivy opens; a
+    // reqwest::blocking call with a 120 s timeout), so they run on the blocking
+    // pool: inline execution pinned a tokio worker per deep search, and
+    // concurrent searches stacked blocked workers until the runtime starved.
+    let hints_dir = index_dir.to_path_buf();
+    let hints_query = query.to_string();
+    let context_hints =
+        tokio::task::spawn_blocking(move || bm25_context_hints(&hints_dir, &hints_query))
+            .await
+            .unwrap_or_default();
     debug!(
         hints = context_hints.len(),
         "BM25 pre-filter produced context hints for query expansion"
     );
 
-    let expanded = completion_client
-        .expand_query_with_context(query, &context_hints)
-        .map_err(|e| anyhow!("failed to generate deep-search query candidates: {e}"))?;
+    let expansion_client = completion_client.clone();
+    let expansion_query = query.to_string();
+    let expanded = tokio::task::spawn_blocking(move || {
+        expansion_client.expand_query_with_context(&expansion_query, &context_hints)
+    })
+    .await
+    .map_err(|e| anyhow!("deep-search query expansion task failed: {e}"))?
+    .map_err(|e| anyhow!("failed to generate deep-search query candidates: {e}"))?;
 
     let queries = dedupe_queries_with_original(query, expanded);
     if queries.len() <= 1 {

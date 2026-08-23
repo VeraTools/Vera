@@ -97,6 +97,9 @@ impl CompletionClientConfig {
 }
 
 /// OpenAI-compatible chat completion client for query expansion.
+///
+/// `Clone` is cheap: the inner `reqwest::blocking::Client` is an `Arc`.
+#[derive(Clone)]
 pub struct CompletionClient {
     client: reqwest::blocking::Client,
     config: CompletionClientConfig,
