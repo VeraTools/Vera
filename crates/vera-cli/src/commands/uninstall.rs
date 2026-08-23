@@ -87,6 +87,7 @@ fn run_at(
     for error in &skill_removal.failures {
         writeln!(stderr, "  {error:#}")?;
     }
+    let complete = skill_removal.failures.is_empty();
     let removed_skills: Vec<&str> = skill_removal
         .reports
         .iter()
@@ -141,17 +142,46 @@ fn run_at(
             "{}",
             serde_json::json!({
                 "uninstalled": true,
+                "complete": complete,
                 "removed": removed,
                 "skills": removed_skills,
             })
         )?;
     } else {
         writeln!(stderr)?;
-        writeln!(stderr, "Vera has been uninstalled.")?;
+        if complete {
+            writeln!(stderr, "Vera has been uninstalled.")?;
+        } else {
+            writeln!(
+                stderr,
+                "Vera was partially uninstalled: {} installed skill{} could not be removed.",
+                skill_removal.failures.len(),
+                if skill_removal.failures.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )?;
+        }
         writeln!(
             stderr,
             "Per-project indexes (.vera/ in each project) were not removed."
         )?;
+    }
+
+    // A locked skill directory must be observable in the exit code: automation
+    // auditing cleanup via status would otherwise see success while Vera skills
+    // remain installed and active for agents.
+    if !complete {
+        anyhow::bail!(
+            "failed to remove {} installed skill{}; see errors above",
+            skill_removal.failures.len(),
+            if skill_removal.failures.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
     }
 
     Ok(())
@@ -198,10 +228,12 @@ mod tests {
         path
     }
 
-    fn uninstall(roots: &Roots, json_output: bool) -> (String, String) {
+    type UninstallOutput = (Result<(), anyhow::Error>, String, String);
+
+    fn uninstall(roots: &Roots, json_output: bool) -> UninstallOutput {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        run_at(
+        let result = run_at(
             &roots.home,
             &roots.vera_home,
             &roots.cwd,
@@ -209,9 +241,9 @@ mod tests {
             json_output,
             &mut stdout,
             &mut stderr,
-        )
-        .unwrap();
+        );
         (
+            result,
             String::from_utf8(stdout).unwrap(),
             String::from_utf8(stderr).unwrap(),
         )
@@ -222,7 +254,8 @@ mod tests {
         let roots = roots();
         let skill = install_claude_global_skill(&roots.home);
 
-        let (stdout, _) = uninstall(&roots, true);
+        let (result, stdout, _) = uninstall(&roots, true);
+        result.unwrap();
 
         // Strict parse: this is what `json.load` and `serde_json::from_str` do,
         // and it fails with trailing input if a second document is printed.
@@ -241,7 +274,8 @@ mod tests {
     fn uninstall_json_claims_only_categories_that_were_removed() {
         let roots = roots();
 
-        let (stdout, _) = uninstall(&roots, true);
+        let (result, stdout, _) = uninstall(&roots, true);
+        result.unwrap();
 
         let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(document["removed"], serde_json::json!([]));
@@ -254,7 +288,7 @@ mod tests {
         let skill = install_claude_global_skill(&roots.home);
         let not_installed = roots.home.join(".gemini").join("skills").join("vera");
 
-        let (stdout, _) = uninstall(&roots, false);
+        let (_, stdout, _) = uninstall(&roots, false);
 
         assert!(stdout.contains("Removed Vera skill from:"), "{stdout}");
         assert!(stdout.contains(&skill.display().to_string()), "{stdout}");
@@ -292,7 +326,10 @@ mod tests {
         let claude = install_claude_global_skill(&roots.home);
         let locked = install_unremovable_gemini_global_skill(&roots.home);
 
-        let (stdout, _) = uninstall(&roots, true);
+        let (result, stdout, _) = uninstall(&roots, true);
+        // The locked gemini skill makes the run partial: success must be
+        // observable as an error, and the document must say so.
+        assert!(result.is_err(), "partial removal must not report success");
         let claude_was_deleted = !claude.exists();
         allow_cleanup(&locked);
 
@@ -301,6 +338,11 @@ mod tests {
             "fixture does not discriminate: the earlier skill was never deleted"
         );
         let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            document["complete"],
+            serde_json::json!(false),
+            "partial removal must set complete: false: {stdout}"
+        );
         assert_eq!(
             document["skills"],
             serde_json::json!([claude.display().to_string()]),
@@ -320,7 +362,7 @@ mod tests {
         let claude = install_claude_global_skill(&roots.home);
         let locked = install_unremovable_gemini_global_skill(&roots.home);
 
-        let (stdout, stderr) = uninstall(&roots, false);
+        let (_, stdout, stderr) = uninstall(&roots, false);
         let claude_was_deleted = !claude.exists();
         allow_cleanup(&locked);
 
@@ -348,7 +390,9 @@ mod tests {
         let roots = roots();
         let locked = install_unremovable_gemini_global_skill(&roots.home);
 
-        let (stdout, stderr) = uninstall(&roots, false);
+        let (result, stdout, stderr) = uninstall(&roots, false);
+        // The locked skill makes the run partial; success must not be reported.
+        assert!(result.is_err(), "partial removal must not report success");
         allow_cleanup(&locked);
 
         assert!(
@@ -381,7 +425,9 @@ mod tests {
         let roots = roots();
         let locked = install_uninspectable_claude_global_skill(&roots.home);
 
-        let (stdout, stderr) = uninstall(&roots, false);
+        let (result, stdout, stderr) = uninstall(&roots, false);
+        // The locked skill makes the run partial; success must not be reported.
+        assert!(result.is_err(), "partial removal must not report success");
         allow_cleanup(&locked);
         let skill_survived = locked.join("SKILL.md").exists();
 
@@ -404,7 +450,7 @@ mod tests {
     fn uninstall_human_output_reports_nothing_when_no_skills_are_installed() {
         let roots = roots();
 
-        let (stdout, stderr) = uninstall(&roots, false);
+        let (_, stdout, stderr) = uninstall(&roots, false);
 
         assert_eq!(stdout.trim(), "No Vera skill installations found.");
         assert!(stderr.contains("Vera has been uninstalled."));
