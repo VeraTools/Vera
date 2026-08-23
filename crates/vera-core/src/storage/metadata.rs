@@ -184,22 +184,40 @@ impl MetadataStore {
     /// Fail on a file that exists but was not written by `init_schema`
     /// (zero-byte leftover of a crashed create, truncated download).
     fn validate_schema(&self, db_path: &std::path::Path) -> Result<()> {
-        let tables: i64 = self
+        const REQUIRED_TABLES: &[&str] = &[
+            "chunks",
+            "file_hashes",
+            "file_index_state",
+            "index_metadata",
+            "references",
+            "type_relations",
+        ];
+        let mut statement = self
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
-                [],
-                |row| row.get(0),
-            )
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
             .with_context(|| {
                 format!(
                     "index metadata at {} is not a readable SQLite database",
                     db_path.display()
                 )
             })?;
-        if tables == 0 {
+        let present: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(statement);
+
+        let missing: Vec<&str> = REQUIRED_TABLES
+            .iter()
+            .filter(|required| {
+                !present
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(required))
+            })
+            .copied()
+            .collect();
+        if let Some(first) = missing.first() {
             anyhow::bail!(
-                "index metadata at {} has no schema (the index is incomplete; run `vera index <path>` to rebuild it)",
+                "index metadata at {} is incomplete (missing table {first}; run `vera index <path>` to rebuild it)",
                 db_path.display()
             );
         }
@@ -1287,6 +1305,24 @@ mod tests {
         assert!(
             std::fs::read(&truncated).unwrap().is_empty(),
             "a failed open must not modify the file"
+        );
+
+        // A partial schema (some tables, not all) is also incomplete: reads
+        // must demand a rebuild rather than fail deep inside a query.
+        std::fs::write(&truncated, b"").unwrap();
+        {
+            let conn = Connection::open(&truncated).unwrap();
+            conn.execute_batch("CREATE TABLE chunks (id TEXT PRIMARY KEY);")
+                .unwrap();
+        }
+        let result = MetadataStore::open_existing(&truncated);
+        assert!(result.is_err(), "partial schema must not open");
+        assert!(
+            result
+                .err()
+                .map(|e| e.to_string().contains("incomplete"))
+                .unwrap_or(false),
+            "error should say the index is incomplete"
         );
     }
     use super::*;
