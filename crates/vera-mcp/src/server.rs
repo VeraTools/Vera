@@ -119,7 +119,19 @@ fn run_server_with_frame_limit(
             continue;
         }
 
-        let line = String::from_utf8_lossy(&frame);
+        // Strict decode: lossy replacement could silently alter bytes inside a
+        // JSON string and let an altered request through.
+        // Strict decode: lossy replacement could silently alter bytes inside a
+        // JSON string and let an altered request through.
+        let line = match String::from_utf8(frame) {
+            Ok(line) => line,
+            Err(_) => {
+                tracing::warn!("Request frame is not valid UTF-8");
+                let err = RpcError::new(Value::Null, PARSE_ERROR, "Request is not valid UTF-8");
+                write_message(writer, &err);
+                continue;
+            }
+        };
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -602,5 +614,39 @@ mod tests {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
         assert_eq!(responses[1]["id"], 7);
+    }
+
+    /// A frame with invalid UTF-8 is a parse error, not a silently repaired one:
+    /// lossy decoding could alter bytes inside a JSON string and let an altered
+    /// request through.
+    #[test]
+    fn invalid_utf8_frame_is_rejected() {
+        let mut input = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "ping"
+        }))
+        .unwrap();
+        // Corrupt bytes inside the frame.
+        input.splice(5..6, [0xFF, 0xFE]);
+        input.push(b'\n');
+        let mut reader = std::io::BufReader::new(Cursor::new(input));
+        let mut output = Vec::new();
+
+        run_server_with_frame_limit(&mut reader, &mut output, 1024);
+
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
+        assert!(
+            responses[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("UTF-8")
+        );
     }
 }
