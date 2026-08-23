@@ -236,9 +236,33 @@ pub fn markdown_section_chunks(source: &str, file_path: &str) -> Vec<Chunk> {
     // Track current section
     let mut section_start: usize = 0;
     let mut section_name: Option<String> = None;
+    // Fenced-code-block state (CommonMark): a line whose trimmed form opens a
+    // fence of >=3 backticks or tildes toggles it, and only the same character
+    // with at least that length closes it. `#` lines inside a fence are code
+    // comments (shell/python/yaml/make), not headings.
+    let mut in_fence = false;
+    let mut fence_char: Option<char> = None;
+    let mut fence_len: usize = 0;
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
+        let fence_run = trimmed
+            .chars()
+            .take_while(|c| *c == '`' || *c == '~')
+            .count();
+        if fence_run >= 3 {
+            let ch = trimmed.chars().next();
+            let is_closer = in_fence && ch == fence_char && fence_run >= fence_len;
+            if !in_fence || is_closer {
+                in_fence = !in_fence;
+                fence_char = if in_fence { ch } else { None };
+                fence_len = if in_fence { fence_run } else { 0 };
+            }
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         if trimmed.starts_with('#') {
             // Extract heading text (strip leading #s and whitespace)
             let heading = trimmed.trim_start_matches('#').trim();
@@ -853,5 +877,45 @@ mod tests {
         assert_eq!(chunks[0].symbol_name.as_deref(), Some("Cargo.toml"));
         assert_eq!(chunks[0].line_start, 1);
         assert_eq!(chunks[0].line_end, 2);
+    }
+    /// `#` lines inside fenced code blocks are code comments, not headings:
+    /// the fence must not split, and the comment must not name a section.
+    #[test]
+    fn markdown_headings_inside_code_fences_do_not_split_sections() {
+        let source = "# Real Title\n\n```python\n# this is a comment\nx = 1\n```\nmore prose\n";
+        let chunks = markdown_section_chunks(source, "README.md");
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "one fence-bounded comment must not create a second section: {chunks:?}"
+        );
+        assert_eq!(chunks[0].symbol_name.as_deref(), Some("Real Title"));
+        assert_eq!(chunks[0].line_start, 1);
+        assert_eq!(chunks[0].line_end, 7);
+        assert!(chunks[0].content.contains("# this is a comment"));
+        assert!(chunks[0].content.contains("more prose"));
+    }
+
+    /// A real heading after a closed fence still starts a new section, and a
+    /// tilde fence is tracked the same way as a backtick one.
+    #[test]
+    fn markdown_heading_after_fence_still_starts_section() {
+        let source = "~~~\n# not a heading\n~~~\n\n## Actual Heading\ntext\n";
+        let chunks = markdown_section_chunks(source, "README.md");
+
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks[0].symbol_name.as_deref(), Some("README.md"));
+        assert_eq!(chunks[1].symbol_name.as_deref(), Some("Actual Heading"));
+    }
+
+    /// A longer closing fence than the opener still closes it (CommonMark).
+    #[test]
+    fn markdown_fence_closes_with_longer_run() {
+        let source = "```python\n# comment\n````\n\n# After\ntext\n";
+        let chunks = markdown_section_chunks(source, "README.md");
+
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks[1].symbol_name.as_deref(), Some("After"));
     }
 }
