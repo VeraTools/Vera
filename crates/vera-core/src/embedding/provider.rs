@@ -126,6 +126,11 @@ pub struct EmbeddingProviderConfig {
     /// Optional prefix prepended to query text for asymmetric embedding models.
     /// Read from `EMBEDDING_QUERY_PREFIX` env var.
     pub query_prefix: Option<String>,
+    /// Optional prefix prepended to indexed passage text, the other half of an
+    /// asymmetric contract (e.g. e5's "passage: "). Read from
+    /// `EMBEDDING_DOCUMENT_PREFIX` env var; auto-detected alongside the query
+    /// prefix so the API path matches the local path's two-sided behavior.
+    pub document_prefix: Option<String>,
 }
 
 impl std::fmt::Debug for EmbeddingProviderConfig {
@@ -150,6 +155,7 @@ impl EmbeddingProviderConfig {
             timeout: Duration::from_secs(30),
             max_retries: 3,
             query_prefix: None,
+            document_prefix: None,
         }
     }
 
@@ -170,9 +176,14 @@ impl EmbeddingProviderConfig {
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| default_query_prefix_for_model(&model_id));
+        let document_prefix = std::env::var("EMBEDDING_DOCUMENT_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_document_prefix_for_model(&model_id));
 
         let mut config = Self::new(base_url, model_id, api_key);
         config.query_prefix = query_prefix;
+        config.document_prefix = document_prefix;
         Ok(config)
     }
 
@@ -210,6 +221,20 @@ fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
     } else {
         // Unrecognized model: try fetching prefix from HuggingFace.
         fetch_query_prefix_from_hf(model_id)
+    }
+}
+
+/// Auto-detect the passage-side prefix matching [`default_query_prefix_for_model`].
+///
+/// Only families with a genuinely asymmetric query/passage contract get one;
+/// a model whose query prefix is an instruction block (Qwen3, CodeRankEmbed,
+/// BGE's "Represent this sentence...") embeds passages bare.
+fn default_document_prefix_for_model(model_id: &str) -> Option<String> {
+    let id = model_id.to_lowercase();
+    if id.contains("e5-") || id.contains("e5_") {
+        Some("passage: ".into())
+    } else {
+        None
     }
 }
 
@@ -471,6 +496,13 @@ impl EmbeddingProvider for OpenAiProvider {
         match &self.config.query_prefix {
             Some(prefix) => format!("{prefix}{query}"),
             None => query.to_string(),
+        }
+    }
+
+    fn prepare_document_text(&self, document: &str) -> String {
+        match &self.config.document_prefix {
+            Some(prefix) => format!("{prefix}{document}"),
+            None => document.to_string(),
         }
     }
 
@@ -1355,6 +1387,50 @@ mod tests {
         fn expected_dim(&self) -> Option<usize> {
             Some(1)
         }
+    }
+
+    /// e5's contract is query:/passage: pairs. The API path auto-detects the
+    /// query prefix; it must apply the passage half on the indexing path too,
+    /// or indexed passages and queries embed under different regimes.
+    #[test]
+    fn api_document_prefix_applied_on_indexing_path() {
+        let mut config = EmbeddingProviderConfig::new(
+            "https://api.example.com".into(),
+            "intfloat/e5-large-v2".into(),
+            "key".into(),
+        );
+        config.query_prefix = Some("query: ".into());
+        config.document_prefix = Some("passage: ".into());
+        let provider = OpenAiProvider::new(config).unwrap();
+
+        assert_eq!(provider.prepare_query_text("find foo"), "query: find foo");
+        assert_eq!(
+            provider.prepare_document_text("fn foo() {}"),
+            "passage: fn foo() {}"
+        );
+    }
+
+    /// e5 is detected from the model id without env overrides.
+    #[test]
+    fn e5_model_detects_both_prefixes() {
+        let id = "intfloat/e5-large-v2";
+        assert_eq!(
+            default_query_prefix_for_model(id).as_deref(),
+            Some("query: ")
+        );
+        assert_eq!(
+            default_document_prefix_for_model(id).as_deref(),
+            Some("passage: ")
+        );
+        // Instruction-style families keep bare passages.
+        assert_eq!(
+            default_document_prefix_for_model("Qwen/Qwen3-Embedding-8B"),
+            None
+        );
+        assert_eq!(
+            default_document_prefix_for_model("some-unknown-model"),
+            None
+        );
     }
 
     #[test]
