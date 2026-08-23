@@ -280,6 +280,10 @@ fn start_watching_with_runtime(
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
                     .is_ok()
                 {
+                    // We own the trailing run; drop the flag we just set so it
+                    // does not schedule a second cycle on top. Events recorded
+                    // from here on re-set it and still get their own cycle.
+                    dirty_clone.store(false, Ordering::SeqCst);
                     let repo = repo_clone.clone();
                     let flag = updating_clone.clone();
                     let dirty_flag = dirty_clone.clone();
