@@ -277,8 +277,14 @@ fn parse_query_candidates(raw: &str, limit: usize) -> Result<Vec<String>> {
     }
 
     // Try extracting a JSON array from within the response (e.g. fenced code blocks).
-    if let Some((start, end)) = raw.find('[').zip(raw.rfind(']')) {
-        let candidate = &raw[start..=end];
+    // `find` and `rfind` resolve independently: a reply whose last `]` precedes its
+    // first `[` must fall through to the error below, not panic on the slice.
+    if let Some(candidate) = raw
+        .find('[')
+        .zip(raw.rfind(']'))
+        .filter(|(start, end)| end >= start)
+        .and_then(|(start, end)| raw.get(start..=end))
+    {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
             if let Some(parsed) = json_value_to_queries(&value) {
                 return Ok(normalize_query_list(parsed, limit));
@@ -378,6 +384,14 @@ mod tests {
     #[test]
     fn non_json_returns_error() {
         let raw = "1. auth token refresh\n2) jwt expiry handling";
+        assert!(parse_query_candidates(raw, 4).is_err());
+    }
+
+    /// A reply whose last `]` sits before its first `[` used to panic on
+    /// `&raw[start..=end]`; it must return the normal parse error instead.
+    #[test]
+    fn closing_bracket_before_opening_bracket_returns_error() {
+        let raw = "array done] here comes [\"q1\"";
         assert!(parse_query_candidates(raw, 4).is_err());
     }
 
