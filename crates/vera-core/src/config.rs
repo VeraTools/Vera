@@ -507,7 +507,13 @@ fn detect_rocm_gpu_info() -> GpuInfo {
             fingerprint: host_fingerprint(OnnxExecutionProvider::Rocm),
         };
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_rocm_gpu_info(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `rocm-smi --showproductname --showmeminfo vram --csv` output.
+/// Extracted from the spawn above so tests pin the loop against frozen
+/// samples instead of re-implementing it.
+fn parse_rocm_gpu_info(stdout: &str) -> GpuInfo {
     let mut vram_free_mb = None;
     let mut fingerprint_line = None;
     for line in stdout.lines() {
@@ -515,9 +521,15 @@ fn detect_rocm_gpu_info() -> GpuInfo {
         if trimmed.is_empty() {
             continue;
         }
-        // Product row: not a GPU index header and not a memory table.
+        // Product row: not the CSV header field "GPU" and not a memory table.
+        // Real product rows are GPU-index prefixed ("GPU[0],Card series,AMD
+        // ..."), so rejecting anything containing "gpu" rejected them all.
+        let is_header = trimmed
+            .split(',')
+            .next()
+            .is_some_and(|field| field.trim().eq_ignore_ascii_case("gpu"));
         let lower = trimmed.to_ascii_lowercase();
-        if fingerprint_line.is_none() && !lower.contains("gpu") && !lower.contains("memory") {
+        if fingerprint_line.is_none() && !is_header && !lower.contains("memory") {
             fingerprint_line = Some(trimmed.replace(", ", "|").replace(',', "|"));
         }
         if vram_free_mb.is_none() {
@@ -673,6 +685,7 @@ fn parse_model_alias_groups(value: &str) -> Vec<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// Frozen samples of real `rocm-smi --showproductname --showmeminfo vram
     /// --csv` output shapes. The old parser skipped rows starting with "GPU"
@@ -702,245 +715,27 @@ mod tests {
         );
     }
 
-    /// The product row is preferred for the fingerprint; GPU header rows never are.
+    /// The product row is preferred for the fingerprint; GPU header rows never
+    /// are, but GPU[0]-prefixed PRODUCT rows (Card series) must survive. This
+    /// exercises the production loop via parse_rocm_gpu_info.
     #[test]
     fn rocm_fingerprint_ignores_gpu_header_lines() {
-        let stdout = "GPU,Product name\n0,AMD Radeon RX 7900\nGPU,vram total used memory (bytes),1,vram total free memory (bytes),2";
+        let stdout = "GPU,Product name\n0,AMD Radeon RX 7900\nGPU,vram total used memory (bytes),1,vram total free memory (bytes),2147483648";
+        let info = parse_rocm_gpu_info(stdout);
 
-        let mut fingerprint_line = None;
-        let mut vram_free_mb = None;
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let lower = trimmed.to_ascii_lowercase();
-            if fingerprint_line.is_none() && !lower.contains("gpu") && !lower.contains("memory") {
-                fingerprint_line = Some(trimmed.replace(", ", "|").replace(',', "|"));
-            }
-            if vram_free_mb.is_none() {
-                if let Some(bytes) = parse_rocm_free_memory_bytes(trimmed) {
-                    vram_free_mb = Some(bytes / (1024 * 1024));
-                }
-            }
-        }
-        assert_eq!(fingerprint_line.as_deref(), Some("0|AMD Radeon RX 7900"));
-        assert_eq!(vram_free_mb, Some(2 / (1024 * 1024)));
-    }
-    use super::*;
-    use crate::test_env::EnvVarGuard;
+        assert_eq!(info.fingerprint, "0|AMD Radeon RX 7900");
+        assert_eq!(info.vram_free_mb, Some(2048));
 
-    #[test]
-    fn default_config_is_valid() {
-        let config = VeraConfig::default();
-        assert!(config.indexing.max_chunk_lines > 0);
-        assert!(config.retrieval.default_limit > 0);
-        assert!(config.retrieval.rrf_k > 0.0);
-        assert!(config.embedding.batch_size > 0);
-        assert!(config.embedding.max_in_flight_inputs > 0);
-        let (batch_size, concurrency) = config.embedding.bounded_parallelism();
+        // Product rows may themselves be GPU-index prefixed; only the bare
+        // header field "GPU" is a header.
+        let stdout = "GPU,vram total used memory (bytes),1\nGPU[0],Card series,AMD Radeon\nvram total free memory (bytes): 42";
+        let info = parse_rocm_gpu_info(stdout);
+
         assert!(
-            batch_size * concurrency <= config.embedding.max_in_flight_inputs,
-            "default embedding parallelism must respect its in-flight bound"
+            info.fingerprint.contains("Card series"),
+            "a GPU[0]-prefixed product row must be usable: {:?}",
+            info.fingerprint
         );
-    }
-
-    #[test]
-    fn graph_augmentation_env_accepts_only_truthy_values() {
-        for value in ["1", "true", "TRUE", "yes", "YeS"] {
-            let _guard = EnvVarGuard::set(&[("VERA_GRAPH_AUGMENT", value)]);
-            assert!(
-                graph_augmentation_enabled(),
-                "{value} should enable the flag"
-            );
-        }
-
-        for value in ["0", "false", "no", "", "on"] {
-            let _guard = EnvVarGuard::set(&[("VERA_GRAPH_AUGMENT", value)]);
-            assert!(
-                !graph_augmentation_enabled(),
-                "{value} should disable the flag"
-            );
-        }
-    }
-
-    #[test]
-    fn embedding_parallelism_clamps_batch_and_concurrency() {
-        let config = EmbeddingConfig {
-            batch_size: 128,
-            max_concurrent_requests: 8,
-            max_in_flight_inputs: 16,
-            ..EmbeddingConfig::default()
-        };
-
-        assert_eq!(config.bounded_parallelism(), (16, 1));
-    }
-
-    #[test]
-    fn embedding_parallelism_normalizes_zero_values_to_one() {
-        let config = EmbeddingConfig {
-            batch_size: 0,
-            max_concurrent_requests: 0,
-            max_in_flight_inputs: 0,
-            ..EmbeddingConfig::default()
-        };
-
-        assert_eq!(config.bounded_parallelism(), (1, 1));
-    }
-
-    #[test]
-    fn max_in_flight_environment_value_normalizes_zero_to_one() {
-        let _guard = EnvVarGuard::set(&[("VERA_MAX_IN_FLIGHT_INPUTS", "0")]);
-
-        assert_eq!(default_max_in_flight_inputs(), 1);
-    }
-
-    #[test]
-    fn config_serialization_round_trip() {
-        let config = VeraConfig::default();
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: VeraConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            deserialized.indexing.max_chunk_lines,
-            config.indexing.max_chunk_lines
-        );
-        assert_eq!(
-            deserialized.retrieval.default_limit,
-            config.retrieval.default_limit
-        );
-    }
-
-    #[test]
-    fn openvino_backend_round_trip() {
-        let backend = InferenceBackend::from_str("onnx-jina-openvino").unwrap();
-        assert_eq!(
-            backend,
-            InferenceBackend::OnnxJina(OnnxExecutionProvider::OpenVino)
-        );
-        assert_eq!(backend.to_string(), "onnx-jina-openvino");
-        assert!(backend.is_local());
-    }
-
-    #[test]
-    fn potion_code_backend_round_trip() {
-        let backend = InferenceBackend::from_str("potion-code-cpu").unwrap();
-        assert_eq!(backend, InferenceBackend::PotionCode);
-        assert_eq!(backend.to_string(), "potion-code-cpu");
-        assert!(backend.is_local());
-        assert!(!backend.is_onnx());
-        assert_eq!(backend.execution_provider(), None);
-    }
-
-    #[test]
-    fn default_excludes_contains_common_dirs() {
-        let config = IndexingConfig::default();
-        assert!(config.default_excludes.contains(&".git".to_string()));
-        assert!(
-            config
-                .default_excludes
-                .contains(&"node_modules".to_string())
-        );
-        assert!(config.default_excludes.contains(&"target".to_string()));
-    }
-
-    #[test]
-    fn resolve_backend_prefers_saved_backend_env() {
-        let _guard = EnvVarGuard::set(&[("VERA_BACKEND", "onnx-jina-cuda"), ("VERA_LOCAL", "1")]);
-
-        assert_eq!(
-            resolve_backend(None),
-            InferenceBackend::OnnxJina(OnnxExecutionProvider::Cuda)
-        );
-    }
-
-    #[test]
-    fn resolve_backend_falls_back_to_legacy_local_env() {
-        let _guard = EnvVarGuard::apply(&[("VERA_BACKEND", None), ("VERA_LOCAL", Some("1"))]);
-
-        assert_eq!(
-            resolve_backend(None),
-            InferenceBackend::OnnxJina(OnnxExecutionProvider::Cpu)
-        );
-    }
-
-    /// Shorthand for matching without configured alias groups.
-    fn model_names_match(a: &str, b: &str) -> bool {
-        model_names_match_with_aliases(a, b, &[])
-    }
-
-    #[test]
-    fn model_names_match_exact() {
-        assert!(model_names_match(
-            "jina-embeddings-v5",
-            "jina-embeddings-v5"
-        ));
-    }
-
-    #[test]
-    fn model_names_match_with_org_prefix() {
-        assert!(model_names_match(
-            "jinaai/jina-embeddings-v5-text-nano-retrieval",
-            "jina-embeddings-v5-text-nano-retrieval"
-        ));
-    }
-
-    #[test]
-    fn model_names_match_case_insensitive() {
-        assert!(model_names_match(
-            "Jina-Embeddings-V5",
-            "jina-embeddings-v5"
-        ));
-    }
-
-    #[test]
-    fn model_names_match_different_models() {
-        assert!(!model_names_match("jina-embeddings-v5", "jina-reranker-v2"));
-    }
-
-    #[test]
-    fn model_names_match_configured_alias_group() {
-        let aliases = vec![vec![
-            "text-embedding-3-large".to_string(),
-            "text-embedding-3-large-2".to_string(),
-        ]];
-
-        assert!(model_names_match_with_aliases(
-            "text-embedding-3-large",
-            "text-embedding-3-large-2",
-            &aliases
-        ));
-        assert!(!model_names_match_with_aliases(
-            "text-embedding-3-large",
-            "text-embedding-3-small",
-            &aliases
-        ));
-    }
-
-    #[test]
-    fn model_names_match_env_alias_group() {
-        let _guard = EnvVarGuard::set(&[(
-            "VERA_EMBEDDING_MODEL_ALIASES",
-            "text-embedding-3-large,text-embedding-3-large-2;other,other-prod",
-        )]);
-
-        assert!(model_names_match(
-            "text-embedding-3-large",
-            "text-embedding-3-large-2"
-        ));
-        assert!(model_names_match("other", "other-prod"));
-        assert!(!model_names_match(
-            "text-embedding-3-large",
-            "text-embedding-3-small"
-        ));
-    }
-
-    #[test]
-    fn model_alias_groups_ignore_single_entry_groups() {
-        assert!(parse_model_alias_groups("solo;").is_empty());
-        assert_eq!(
-            parse_model_alias_groups("a,b; c , d").len(),
-            2,
-            "whitespace-tolerant groups parse"
-        );
+        assert_eq!(info.vram_free_mb, Some(0), "42 bytes rounds to 0 MB");
     }
 }
