@@ -246,6 +246,10 @@ pub fn markdown_section_chunks(source: &str, file_path: &str) -> Vec<Chunk> {
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
+        // CommonMark: a fence indented four or more columns is an indented
+        // code block, not a fence. "    ```" must not swallow the "# Actual"
+        // heading after it.
+        let indent = line.len() - line.trim_start().len();
         // The run is counted over the FIRST character only: a mixed run like
         // "``~~" is not a fence marker. A closer must be the marker run alone
         // (trailing whitespace allowed); an opener may carry an info string
@@ -254,7 +258,7 @@ pub fn markdown_section_chunks(source: &str, file_path: &str) -> Vec<Chunk> {
         let fence_run = marker
             .filter(|ch| matches!(ch, '`' | '~'))
             .map_or(0, |ch| trimmed.chars().take_while(|c| *c == ch).count());
-        if fence_run >= 3 {
+        if fence_run >= 3 && indent < 4 {
             let rest = &trimmed[fence_run..];
             let is_closer = in_fence
                 && marker == fence_char
@@ -953,5 +957,16 @@ mod tests {
         );
         assert!(fenced.content.contains("```python"), "{:?}", fenced.content);
         assert_eq!(chunks[1].symbol_name.as_deref(), Some("After"));
+    }
+
+    /// A fence indented four or more columns is an indented code block per
+    /// CommonMark, not a fence: it must not suppress the following heading.
+    #[test]
+    fn markdown_indented_fence_is_not_recognized() {
+        let source = "    ```\nlet x = 1;\n\n# Actual\ntext\n";
+        let chunks = markdown_section_chunks(source, "README.md");
+
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks[1].symbol_name.as_deref(), Some("Actual"));
     }
 }
