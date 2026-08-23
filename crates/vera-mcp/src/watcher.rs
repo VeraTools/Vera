@@ -207,7 +207,9 @@ fn start_watching_with_runtime(
     let index_dir = idx_dir.clone();
 
     let updating = Arc::new(AtomicBool::new(false));
+    let dirty = Arc::new(AtomicBool::new(false));
     let updating_clone = updating.clone();
+    let dirty_clone = dirty.clone();
     let repo_clone = repo_path.clone();
     let engine = Arc::new(SharedEngine {
         build,
@@ -256,11 +258,16 @@ fn start_watching_with_runtime(
                 return;
             }
 
-            // Skip if already updating.
+            // Skip if already updating, but remember that changes arrived:
+            // the running update's final scan happened before these events, so
+            // dropping the batch here would leave the index stale until some
+            // unrelated future change. The runner re-runs once when it sees
+            // the flag.
             if updating_clone
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
                 .is_err()
             {
+                dirty_clone.store(true, Ordering::SeqCst);
                 debug!("Skipping auto-update: previous update still running");
                 if progress_logs {
                     eprintln!(
@@ -276,10 +283,11 @@ fn start_watching_with_runtime(
 
             let repo = repo_clone.clone();
             let flag = updating_clone.clone();
+            let dirty_flag = dirty_clone.clone();
             let engine = Arc::clone(&engine);
 
             std::thread::spawn(move || {
-                run_incremental_update(&engine, &repo, &runtime, &flag, progress_logs);
+                run_incremental_update(&engine, &repo, &runtime, &flag, &dirty_flag, progress_logs);
             });
         },
     )
@@ -375,11 +383,41 @@ fn watch_failure_message(repo_path: &Path, error: &notify::Error) -> String {
 }
 
 /// Run an incremental update, resetting the flag when done.
+///
+/// Event batches that arrived while this update was running set `dirty`; the
+/// runner then takes the update lock once more and runs again, so edits made
+/// mid-update are picked up instead of waiting for an unrelated future change.
 fn run_incremental_update(
     engine: &SharedEngine,
     repo_path: &Path,
     runtime: &WatchRuntime,
     updating: &AtomicBool,
+    dirty: &AtomicBool,
+    progress_logs: bool,
+) {
+    loop {
+        run_incremental_update_once(engine, repo_path, runtime, progress_logs);
+
+        updating.store(false, Ordering::SeqCst);
+        if !dirty.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        // Re-acquire the updating flag so a concurrent batch cannot start a
+        // second runner while we trail; if it won the race, its own cycle will
+        // observe any further events.
+        if updating
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn run_incremental_update_once(
+    engine: &SharedEngine,
+    repo_path: &Path,
+    runtime: &WatchRuntime,
     progress_logs: bool,
 ) {
     debug!(path = %repo_path.display(), "Auto-update triggered by file changes");
@@ -418,8 +456,6 @@ fn run_incremental_update(
             }
         }
     }
-
-    updating.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -537,6 +573,81 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         predicate()
+    }
+
+    /// An engine whose update is slow enough to overlap the next event batch.
+    struct SlowCountingEngine {
+        updates: Arc<AtomicUsize>,
+        update_ms: u64,
+    }
+
+    impl IncrementalUpdate for SlowCountingEngine {
+        fn update(
+            &self,
+            _repo_path: &Path,
+            _config: &VeraConfig,
+        ) -> Result<UpdateSummary, anyhow::Error> {
+            self.updates.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(self.update_ms));
+            Ok(UpdateSummary {
+                files_modified: 1,
+                files_added: 0,
+                files_deleted: 0,
+                files_unchanged: 0,
+                files_with_tree_sitter_errors: 0,
+                files_using_tier0_fallback: 0,
+                parse_errors: Vec::new(),
+                files_deferred: 0,
+                total_chunks: 0,
+                elapsed_secs: 0.0,
+            })
+        }
+    }
+
+    /// A change landing while an update is running used to be dropped with no
+    /// trailing cycle: the index stayed stale until an unrelated later edit.
+    /// The runner must pick the skipped batch up when it finishes.
+    #[test]
+    fn changes_landing_mid_update_are_picked_up_by_a_trailing_cycle() {
+        let repo = repo_fixture();
+        let updates = Arc::new(AtomicUsize::new(0));
+        let build: EngineBuilder = {
+            let updates = Arc::clone(&updates);
+            Arc::new(move |_| {
+                Ok(Arc::new(SlowCountingEngine {
+                    updates: Arc::clone(&updates),
+                    update_ms: 500,
+                }) as Engine)
+            })
+        };
+
+        let _handle = start_watching_with(
+            repo.path(),
+            false,
+            TEST_DEBOUNCE,
+            &IndexingConfig::default(),
+            build,
+        )
+        .expect("watcher starts");
+
+        // First change starts a slow (500 ms) update.
+        std::fs::write(repo.path().join("src/first.rs"), "fn first() {}").expect("write");
+        assert!(
+            wait_until(Duration::from_secs(5), || updates.load(Ordering::SeqCst)
+                == 1),
+            "first change should start the slow update"
+        );
+
+        // Second change lands while that update is still running: the debounce
+        // window (300 ms) fires well inside it, so the skip path takes it.
+        std::fs::write(repo.path().join("src/second.rs"), "fn second() {}").expect("write");
+
+        // Without the dirty-flag re-trigger the count stays at 1 forever.
+        assert!(
+            wait_until(Duration::from_secs(10), || updates.load(Ordering::SeqCst)
+                >= 2),
+            "a trailing cycle must pick up the change that landed mid-update"
+        );
     }
 
     #[test]
