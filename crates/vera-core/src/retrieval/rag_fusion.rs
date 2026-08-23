@@ -126,7 +126,9 @@ async fn execute_rag_fusion_with_context(
         expansion_client.expand_query_with_context(&expansion_query, &context_hints)
     })
     .await
-    .map_err(|e| anyhow!("deep-search query expansion task failed: {e}"))?
+    // Preserve the JoinError as the source (panic location, cancellation
+    // reason) rather than flattening it into a message string.
+    .map_err(|e| anyhow::Error::new(e).context("deep-search query expansion task failed"))?
     .map_err(|e| anyhow!("failed to generate deep-search query candidates: {e}"))?;
 
     let queries = dedupe_queries_with_original(query, expanded);
