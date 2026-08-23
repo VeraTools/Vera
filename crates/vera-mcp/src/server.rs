@@ -46,36 +46,70 @@ fn run_server_with_frame_limit(
     let mut initialized = false;
 
     loop {
+        // Read the frame in bounded chunks: `read_until` would buffer the
+        // entire line before any length check, so a newline-less stream could
+        // still grow memory without bound. Once the cap is exceeded, further
+        // input is drained through a fixed scratch buffer instead of appended.
         let mut frame = Vec::with_capacity(1024);
-        match reader.read_until(b'\n', &mut frame) {
-            Ok(0) => {
-                // EOF — client closed stdin.
-                tracing::info!("Client closed connection (EOF)");
+        let mut oversized = false;
+        let mut eof = false;
+        loop {
+            let (chunk, newline_at) = match reader.fill_buf() {
+                Ok(buf) => (buf, buf.iter().position(|&byte| byte == b'\n')),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    tracing::error!(error = %e, "Failed to read from stdin");
+                    return;
+                }
+            };
+            if chunk.is_empty() {
+                eof = true;
                 break;
             }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to read from stdin");
-                break;
+            match newline_at {
+                Some(pos) => {
+                    let total = frame.len() + pos + 1;
+                    if !oversized && total > max_frame_bytes {
+                        oversized = true;
+                        tracing::warn!(
+                            limit = max_frame_bytes,
+                            "Request frame exceeded the size limit; draining"
+                        );
+                    }
+                    if !oversized {
+                        frame.extend_from_slice(&chunk[..=pos]);
+                    }
+                    reader.consume(pos + 1);
+                    break;
+                }
+                None => {
+                    let buffered = chunk.len();
+                    if !oversized {
+                        frame.extend_from_slice(chunk);
+                        if frame.len() > max_frame_bytes {
+                            oversized = true;
+                            tracing::warn!(
+                                limit = max_frame_bytes,
+                                "Request frame exceeded the size limit; draining"
+                            );
+                        }
+                    }
+                    reader.consume(buffered);
+                }
             }
         }
 
-        // An oversized frame is rejected and drained to its terminating
-        // newline (the first read may have stopped before it), then the server
-        // keeps serving instead of dying.
-        if frame.len() > max_frame_bytes {
-            tracing::warn!(
-                bytes = frame.len(),
-                limit = max_frame_bytes,
-                "Request frame exceeded the size limit"
-            );
-            while !frame.ends_with(b"\n") {
-                frame.clear();
-                match reader.read_until(b'\n', &mut frame) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
+        if eof && frame.is_empty() && !oversized {
+            // EOF — client closed stdin.
+            tracing::info!("Client closed connection (EOF)");
+            break;
+        }
+
+        // An oversized frame is rejected and its remainder already drained,
+        // then the server keeps serving instead of dying.
+        if oversized {
             let err = RpcError::new(
                 Value::Null,
                 PARSE_ERROR,
@@ -545,5 +579,28 @@ mod tests {
             .collect();
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0]["id"], 1);
+    }
+
+    /// A frame whose terminating newline never arrives before EOF is still
+    /// rejected, and input after an oversized frame keeps being served.
+    #[test]
+    fn oversized_frame_without_trailing_newline_is_rejected_and_next_message_served() {
+        let input = format!(
+            "{}\n{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}}\n",
+            "y".repeat(300)
+        );
+        let mut reader = std::io::BufReader::new(Cursor::new(input));
+        let mut output = Vec::new();
+
+        run_server_with_frame_limit(&mut reader, &mut output, 64);
+
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
+        assert_eq!(responses[1]["id"], 7);
     }
 }
