@@ -121,8 +121,6 @@ fn run_server_with_frame_limit(
 
         // Strict decode: lossy replacement could silently alter bytes inside a
         // JSON string and let an altered request through.
-        // Strict decode: lossy replacement could silently alter bytes inside a
-        // JSON string and let an altered request through.
         let line = match String::from_utf8(frame) {
             Ok(line) => line,
             Err(_) => {
