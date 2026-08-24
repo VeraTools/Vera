@@ -220,13 +220,21 @@ pub fn collect_overview_filtered(
     let mut total_lines = 0u64;
     let mut chunk_count = 0u64;
 
-    for file in &files {
-        let chunks = store.get_chunks_by_file(file)?;
-        if chunks.is_empty() {
-            continue;
-        }
+    // Two aggregate queries replace one full-row fetch (content blob included)
+    // per file; the old loop materialized every chunk's content and read four
+    // fields.
+    let file_paths: Vec<String> = files.to_vec();
+    let summaries = store.get_file_chunk_summaries(&file_paths)?;
+    for (symbol_type, count) in store.count_symbol_types(&file_paths)? {
+        *symbol_types.entry(symbol_type).or_default() += count as u64;
+    }
 
-        let file_chunk_count = chunks.len() as u64;
+    for file in &files {
+        let Some(summary) = summaries.get(file) else {
+            continue;
+        };
+
+        let file_chunk_count = summary.chunk_count as u64;
         chunk_count += file_chunk_count;
         hotspots.push((file.clone(), file_chunk_count));
 
@@ -242,18 +250,11 @@ pub fn collect_overview_filtered(
             .to_string();
         *top_directories.entry(top_dir).or_default() += 1;
 
-        let language = chunks[0].language.to_string();
+        let language = summary.language.clone();
         *language_files.entry(language.clone()).or_default() += 1;
         *language_chunks.entry(language).or_default() += file_chunk_count;
 
-        let mut max_line_end = 0u32;
-        for chunk in &chunks {
-            max_line_end = max_line_end.max(chunk.line_end);
-            if let Some(symbol_type) = chunk.symbol_type {
-                *symbol_types.entry(symbol_type.to_string()).or_default() += 1;
-            }
-        }
-        total_lines += max_line_end as u64;
+        total_lines += summary.max_line_end as u64;
     }
 
     let mut languages: Vec<LanguageOverview> = language_chunks
@@ -576,5 +577,53 @@ mod tests {
         let exact_paths = HashSet::from([String::from("src/main.rs")]);
         let overview = collect_overview_filtered(dir.path(), Some(&exact_paths)).unwrap();
         assert_eq!(overview.entry_points, vec![String::from("src/main.rs")]);
+    }
+
+    /// The aggregate queries must reproduce the per-file loop's numbers across
+    /// multiple files and chunks: whole shape, not one property.
+    #[tokio::test]
+    async fn filtered_overview_aggregates_match_per_file_numbers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("main.rs"),
+            "fn main() {}\nfn other() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.py"),
+            "def helper():\n    pass\n",
+        )
+        .unwrap();
+
+        let provider = MockProvider::new(8);
+        let config = VeraConfig::default();
+        index_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+
+        let overview = collect_overview_filtered(dir.path(), None).unwrap();
+
+        assert_eq!(overview.file_count, 2);
+        // entry-point detection accepts several stems; pin membership, not order.
+        assert!(overview.entry_points.contains(&String::from("src/main.rs")));
+
+        let rust = overview
+            .languages
+            .iter()
+            .find(|l| l.language == "rust")
+            .expect("rust language entry");
+        let python = overview
+            .languages
+            .iter()
+            .find(|l| l.language == "python")
+            .expect("python language entry");
+        assert_eq!(rust.files, 1);
+        assert!(rust.chunks >= 1);
+        assert_eq!(python.files, 1);
+
+        // total_lines is the max line_end summed over files.
+        assert!(overview.total_lines >= 4, "got {}", overview.total_lines);
+        assert!(overview.chunk_count >= 3, "got {}", overview.chunk_count);
     }
 }

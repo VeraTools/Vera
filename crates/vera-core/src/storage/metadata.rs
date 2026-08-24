@@ -148,6 +148,14 @@ pub struct MetadataStore {
     conn: Connection,
 }
 
+/// Aggregate per-file chunk stats for overview generation (no content blobs).
+#[derive(Debug, Clone)]
+pub struct FileChunkSummary {
+    pub chunk_count: i64,
+    pub max_line_end: u32,
+    pub language: String,
+}
+
 impl MetadataStore {
     /// Open (or create) a metadata store at the given path.
     pub fn open(db_path: &std::path::Path) -> Result<Self> {
@@ -380,6 +388,81 @@ impl MetadataStore {
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         Ok(chunks.into_iter().map(|c| (c.id.clone(), c)).collect())
+    }
+
+    /// Per-file chunk aggregates for the overview: chunk count, max line_end,
+    /// and the file's language. One batched query instead of one full-row
+    /// fetch per file (the old path materialized every content blob and used
+    /// four fields). Files absent from the result have no indexed chunks.
+    pub fn get_file_chunk_summaries(
+        &self,
+        file_paths: &[String],
+    ) -> Result<HashMap<String, FileChunkSummary>> {
+        const BATCH: usize = 900;
+        let mut out = HashMap::new();
+        for batch in file_paths.chunks(BATCH) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT file_path, COUNT(*) AS chunk_count, MAX(line_end) AS max_line_end, MIN(language) AS language
+                 FROM chunks WHERE file_path IN ({placeholders}) GROUP BY file_path"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("failed to prepare file summary query")?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        FileChunkSummary {
+                            chunk_count: row.get::<_, i64>(1)?,
+                            max_line_end: row.get::<_, u32>(2)?,
+                            language: row.get::<_, String>(3)?,
+                        },
+                    ))
+                })
+                .context("failed to query file summaries")?;
+            for row in rows {
+                let (path, summary) = row.context("failed to read file summary row")?;
+                out.insert(path, summary);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Symbol-type counts across the given files, in one aggregate query.
+    pub fn count_symbol_types(&self, file_paths: &[String]) -> Result<HashMap<String, i64>> {
+        const BATCH: usize = 900;
+        let mut out: HashMap<String, i64> = HashMap::new();
+        for batch in file_paths.chunks(BATCH) {
+            if batch.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT symbol_type, COUNT(*) FROM chunks
+                 WHERE symbol_type IS NOT NULL AND file_path IN ({placeholders})
+                 GROUP BY symbol_type"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("failed to prepare symbol type count query")?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .context("failed to count symbol types")?;
+            for row in rows {
+                let (symbol_type, count) = row.context("failed to read symbol type row")?;
+                *out.entry(symbol_type).or_default() += count;
+            }
+        }
+        Ok(out)
     }
 
     /// Get all chunks for a given file path.
