@@ -219,6 +219,17 @@ fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
 /// `prompts.retrieval` or `default_prompt` in their tokenizer config.
 /// This is a best-effort fallback; returns `None` on any failure.
 fn fetch_query_prefix_from_hf(model_id: &str) -> Option<String> {
+    // Long-running processes (serve, mcp, watch) construct providers more than
+    // once; the network lookup is deterministic per model id, so pay it once.
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let cached = CACHE.get_or_init(|| hf_query_prefix_lookup(model_id));
+    if cached.is_none() {
+        tracing::debug!(model_id, "no retrieval prompt found on HuggingFace");
+    }
+    cached.clone()
+}
+
+fn hf_query_prefix_lookup(model_id: &str) -> Option<String> {
     // Only attempt if model_id looks like a HuggingFace repo (contains '/').
     if !model_id.contains('/') {
         return None;

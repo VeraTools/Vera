@@ -117,15 +117,37 @@ pub async fn create_dynamic_provider(
             ))
         }
         InferenceBackend::Api => {
-            let provider_config = EmbeddingProviderConfig::from_env()
-                .map_err(|err| anyhow::anyhow!("embedding API not configured: {err}\nHint: set EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and EMBEDDING_MODEL_API_KEY environment variables, or use --potion-code for local CPU inference."))?;
-            let model_name = provider_config.model_id.clone();
-            let provider_config = provider_config
-                .with_timeout(Duration::from_secs(config.embedding.timeout_secs))
-                .with_max_retries(config.embedding.max_retries);
-            let p = OpenAiProvider::new(provider_config)
-                .map_err(|err| anyhow::anyhow!("failed to initialize embedding provider: {err}"))?;
-            Ok((DynamicProvider::Api(p), model_name))
+            // from_env may run a blocking HuggingFace prefix lookup (5 s
+            // timeout) for unrecognized model ids; keep it off the async
+            // workers when a runtime is active. Sync callers (setup, CLI
+            // pre-flight) have no runtime to block.
+            let timeout_secs = config.embedding.timeout_secs;
+            let max_retries = config.embedding.max_retries;
+            let build = move || {
+                EmbeddingProviderConfig::from_env()
+                    .map_err(|err| anyhow::anyhow!("embedding API not configured: {err}\nHint: set EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and EMBEDDING_MODEL_API_KEY environment variables, or use --potion-code for local CPU inference."))
+                    .map(|provider_config| {
+                        let model_name = provider_config.model_id.clone();
+                        let provider_config = provider_config
+                            .with_timeout(Duration::from_secs(timeout_secs))
+                            .with_max_retries(max_retries);
+                        (model_name, provider_config)
+                    })
+                    .and_then(|(model_name, provider_config)| {
+                        OpenAiProvider::new(provider_config)
+                            .map(|p| (DynamicProvider::Api(p), model_name))
+                            .map_err(|err| {
+                                anyhow::anyhow!("failed to initialize embedding provider: {err}")
+                            })
+                    })
+            };
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::spawn_blocking(build)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("provider construction task failed: {e}"))?
+            } else {
+                build()
+            }
         }
     }
 }
