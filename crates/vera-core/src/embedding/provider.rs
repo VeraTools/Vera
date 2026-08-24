@@ -219,14 +219,27 @@ fn default_query_prefix_for_model(model_id: &str) -> Option<String> {
 /// `prompts.retrieval` or `default_prompt` in their tokenizer config.
 /// This is a best-effort fallback; returns `None` on any failure.
 fn fetch_query_prefix_from_hf(model_id: &str) -> Option<String> {
-    // Long-running processes (serve, mcp, watch) construct providers more than
-    // once; the network lookup is deterministic per model id, so pay it once.
-    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let cached = CACHE.get_or_init(|| hf_query_prefix_lookup(model_id));
-    if cached.is_none() {
+    // Long-running processes (serve, mcp, watch) may see more than one model
+    // id over their lifetime; the lookup is deterministic per id, so cache by
+    // model_id. Hits and misses are both cached.
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // A poisoned cache mutex only means a thread panicked mid-insert; the
+    // map itself stays usable.
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = guard.get(model_id) {
+        return cached.clone();
+    }
+    let result = hf_query_prefix_lookup(model_id);
+    if result.is_none() {
         tracing::debug!(model_id, "no retrieval prompt found on HuggingFace");
     }
-    cached.clone()
+    guard.insert(model_id.to_string(), result.clone());
+    result
 }
 
 fn hf_query_prefix_lookup(model_id: &str) -> Option<String> {
