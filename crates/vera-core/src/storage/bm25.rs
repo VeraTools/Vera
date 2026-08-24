@@ -185,6 +185,12 @@ impl Bm25Index {
     ///
     /// Searches across content and symbol_name fields.
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<Bm25SearchResult>> {
+        // Pick up commits made by OTHER Bm25Index instances (update runs open
+        // their own); a reload that finds nothing is a cheap metadata check,
+        // versus rebuilding the whole reader per search.
+        self.reader
+            .reload()
+            .context("failed to refresh BM25 reader")?;
         let searcher = self.reader.searcher();
         let mut query_parser = QueryParser::for_index(
             &self.index,
@@ -237,6 +243,9 @@ impl Bm25Index {
 
     /// Count total documents in the index.
     pub fn doc_count(&self) -> Result<u64> {
+        self.reader
+            .reload()
+            .context("failed to refresh BM25 reader")?;
         let searcher = self.reader.searcher();
         Ok(searcher.num_docs())
     }
