@@ -101,45 +101,12 @@ impl VectorStore {
     /// For re-inserts (same chunk_id), deletes the old vector first since
     /// the vec0 virtual table does not support INSERT OR REPLACE.
     pub fn insert(&self, chunk_id: &str, vector: &[f32]) -> Result<()> {
-        if vector.len() != self.dim {
-            anyhow::bail!(
-                "vector dimension mismatch: expected {}, got {}",
-                self.dim,
-                vector.len()
-            );
-        }
-
-        // Use INSERT OR IGNORE to preserve existing rowid if already present.
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO chunk_id_map (chunk_id) VALUES (?1)",
-                params![chunk_id],
-            )
-            .context("failed to insert chunk id mapping")?;
-
-        let rowid: i64 = self
-            .conn
-            .query_row(
-                "SELECT rowid FROM chunk_id_map WHERE chunk_id = ?1",
-                params![chunk_id],
-                |row| row.get(0),
-            )
-            .context("failed to get rowid for chunk")?;
-
-        // Delete any existing vector for this rowid before inserting.
-        // vec0 virtual tables do not support INSERT OR REPLACE.
-        self.conn
-            .execute("DELETE FROM vec_chunks WHERE rowid = ?1", params![rowid])
-            .ok(); // Ignore error if row doesn't exist.
-
-        self.conn
-            .execute(
-                "INSERT INTO vec_chunks (rowid, embedding) VALUES (?1, ?2)",
-                params![rowid, vector.as_bytes()],
-            )
-            .context("failed to insert vector")?;
-
-        Ok(())
+        // Delegates to the batch path so the mapping insert, rowid lookup,
+        // delete and vector write run in ONE transaction: as three autocommit
+        // statements a failure between them persisted a chunk_id_map row with
+        // no backing vector, which count() then overstated and KNN silently
+        // skipped.
+        self.insert_batch(&[(chunk_id, vector)])
     }
 
     /// Insert a batch of vectors.
@@ -192,7 +159,11 @@ impl VectorStore {
                     .context("failed to get rowid")?;
 
                 // Delete old vector if exists (vec0 doesn't support upsert).
-                del_vec_stmt.execute(params![rowid]).ok();
+                // Deleting a missing rowid is not an error in SQLite, so any
+                // failure here is real and must surface.
+                del_vec_stmt
+                    .execute(params![rowid])
+                    .context("failed to delete old vector")?;
 
                 vec_stmt
                     .execute(params![rowid, vector.as_bytes()])
@@ -494,6 +465,22 @@ fn register_sqlite_vec() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Single-item insert must go through the transactional batch path: a
+    /// mapping row without a backing vector would overstate count() and be
+    /// silently skipped by KNN.
+    #[test]
+    fn single_insert_is_visible_and_counted() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        store.insert("chunk-1", &[0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        assert_eq!(store.count().unwrap(), 1);
+        // Re-insert same id: no duplicate mapping row, count stays 1.
+        store.insert("chunk-1", &[0.4, 0.3, 0.2, 0.1]).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
     use super::*;
 
     fn random_vector(dim: usize, seed: u64) -> Vec<f32> {
