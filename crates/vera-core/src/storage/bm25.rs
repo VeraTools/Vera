@@ -20,6 +20,10 @@ use crate::chunk_text;
 pub struct Bm25Index {
     index: Index,
     schema: Bm25Schema,
+    /// One shared reader, built once at construction. Rebuilding it per search
+    /// re-opened every segment on the hottest read path; `reload()` after
+    /// commits keeps it current instead.
+    reader: tantivy::IndexReader,
 }
 
 /// Pre-resolved schema field handles for efficient access.
@@ -81,7 +85,16 @@ impl Bm25Index {
         };
 
         register_stemmed_tokenizer(&index);
-        Ok(Self { index, schema })
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .context("failed to create BM25 reader")?;
+        Ok(Self {
+            index,
+            schema,
+            reader,
+        })
     }
 
     /// Create an in-memory BM25 index (useful for testing).
@@ -89,7 +102,16 @@ impl Bm25Index {
         let schema = build_schema();
         let index = Index::create_in_ram(schema.schema.clone());
         register_stemmed_tokenizer(&index);
-        Ok(Self { index, schema })
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .context("failed to create BM25 reader")?;
+        Ok(Self {
+            index,
+            schema,
+            reader,
+        })
     }
 
     /// Insert a batch of documents into the index.
@@ -135,6 +157,9 @@ impl Bm25Index {
         writer
             .wait_merging_threads()
             .map_err(|e| anyhow::anyhow!("BM25 merge failed: {e}"))?;
+        self.reader
+            .reload()
+            .context("failed to reload BM25 reader")?;
 
         Ok(())
     }
@@ -160,14 +185,7 @@ impl Bm25Index {
     ///
     /// Searches across content and symbol_name fields.
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<Bm25SearchResult>> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .context("failed to create BM25 reader")?;
-
-        let searcher = reader.searcher();
+        let searcher = self.reader.searcher();
         let mut query_parser = QueryParser::for_index(
             &self.index,
             vec![
@@ -219,13 +237,7 @@ impl Bm25Index {
 
     /// Count total documents in the index.
     pub fn doc_count(&self) -> Result<u64> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .context("failed to create BM25 reader for count")?;
-        let searcher = reader.searcher();
+        let searcher = self.reader.searcher();
         Ok(searcher.num_docs())
     }
 
@@ -242,6 +254,10 @@ impl Bm25Index {
         writer
             .wait_merging_threads()
             .map_err(|e| anyhow::anyhow!("BM25 merge after delete failed: {e}"))?;
+
+        self.reader
+            .reload()
+            .context("failed to reload BM25 reader")?;
 
         Ok(())
     }
@@ -279,6 +295,10 @@ impl Bm25Index {
             .wait_merging_threads()
             .map_err(|e| anyhow::anyhow!("BM25 merge after file delete failed: {e}"))?;
 
+        self.reader
+            .reload()
+            .context("failed to reload BM25 reader")?;
+
         Ok(())
     }
 
@@ -295,6 +315,10 @@ impl Bm25Index {
         writer
             .wait_merging_threads()
             .map_err(|e| anyhow::anyhow!("BM25 merge after clear failed: {e}"))?;
+        self.reader
+            .reload()
+            .context("failed to reload BM25 reader")?;
+
         Ok(())
     }
 }
