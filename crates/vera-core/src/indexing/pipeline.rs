@@ -443,6 +443,11 @@ fn parse_discovered_files_parallel(
 
             // RST files need preprocessing before chunking, but refs
             // come from the raw source, so they can't share a single parse.
+            // The indexing hash is computed up front in BOTH branches: it must
+            // reflect what update-time hashing compares against (preprocessed
+            // text for RST), including when parsing fails — a raw-source hash
+            // here would never match and re-parse the file every update run.
+            let hash;
             let parsed = if language == Language::Rst {
                 let refs = parsing::parse_and_extract_references(&source, language);
                 let normalized_source = match parsing::sphinx::preprocess_rst(
@@ -461,27 +466,27 @@ fn parse_discovered_files_parallel(
                     }
                 };
                 let src = normalized_source.as_deref().unwrap_or(&source);
-                let hash = content_hash(src);
+                hash = content_hash(src);
                 parsing::parse_file_with_diagnostics(
                     src,
                     &file.relative_path,
                     language,
                     &config.indexing,
                 )
-                .map(|(chunks, _ignored_refs, diagnostics)| (chunks, refs, hash, diagnostics))
+                .map(|(chunks, _ignored_refs, diagnostics)| (chunks, refs, diagnostics))
             } else {
-                let hash = content_hash(&source);
+                hash = content_hash(&source);
                 parsing::parse_file_with_diagnostics(
                     &source,
                     &file.relative_path,
                     language,
                     &config.indexing,
                 )
-                .map(|(chunks, refs, diagnostics)| (chunks, refs, hash, diagnostics))
+                .map(|(chunks, refs, diagnostics)| (chunks, refs, diagnostics))
             };
 
             match parsed {
-                Ok((chunks, refs, hash, diagnostics)) => {
+                Ok((chunks, refs, diagnostics)) => {
                     let chunk_count = chunks.len() as u64;
                     let type_relations = parsing::type_relations::extract_type_relations(&chunks);
                     debug!(
@@ -520,7 +525,7 @@ fn parse_discovered_files_parallel(
                             file_path: file.relative_path.clone(),
                             error: err.to_string(),
                         }),
-                        file_hash: Some((file.relative_path.clone(), content_hash(&source))),
+                        file_hash: Some((file.relative_path.clone(), hash)),
                         refs: None,
                         type_relations: None,
                         file_state: Some(FileIndexState {
