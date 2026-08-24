@@ -527,7 +527,10 @@ pub async fn rerank_results(
             }
             let mut result = (*candidate).clone();
             if let Some(ceiling_value) = ceiling {
-                result.score = result.score.min(ceiling_value);
+                // Strictly below the scored prefix: equality would tie a
+                // preserved candidate with the last scored one.
+                let cap = ceiling_value.next_down();
+                result.score = result.score.min(cap);
             }
             ceiling = Some(result.score);
             reranked.push(result);
@@ -735,9 +738,15 @@ pub(crate) mod test_helpers {
             let mut scores: Vec<RerankScore> = included
                 .iter()
                 .enumerate()
-                .map(|(rank, i)| RerankScore {
-                    index: *i,
-                    relevance_score: (total - rank) as f64 / total as f64,
+                .map(|(rank, i)| {
+                    // Denominator from the response length: repeated indices
+                    // can make the response longer than `documents`, which
+                    // would underflow `total - rank` in debug builds.
+                    let rows = included.len();
+                    RerankScore {
+                        index: *i,
+                        relevance_score: (rows - rank) as f64 / rows.max(1) as f64,
+                    }
                 })
                 .collect();
 

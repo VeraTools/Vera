@@ -543,6 +543,14 @@ async fn rerank_shortfall_preserves_unscored_candidates() {
     // under the prefix.
     assert_eq!(reranked[0].file_path, "src/file4.rs");
     assert!(reranked[1].file_path == "src/file0.rs");
+    // The first preserved candidate must sit strictly below the last scored
+    // one: a tie would make the boundary invisible in the output order.
+    assert!(
+        reranked[1].score > reranked[2].score,
+        "preserved score {} must be strictly below last scored {}",
+        reranked[2].score,
+        reranked[1].score
+    );
     for window in reranked.windows(2) {
         assert!(
             window[0].score >= window[1].score,
@@ -577,12 +585,14 @@ async fn rerank_duplicate_indices_are_not_duplicated() {
         .await
         .unwrap();
 
+    // Duplicate rejection must reinject omitted candidates too: every
+    // original candidate survives exactly once.
+    assert_eq!(reranked.len(), 3);
     for i in 0..3 {
         let count = reranked
             .iter()
             .filter(|r| r.file_path == format!("src/file{i}.rs"))
             .count();
-        assert!(count <= 1, "candidate {i} appeared {count} times");
+        assert_eq!(count, 1, "candidate {i} appeared {count} times");
     }
-    assert!(!reranked.is_empty());
 }
