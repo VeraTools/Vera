@@ -1164,10 +1164,30 @@ fn row_to_chunk(row: &rusqlite::Row<'_>) -> Result<Chunk> {
     })
 }
 
+/// Warn once per process about an unrecognized persisted enum value.
+///
+/// Values written by a newer binary (added variants) or corrupted rows used to
+/// coerce silently into `Unknown`/`Block`, so filters like `--lang rust`
+/// quietly missed present data. Behavior is unchanged - coercion keeps reads
+/// working across versions - but the first occurrence names itself.
+fn warn_unknown_enum_value(kind: &str, value: &str) {
+    static WARNED_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if WARNED_ONCE.set(()).is_ok() {
+        tracing::warn!(
+            kind,
+            value,
+            "unknown persisted enum value; it was written by a newer Vera or is              corrupted, and affected rows may be filtered or miscounted"
+        );
+    }
+}
+
 /// Parse a language string back into the enum.
 /// Delegates to `Language::from_str()` to stay in sync with the `Display` impl.
 fn parse_language(s: &str) -> Language {
-    s.parse::<Language>().unwrap_or(Language::Unknown)
+    s.parse().unwrap_or_else(|_| {
+        warn_unknown_enum_value("language", s);
+        Language::Unknown
+    })
 }
 
 /// Parse a symbol type string back into the enum.
@@ -1184,7 +1204,10 @@ fn parse_symbol_type(s: &str) -> SymbolType {
         "constant" => SymbolType::Constant,
         "variable" => SymbolType::Variable,
         "module" => SymbolType::Module,
-        _ => SymbolType::Block,
+        other => {
+            warn_unknown_enum_value("symbol type", other);
+            SymbolType::Block
+        }
     }
 }
 
