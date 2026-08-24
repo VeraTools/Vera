@@ -39,7 +39,6 @@ pub fn classify_path(file_path: &str, language: Language) -> ContentClass {
             "deprecated",
             "backup",
             "backups",
-            "old",
         ],
     ) {
         return ContentClass::Archive;
@@ -132,6 +131,10 @@ pub fn matches_scope(class: ContentClass, scope: SearchScope, include_generated:
                     | ContentClass::Bench
                     | ContentClass::Config
                     | ContentClass::Unknown
+                    // Archived-looking paths are still code: snapshot-test
+                    // fixtures and maintained legacy modules are live source.
+                    // Ranking already scores them below fresh paths.
+                    | ContentClass::Archive
             ) || (include_generated && matches!(class, ContentClass::Generated))
         }
         SearchScope::Docs => matches!(class, ContentClass::Docs | ContentClass::Archive),
@@ -252,5 +255,37 @@ mod tests {
             classify_content("src/app.js", Language::JavaScript, &content),
             ContentClass::Generated
         );
+    }
+
+    /// "old" was too ambiguous: tokenize_path splits on underscores, so a live
+    /// file like old_config.rs classified as Archive and vanished from
+    /// source-scoped search.
+    #[test]
+    fn bare_old_token_no_longer_classifies_archive() {
+        assert_eq!(
+            classify_path("src/old_config.rs", Language::Rust),
+            ContentClass::Source
+        );
+        assert_eq!(
+            classify_path("archived/config.rs", Language::Rust),
+            ContentClass::Archive
+        );
+    }
+
+    /// Archive-classified code remains searchable under Source scope: snapshot
+    /// fixtures and maintained legacy modules are live source. Ranking already
+    /// demotes them.
+    #[test]
+    fn archive_class_is_inside_source_scope() {
+        assert!(matches_scope(
+            ContentClass::Archive,
+            SearchScope::Source,
+            false
+        ));
+        assert!(matches_scope(
+            ContentClass::Archive,
+            SearchScope::Docs,
+            false
+        ));
     }
 }
