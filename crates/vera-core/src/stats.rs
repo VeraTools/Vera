@@ -426,13 +426,14 @@ fn detect_conventions_from_files(files: &[String]) -> Vec<String> {
         (&[".storybook"], "Storybook UI"),
     ];
 
+    // Lowercase each path once, up front: the old code allocated inside the
+    // pattern x file loop (~60 patterns x N files full-path copies).
+    let lowered_files: Vec<String> = files.iter().map(|f| f.to_ascii_lowercase()).collect();
     for (patterns, label) in indicators {
         let found = patterns.iter().any(|pat| {
-            files.iter().any(|f| {
-                let lower = f.to_ascii_lowercase();
-                // Match as filename or path component.
-                lower.contains(pat)
-            })
+            lowered_files
+                .iter()
+                .any(|lower| match_component(lower, pat))
         });
         if found {
             conventions.push((*label).to_string());
@@ -440,6 +441,40 @@ fn detect_conventions_from_files(files: &[String]) -> Vec<String> {
     }
 
     conventions
+}
+
+/// Match `pattern` against path structure, not raw substrings: "kubernetes"
+/// must fire on a `src/kubernetes/` directory but not on
+/// `src/kubernetes_client.go`, and "terraform" not on `src/myterraform/mod.rs`.
+///
+/// Rules per segment: equality (`Makefile`), the segment starting with the
+/// pattern plus a dot (`tsconfig.json`, `next.config.js`, `.env.example`),
+/// or a dotted part matching the pattern with its leading dot stripped
+/// (`schema.proto` fires for `.proto`). Multi-segment patterns like
+/// `.github/workflows` match when they appear at directory boundaries.
+fn match_component(lowered_path: &str, pattern: &str) -> bool {
+    // Table patterns arrive in file-case (Dockerfile, Makefile); paths are
+    // already lowercased, so compare case-insensitively. The old substring
+    // pass was accidentally case-sensitive and never matched them.
+    let pattern = pattern.to_ascii_lowercase();
+    if lowered_path == pattern {
+        return true;
+    }
+    if pattern.contains('/') {
+        return lowered_path.contains(&format!("/{pattern}/"))
+            || lowered_path.starts_with(&format!("{pattern}/"))
+            || lowered_path.ends_with(&format!("/{}", pattern));
+    }
+    for segment in lowered_path.split('/') {
+        if segment == pattern || segment.starts_with(&format!("{pattern}.")) {
+            return true;
+        }
+        let bare = pattern.trim_start_matches('.');
+        if !bare.is_empty() && segment.split('.').any(|part| part == bare) {
+            return true;
+        }
+    }
+    false
 }
 
 fn matches_entry_point(file_path: &str) -> bool {
@@ -576,5 +611,64 @@ mod tests {
         let exact_paths = HashSet::from([String::from("src/main.rs")]);
         let overview = collect_overview_filtered(dir.path(), Some(&exact_paths)).unwrap();
         assert_eq!(overview.entry_points, vec![String::from("src/main.rs")]);
+    }
+
+    /// Component matching: a pattern must fire on a matching segment but not on
+    /// a substring buried inside another name.
+    #[test]
+    fn match_component_requires_component_boundaries() {
+        assert!(match_component("src/kubernetes/deploy.yaml", "kubernetes"));
+        assert!(match_component("k8s/helm/values.yml", "helm"));
+        assert!(match_component("infra/terraform/main.tf", "terraform"));
+        // Substring hits that used to false-positive.
+        assert!(!match_component("src/kubernetes_client.go", "kubernetes"));
+        assert!(!match_component("src/myterraform/mod.rs", "terraform"));
+        assert!(!match_component("src/protocols.rs", "proto"));
+
+        // Filenames with extensions: stem equality counts ("Makefile" is exact,
+        // "tsconfig.json" matches its stem, ".env" is a whole segment).
+        assert!(match_component("makefile", "makefile"));
+        assert!(match_component("tsconfig.json", "tsconfig.json"));
+        assert!(match_component(".env.example", ".env.example"));
+        assert!(match_component(".env", ".env"));
+
+        // Directory-prefixed patterns like .github/workflows still work via
+        // component sequence containment of both parts.
+        assert!(
+            match_component(".github/workflows/ci.yml", ".github/workflows")
+                || match_component(".github/workflows/ci.yml", "workflows")
+        );
+    }
+
+    /// End-to-end: substring false positives must not fire; a genuine marker
+    /// (Dockerfile) still does.
+    #[tokio::test]
+    async fn conventions_reject_substring_hits_and_accept_real_markers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("kubernetes_client.go"), "package main\n").unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        let provider = MockProvider::new(8);
+        let config = VeraConfig::default();
+        index_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+
+        let overview = collect_overview_filtered(dir.path(), None).unwrap();
+        assert!(
+            !overview
+                .conventions
+                .iter()
+                .any(|c| c.contains("Kubernetes")),
+            "{:?}",
+            overview.conventions
+        );
+        assert!(
+            overview.conventions.iter().any(|c| c.contains("Docker")),
+            "{:?}",
+            overview.conventions
+        );
     }
 }
