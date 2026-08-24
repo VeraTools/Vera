@@ -602,7 +602,13 @@ mod tests {
             .await
             .unwrap();
 
-        let overview = collect_overview_filtered(dir.path(), None).unwrap();
+        // Exercise the filtered aggregate path (get_file_chunk_summaries +
+        // count_symbol_types), not the full-overview fallback.
+        let exact_paths: HashSet<String> = ["src/main.rs", "src/lib.py"]
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let overview = collect_overview_filtered(dir.path(), Some(&exact_paths)).unwrap();
 
         assert_eq!(overview.file_count, 2);
         // entry-point detection accepts several stems; pin membership, not order.
@@ -625,5 +631,16 @@ mod tests {
         // total_lines is the max line_end summed over files.
         assert!(overview.total_lines >= 4, "got {}", overview.total_lines);
         assert!(overview.chunk_count >= 3, "got {}", overview.chunk_count);
+
+        // The aggregate symbol-type query ran and produced rows for both
+        // files' functions.
+        let fn_total: u64 = overview
+            .symbol_types
+            .iter()
+            .filter(|s| s.symbol_type == "function")
+            .map(|s| s.count)
+            .sum();
+        // fn main + fn other (rust) + def helper (python).
+        assert_eq!(fn_total, 3);
     }
 }
