@@ -431,9 +431,10 @@ fn detect_conventions_from_files(files: &[String]) -> Vec<String> {
     let lowered_files: Vec<String> = files.iter().map(|f| f.to_ascii_lowercase()).collect();
     for (patterns, label) in indicators {
         let found = patterns.iter().any(|pat| {
+            let pattern = pat.to_ascii_lowercase();
             lowered_files
                 .iter()
-                .any(|lower| match_component(lower, pat))
+                .any(|lower| match_component(lower, &pattern))
         });
         if found {
             conventions.push((*label).to_string());
@@ -452,21 +453,28 @@ fn detect_conventions_from_files(files: &[String]) -> Vec<String> {
 /// or a dotted part matching the pattern with its leading dot stripped
 /// (`schema.proto` fires for `.proto`). Multi-segment patterns like
 /// `.github/workflows` match when they appear at directory boundaries.
+/// `pattern` must already be lowercase (callers hoist the lowering out of
+/// the file loop).
 fn match_component(lowered_path: &str, pattern: &str) -> bool {
-    // Table patterns arrive in file-case (Dockerfile, Makefile); paths are
-    // already lowercased, so compare case-insensitively. The old substring
-    // pass was accidentally case-sensitive and never matched them.
-    let pattern = pattern.to_ascii_lowercase();
     if lowered_path == pattern {
         return true;
     }
     if pattern.contains('/') {
-        return lowered_path.contains(&format!("/{pattern}/"))
-            || lowered_path.starts_with(&format!("{pattern}/"))
-            || lowered_path.ends_with(&format!("/{}", pattern));
+        // Prefix hit via strip_prefix (no alloc); the single "/{pattern}"
+        // substring covers both mid-path and trailing directory positions.
+        return lowered_path
+            .strip_prefix(pattern)
+            .is_some_and(|s| s.starts_with('/'))
+            || lowered_path.contains(&format!("/{pattern}"));
     }
     for segment in lowered_path.split('/') {
-        if segment == pattern || segment.starts_with(&format!("{pattern}.")) {
+        if segment == pattern {
+            return true;
+        }
+        if segment
+            .strip_prefix(pattern)
+            .is_some_and(|s| s.starts_with('.'))
+        {
             return true;
         }
         let bare = pattern.trim_start_matches('.');
@@ -632,12 +640,21 @@ mod tests {
         assert!(match_component(".env.example", ".env.example"));
         assert!(match_component(".env", ".env"));
 
-        // Directory-prefixed patterns like .github/workflows still work via
-        // component sequence containment of both parts.
-        assert!(
-            match_component(".github/workflows/ci.yml", ".github/workflows")
-                || match_component(".github/workflows/ci.yml", "workflows")
-        );
+        // Multi-segment patterns match at directory boundaries...
+        assert!(match_component(
+            ".github/workflows/ci.yml",
+            ".github/workflows"
+        ));
+        // ...and near-misses must not: the pattern must not fire because a
+        // bare component happens to appear elsewhere in the path.
+        assert!(!match_component(
+            "workflows/.github/readme.md",
+            ".github/workflows"
+        ));
+        assert!(!match_component(
+            "src/myworkflows/deploy.sh",
+            ".github/workflows"
+        ));
     }
 
     /// End-to-end: substring false positives must not fire; a genuine marker
