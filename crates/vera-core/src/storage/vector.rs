@@ -467,6 +467,30 @@ fn register_sqlite_vec() {
 mod tests {
     use super::*;
 
+    /// A failure partway through the batch must leave no partial state:
+    /// neither the earlier item's mapping row nor its vector may survive.
+    /// This is the discriminator the success-path tests cannot see (they
+    /// also pass under the old autocommit implementation).
+    #[test]
+    fn batch_failure_rolls_back_earlier_items() {
+        let store = VectorStore::open_in_memory(4).unwrap();
+        let good: &[f32] = &[0.1, 0.2, 0.3, 0.4];
+        let bad_dim: &[f32] = &[1.0, 2.0];
+
+        let err = store
+            .insert_batch(&[("chunk-good", good), ("chunk-bad", bad_dim)])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("dimension mismatch"), "{err}");
+        assert_eq!(store.count().unwrap(), 0, "mapping rows must roll back");
+        // And nothing is queryable.
+        let hits = store.search(&[0.1, 0.2, 0.3, 0.4], 10).unwrap();
+        assert!(hits.is_empty(), "no vectors may survive a failed batch");
+        // The failed ids remain fully reusable afterwards.
+        store.insert("chunk-bad", &[9.0, 8.0, 7.0, 6.0]).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
     /// Single-item insert must go through the transactional batch path: a
     /// mapping row without a backing vector would overstate count() and be
     /// silently skipped by KNN.
