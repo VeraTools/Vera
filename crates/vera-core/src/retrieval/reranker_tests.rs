@@ -501,3 +501,88 @@ fn rerank_response_accepts_data_field_alias() {
     assert_eq!(resp.results.len(), 1);
     assert_eq!(resp.results[0].index, 2);
 }
+
+// ── Shortfall / duplicate handling ────────────────────────────────
+
+fn sample_results(n: usize) -> Vec<SearchResult> {
+    (0..n)
+        .map(|i| SearchResult {
+            file_path: format!("src/file{i}.rs"),
+            line_start: 1,
+            line_end: 10,
+            content: format!("fn candidate{i}() {{}}"),
+            language: crate::types::Language::Rust,
+            score: 1.0 - i as f64 / 100.0,
+            symbol_name: Some(format!("candidate{i}")),
+            symbol_type: None,
+        })
+        .collect()
+}
+
+/// A provider returning fewer rows than requested must not silently drop
+/// the unscored candidates: they are preserved below the scored prefix.
+#[tokio::test]
+async fn rerank_shortfall_preserves_unscored_candidates() {
+    let results = sample_results(5);
+    let reranker = test_helpers::MockReranker::scoring_only(&[4, 0]);
+
+    let reranked = rerank_results(&reranker, "query", &results, 5)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reranked.len(),
+        5,
+        "unscored candidates must be preserved, got {:?}",
+        reranked
+            .iter()
+            .map(|r| r.file_path.clone())
+            .collect::<Vec<_>>()
+    );
+    // Scored candidates come first (descending), then unscored ones clamped
+    // under the prefix.
+    assert_eq!(reranked[0].file_path, "src/file4.rs");
+    assert!(reranked[1].file_path == "src/file0.rs");
+    for window in reranked.windows(2) {
+        assert!(
+            window[0].score >= window[1].score,
+            "scores must stay descending: {} >= {}",
+            window[0].score,
+            window[1].score
+        );
+    }
+    // Every original candidate appears exactly once.
+    for i in 0..5 {
+        assert_eq!(
+            reranked
+                .iter()
+                .filter(|r| r.file_path == format!("src/file{i}.rs"))
+                .count(),
+            1,
+            "candidate {i} must appear exactly once"
+        );
+    }
+}
+
+/// Repeated indices from the provider must not duplicate chunks.
+#[tokio::test]
+async fn rerank_duplicate_indices_are_not_duplicated() {
+    let results = sample_results(3);
+    let reranker = test_helpers::MockReranker {
+        fail_with: None,
+        score_only: Some(vec![1, 1, 0]),
+    };
+
+    let reranked = rerank_results(&reranker, "query", &results, 3)
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        let count = reranked
+            .iter()
+            .filter(|r| r.file_path == format!("src/file{i}.rs"))
+            .count();
+        assert!(count <= 1, "candidate {i} appeared {count} times");
+    }
+    assert!(!reranked.is_empty());
+}

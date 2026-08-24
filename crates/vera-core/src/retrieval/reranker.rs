@@ -480,24 +480,59 @@ pub async fn rerank_results(
         "received reranker scores"
     );
 
-    // Reorder results by reranker scores.
+    // Reorder results by reranker scores. Out-of-bounds indices are skipped;
+    // repeated indices are ignored so one chunk cannot appear twice.
+    let mut seen = std::collections::HashSet::new();
+    let mut scored = vec![false; candidates.len()];
     let mut reranked: Vec<SearchResult> = scores
         .iter()
         .filter_map(|score| {
-            if score.index < candidates.len() {
-                let mut result = candidates[score.index].clone();
-                result.score = score.relevance_score;
-                Some(result)
-            } else {
+            if score.index >= candidates.len() {
                 warn!(
                     index = score.index,
                     candidates = candidates.len(),
                     "reranker returned out-of-bounds index, skipping"
                 );
-                None
+                return None;
             }
+            if !seen.insert(score.index) {
+                warn!(
+                    index = score.index,
+                    "reranker returned duplicate index, ignoring repeat"
+                );
+                return None;
+            }
+            scored[score.index] = true;
+            let mut result = candidates[score.index].clone();
+            result.score = score.relevance_score;
+            Some(result)
         })
         .collect();
+
+    // A provider can return fewer rows than requested (caps, dropped rows).
+    // Dropping the unscored remainder would silently vanish mid-pool
+    // candidates from the output; keep them in their pre-rerank order with
+    // scores clamped below the reranked prefix so result order still matches
+    // score order.
+    if reranked.len() < candidates.len() {
+        warn!(
+            scored = reranked.len(),
+            candidates = candidates.len(),
+            "reranker returned fewer scores than candidates; preserving unscored candidates"
+        );
+        let mut ceiling = reranked.last().map(|result| result.score);
+        for (index, candidate) in candidates.iter().enumerate() {
+            if scored[index] {
+                continue;
+            }
+            let mut result = (*candidate).clone();
+            if let Some(ceiling_value) = ceiling {
+                result.score = result.score.min(ceiling_value);
+            }
+            ceiling = Some(result.score);
+            reranked.push(result);
+        }
+    }
 
     // Ensure results are sorted by score descending (should already be from the API).
     reranked.sort_by(|a, b| {
@@ -652,16 +687,31 @@ pub(crate) mod test_helpers {
     /// configured to fail with a specific error.
     pub struct MockReranker {
         pub fail_with: Option<RerankerError>,
+        /// When set, only these document indices get scores - simulating a
+        /// provider that caps or drops rows (and, with repeats, duplicated
+        /// indices).
+        pub score_only: Option<Vec<usize>>,
     }
 
     impl MockReranker {
         pub fn new() -> Self {
-            Self { fail_with: None }
+            Self {
+                fail_with: None,
+                score_only: None,
+            }
         }
 
         pub fn failing(error: RerankerError) -> Self {
             Self {
                 fail_with: Some(error),
+                score_only: None,
+            }
+        }
+
+        pub fn scoring_only(indices: &[usize]) -> Self {
+            Self {
+                fail_with: None,
+                score_only: Some(indices.to_vec()),
             }
         }
     }
@@ -678,12 +728,16 @@ pub(crate) mod test_helpers {
 
             // Deterministic scoring: reverse order of input (last doc scores highest).
             let total = documents.len();
-            let mut scores: Vec<RerankScore> = documents
+            let included: Vec<usize> = self
+                .score_only
+                .clone()
+                .unwrap_or_else(|| (0..total).collect());
+            let mut scores: Vec<RerankScore> = included
                 .iter()
                 .enumerate()
-                .map(|(i, _)| RerankScore {
-                    index: i,
-                    relevance_score: (total - i) as f64 / total as f64,
+                .map(|(rank, i)| RerankScore {
+                    index: *i,
+                    relevance_score: (total - rank) as f64 / total as f64,
                 })
                 .collect();
 
