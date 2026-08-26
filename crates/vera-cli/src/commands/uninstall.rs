@@ -39,6 +39,44 @@ fn shim_name() -> &'static str {
     if cfg!(windows) { "vera.cmd" } else { "vera" }
 }
 
+/// What the file sitting at a shim candidate path actually is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShimKind {
+    /// A launcher we installed: a text script naming vera, or a symlink to one.
+    Ours,
+    /// A file we cannot read as text, i.e. a compiled binary. `cargo install`
+    /// puts the real executable on `PATH` rather than a shim, so this is a Vera
+    /// the uninstaller did not install and does not own.
+    ForeignBinary,
+    /// Readable text that says nothing about Vera. Someone else's `vera`.
+    Unrelated,
+}
+
+/// Classify a shim candidate.
+///
+/// Split out from the removal loop because the previous inline check collapsed
+/// "this is not ours" and "I could not read this" into one `unwrap_or(false)`,
+/// which is exactly the distinction that decides whether the uninstall was
+/// complete. Pure, so all three outcomes can be tested.
+fn classify_shim(shim: &Path) -> ShimKind {
+    if fs::read_link(shim).is_ok_and(|target| target.to_string_lossy().contains("vera")) {
+        return ShimKind::Ours;
+    }
+    match fs::read_to_string(shim) {
+        Ok(contents) if contents.contains("vera") => ShimKind::Ours,
+        Ok(_) => ShimKind::Unrelated,
+        // Not valid UTF-8, or otherwise unreadable as text. The file is named
+        // exactly `vera`/`vera.cmd` and sits in a bin directory, so treat it as
+        // a Vera binary to report rather than as an unrelated file to ignore.
+        Err(_) => ShimKind::ForeignBinary,
+    }
+}
+
+fn is_cargo_bin(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|dir| dir.ends_with(Path::new(".cargo").join("bin")))
+}
+
 fn configured_user_bin_dir() -> Option<PathBuf> {
     std::env::var_os("VERA_USER_BIN_DIR")
         .filter(|value| !value.is_empty())
@@ -108,28 +146,43 @@ fn run_at(
     // 3. Remove the PATH shim.
     let name = shim_name();
     let mut removed_any_shim = false;
+    let mut left_in_place: Vec<PathBuf> = Vec::new();
     for dir in shim_candidates(home, user_bin_dir) {
         let shim = dir.join(name);
-        if shim.exists() {
-            // Only remove if it's a Vera shim (contains "vera" in content or is a symlink to vera).
-            let is_vera_shim = fs::read_to_string(&shim)
-                .map(|c| c.contains("vera"))
-                .unwrap_or(false)
-                || fs::read_link(&shim)
-                    .map(|t| t.to_string_lossy().contains("vera"))
-                    .unwrap_or(false);
-            if is_vera_shim {
+        if !shim.exists() {
+            continue;
+        }
+        match classify_shim(&shim) {
+            ShimKind::Ours => {
                 fs::remove_file(&shim)?;
                 removed_any_shim = true;
                 if !json_output {
                     writeln!(stderr, "  Removed shim {}", shim.display())?;
                 }
             }
+            ShimKind::ForeignBinary => left_in_place.push(shim),
+            ShimKind::Unrelated => {}
         }
     }
     if removed_any_shim {
         removed.push("PATH shim");
     }
+    for path in &left_in_place {
+        writeln!(
+            stderr,
+            "  Left in place: {} is a binary, not a shim we installed{}",
+            path.display(),
+            if is_cargo_bin(path) {
+                " — run `cargo uninstall vera` to remove it"
+            } else {
+                " — remove it yourself if you no longer want it"
+            }
+        )?;
+    }
+
+    // A binary we deliberately did not remove is still a Vera left on `PATH`,
+    // so it cannot be reported as a complete uninstall.
+    let complete = complete && left_in_place.is_empty();
 
     if json_output {
         writeln!(
@@ -140,6 +193,10 @@ fn run_at(
                 "complete": complete,
                 "removed": removed,
                 "skills": removed_skills,
+                "left_in_place": left_in_place
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
             })
         )?;
     } else {
@@ -147,10 +204,15 @@ fn run_at(
         if complete {
             writeln!(stderr, "Vera has been uninstalled.")?;
         } else {
-            writeln!(
-                stderr,
-                "Vera was partially uninstalled; some skills could not be removed."
-            )?;
+            // Both reasons can hold at once, so neither branch may hide the
+            // other: the user needs to know about every part that survived.
+            writeln!(stderr, "Vera was partially uninstalled.")?;
+            if !skill_removal.failures.is_empty() {
+                writeln!(stderr, "  Some skills could not be removed.")?;
+            }
+            if !left_in_place.is_empty() {
+                writeln!(stderr, "  A Vera binary is still on your PATH.")?;
+            }
         }
         writeln!(
             stderr,
@@ -384,6 +446,120 @@ mod tests {
 
         let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(document["complete"], serde_json::json!(true));
+    }
+
+    /// The bytes that make this defect reproduce: a Mach-O magic number, which
+    /// `read_to_string` rejects as invalid UTF-8 exactly as a real
+    /// `cargo install`ed binary does. A text fixture would be readable and
+    /// would never reach the branch under test.
+    const BINARY_MAGIC: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
+
+    #[test]
+    fn a_binary_on_path_is_reported_and_left_rather_than_silently_kept() {
+        let roots = roots();
+        let binary = roots.user_bin_dir.join(shim_name());
+        fs::write(&binary, BINARY_MAGIC).unwrap();
+        assert!(
+            fs::read_to_string(&binary).is_err(),
+            "fixture must be unreadable as text, or it exercises the shim branch instead"
+        );
+
+        let (stdout, stderr) = uninstall(&roots, true);
+
+        assert!(
+            binary.exists(),
+            "a binary we did not install must not be deleted"
+        );
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            document["complete"],
+            serde_json::json!(false),
+            "a Vera still on PATH is not a complete uninstall: {stdout}"
+        );
+        assert_eq!(
+            document["left_in_place"],
+            serde_json::json!([binary.display().to_string()]),
+            "the surviving binary must be named in the document: {stdout}"
+        );
+        assert!(
+            stderr.contains("Left in place") && stderr.contains(&binary.display().to_string()),
+            "stderr must name the file that survived: {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_text_shim_is_still_removed_and_still_reports_complete() {
+        // The negative half: adding the binary case must not stop the case that
+        // already worked, which is what every non-cargo install writes.
+        let roots = roots();
+        let shim = roots.user_bin_dir.join(shim_name());
+        fs::write(
+            &shim,
+            "#!/bin/sh\nexec \"$HOME/.vera/bin/1.0.0/vera\" \"$@\"\n",
+        )
+        .unwrap();
+
+        let (stdout, stderr) = uninstall(&roots, true);
+
+        assert!(!shim.exists(), "our own shim must still be removed");
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["complete"], serde_json::json!(true), "{stdout}");
+        assert_eq!(
+            document["left_in_place"],
+            serde_json::json!([]),
+            "nothing survived, so the list must be empty: {stdout}"
+        );
+        assert!(
+            !stderr.contains("Left in place"),
+            "a removed shim must not be reported as left behind: {stderr}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_binary_named_vera_is_left_alone_but_still_reported() {
+        // Someone else's `vera` we cannot read is indistinguishable from ours by
+        // content, so it is reported rather than deleted. This pins that the
+        // choice is "report, never delete", not "delete anything unreadable".
+        let roots = roots();
+        let other = roots.user_bin_dir.join(shim_name());
+        fs::write(&other, BINARY_MAGIC).unwrap();
+
+        let (_, _) = uninstall(&roots, true);
+
+        assert!(other.exists(), "an unreadable file must never be deleted");
+    }
+
+    #[test]
+    fn classify_shim_separates_unreadable_from_unrelated() {
+        // The defect was that `unwrap_or(false)` collapsed these two, which is
+        // the distinction that decides whether the uninstall was complete.
+        let temp = tempdir().unwrap();
+
+        let ours = temp.path().join("ours");
+        fs::write(&ours, "#!/bin/sh\nexec .../vera \"$@\"\n").unwrap();
+        assert_eq!(classify_shim(&ours), ShimKind::Ours);
+
+        let binary = temp.path().join("binary");
+        fs::write(&binary, BINARY_MAGIC).unwrap();
+        assert_eq!(classify_shim(&binary), ShimKind::ForeignBinary);
+
+        let unrelated = temp.path().join("unrelated");
+        fs::write(&unrelated, "#!/bin/sh\necho not this tool\n").unwrap();
+        assert_eq!(classify_shim(&unrelated), ShimKind::Unrelated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_shim_recognizes_a_symlink_to_vera() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("vera-real");
+        fs::write(&target, BINARY_MAGIC).unwrap();
+        let link = temp.path().join("vera");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // Reached through the symlink arm, not the text arm: the target is
+        // unreadable as text, so without that arm this would be ForeignBinary.
+        assert_eq!(classify_shim(&link), ShimKind::Ours);
     }
 
     #[cfg(unix)]
