@@ -884,6 +884,37 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_separator_on_the_data_dir_does_not_change_the_answer() {
+        // VERA_HOME may arrive with a trailing separator. Containment compares
+        // path components, so the boundary does not depend on how the caller
+        // spelled the directory — a string prefix would have needed the two
+        // spellings normalized first.
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+        let with_separator = PathBuf::from(format!("{}{}", vera_home.display(), MAIN_SEPARATOR));
+
+        let shim = temp.path().join("vera");
+        fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nexec \"{}{}bin{}1.0.0{}vera\" \"$@\"\n",
+                vera_home.display(),
+                MAIN_SEPARATOR,
+                MAIN_SEPARATOR,
+                MAIN_SEPARATOR
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(classify_shim(&shim, &vera_home), ShimKind::Ours);
+        assert_eq!(
+            classify_shim(&shim, &with_separator),
+            ShimKind::Ours,
+            "a trailing separator on vera_home must not orphan our own shim"
+        );
+    }
+
+    #[test]
     fn a_parent_traversal_escaping_the_data_directory_is_not_ours() {
         // `<vera_home>/bin/../../other/vera` passes a prefix test and resolves
         // outside. Normalization is lexical on purpose: vera_home is already
