@@ -536,7 +536,18 @@ mod tests {
     #[test]
     fn preprocess_terminates_on_include_cycle() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
+        let real_root = temp.path().canonicalize().unwrap();
+        let files = real_root.join("files");
+        fs::create_dir(&files).unwrap();
+
+        // Reach the fixture through a symlink so the as-written path differs
+        // from its canonical form on every platform. Without this the test
+        // only discriminates where TMPDIR itself contains a symlink: on macOS
+        // it does (/var -> /private/var), on Linux it does not, so reverting
+        // the seed fix leaves this test green there.
+        let root = real_root.join("link");
+        std::os::unix::fs::symlink(&files, &root).unwrap();
+
         let source_path = root.join("root.rst");
         let child_path = root.join("child.rst");
 
@@ -545,13 +556,14 @@ mod tests {
         fs::write(&child_path, "CHILD-BODY\n.. include:: root.rst\n").unwrap();
         let source = "ROOT-BODY\n.. include:: child.rst\n";
         fs::write(&source_path, source).unwrap();
-        let processed = preprocess_rst_with_limit(source, &source_path, root, 128).unwrap();
+        let processed = preprocess_rst_with_limit(source, &source_path, &root, 128).unwrap();
 
         // The cycle edge back to root.rst stays literal, and each body is
-        // expanded exactly once. Counting rather than probing for presence is
-        // what distinguishes termination from expanding one lap too far: an
-        // uncanonical stack seed duplicates CHILD-BODY and leaves
-        // `.. include:: child.rst` as the surviving directive instead.
+        // expanded exactly once. An uncanonical stack seed fails to match the
+        // canonical entry pushed beneath it, so root.rst is expanded a second
+        // time at depth 2 and `.. include:: child.rst` survives as the literal
+        // instead: the discriminating checks are the exact expansion and the
+        // ROOT-BODY count, which reaches 2. CHILD-BODY stays at 1 either way.
         assert_eq!(
             processed, "ROOT-BODY\nCHILD-BODY\n.. include:: root.rst\n",
             "cycle should terminate at the first repeat of root.rst"
