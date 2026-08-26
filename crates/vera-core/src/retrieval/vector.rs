@@ -9,11 +9,11 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::storage::metadata::MetadataStore;
-use crate::storage::vector::{MAX_KNN_K, VectorStore};
+use crate::storage::vector::VectorStore;
 use crate::types::SearchResult;
 
 /// Errors specific to vector search.
@@ -145,18 +145,7 @@ fn search_vector_from_embedding(
     query_embedding: &[f32],
 ) -> Result<Vec<SearchResult>, VectorSearchError> {
     // 1. Search the vector store for nearest neighbors.
-    let (requested, candidates) = candidate_pool(limit);
-    if requested > candidates {
-        // Deliberately without the query text: the surrounding `debug!` calls
-        // carry it, but this one is on by default, and a search query is user
-        // content that should not be raised into default-visible logs.
-        warn!(
-            requested,
-            fetched = candidates,
-            "candidate pool exceeds the sqlite-vec KNN cap; the filter and \
-             metadata over-fetch are inert above it"
-        );
-    }
+    let candidates = candidate_pool(limit);
 
     let vector_results = vector_store
         .search(query_embedding, candidates)
@@ -210,23 +199,15 @@ fn search_vector_from_embedding(
     Ok(results)
 }
 
-/// Size the KNN request for a caller-selected pool, bounded by the backend cap.
+/// Size the vector request for a caller-selected pool.
 ///
-/// Returns `(requested, fetched)`. Extra candidates are fetched to absorb chunks
-/// whose metadata has gone missing, without doubling an already-large pool.
-///
-/// The two values differ once the compounded over-fetch runs past
-/// [`MAX_KNN_K`]. Callers stack several multipliers before reaching here (query
-/// type, then a filter over-fetch, then this one), so a natural-language query
-/// with an active filter can ask for more than sqlite-vec will serve. Bounding
-/// it here rather than letting the storage layer clamp keeps the ceiling
-/// visible to the one place that can report it; the same `k` reaches sqlite-vec
-/// either way, so ranking is unchanged.
-fn candidate_pool(limit: usize) -> (usize, usize) {
-    let requested = limit
+/// Extra candidates absorb chunks whose metadata has gone missing. The active
+/// storage backend applies any backend-specific ceiling: the default flat scan
+/// has no sqlite-vec KNN limit, while the vec0 rollback path clamps its request.
+fn candidate_pool(limit: usize) -> usize {
+    limit
         .saturating_add(limit / 2)
-        .max(limit.saturating_add(10));
-    (requested, requested.min(MAX_KNN_K))
+        .max(limit.saturating_add(10))
 }
 
 /// Generate a query embedding, truncating to match stored dimensionality.
@@ -290,24 +271,11 @@ mod tests {
     use crate::types::{Chunk, Language, SymbolType};
     use std::collections::HashMap;
 
-    /// The pool must never ask sqlite-vec for more than it will serve, and must
-    /// report the shortfall so a degraded pool is diagnosable rather than silent.
     #[test]
-    fn candidate_pool_is_bounded_by_the_knn_cap() {
-        // Below the cap the metadata over-fetch is untouched.
-        assert_eq!(candidate_pool(10), (20, 20));
-        assert_eq!(candidate_pool(100), (150, 150));
-
-        // At and above it, the request is reported but not made.
-        let (requested, fetched) = candidate_pool(MAX_KNN_K);
-        assert!(
-            requested > MAX_KNN_K,
-            "over-fetch should exceed the cap here"
-        );
-        assert_eq!(fetched, MAX_KNN_K);
-
-        // No caller can push the fetch past the cap, and none can overflow it.
-        assert_eq!(candidate_pool(usize::MAX).1, MAX_KNN_K);
+    fn candidate_pool_preserves_backend_independent_overfetch() {
+        assert_eq!(candidate_pool(10), 20);
+        assert_eq!(candidate_pool(100), 150);
+        assert_eq!(candidate_pool(usize::MAX), usize::MAX);
     }
 
     /// Create sample chunks with semantic variety for testing.

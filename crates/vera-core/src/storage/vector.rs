@@ -342,8 +342,7 @@ fn scan_snapshot(
     query: &[f32],
     limit: usize,
 ) -> Result<Vec<DistanceCandidate>> {
-    let max_k = limit.min(MAX_KNN_K);
-    if max_k == 0 {
+    if limit == 0 {
         return Ok(Vec::new());
     }
     let dim = snapshot.manifest.dim;
@@ -355,6 +354,7 @@ fn scan_snapshot(
         );
     }
     let values = snapshot.data.as_slice();
+    let max_k = limit.min(values.len() / dim);
     let mut heap = BinaryHeap::with_capacity(max_k);
     for (index, vector) in values.chunks_exact(dim).enumerate() {
         let rowid = index as i64 + 1;
@@ -997,8 +997,8 @@ pub struct VectorStore {
 /// Maximum `k` sqlite-vec accepts in a KNN query. Requesting more is a hard
 /// error from the extension, not a soft limit.
 ///
-/// Public so callers can size their candidate pools against the real ceiling
-/// instead of scaling past it and relying on [`VectorStore::search`] to clamp.
+/// This ceiling applies only to the vec0 rollback scanner. The default flat
+/// scanner is bounded by the number of vectors in its snapshot instead.
 pub const MAX_KNN_K: usize = 4096;
 
 /// A single vector search result: chunk ID and distance score.
@@ -1332,14 +1332,6 @@ impl VectorStore {
             );
         }
 
-        if limit > MAX_KNN_K {
-            tracing::warn!(
-                requested = limit,
-                clamped = MAX_KNN_K,
-                "clamping vector search limit to the KNN cap; the extra candidates are not fetched"
-            );
-        }
-
         if self.scan_mode == VectorScanMode::Flat {
             let mut flat = self
                 .flat
@@ -1363,17 +1355,22 @@ impl VectorStore {
                 .collect();
         }
 
+        if limit > MAX_KNN_K {
+            tracing::warn!(
+                requested = limit,
+                clamped = MAX_KNN_K,
+                "clamping vec0 search limit to the sqlite-vec KNN cap; the extra candidates are not fetched"
+            );
+        }
+
         // sqlite-vec reads this LIMIT as the KNN `k` and rejects anything above
         // MAX_KNN_K with "k value in knn query too large". Callers scale the
         // candidate pool from the query type and result limit, which can exceed
         // it on natural-language queries, and the whole vector arm would then be
         // dropped in favour of BM25-only results. Ask for as many as the backend
         // allows instead.
-        // Warn rather than debug: this is a silent quality reduction, and the
-        // reason #38 was hard to diagnose was a swallowed signal. Vera's own
-        // retrieval path now bounds the pool before it gets here, so reaching
-        // this branch means an external caller asked for more than the backend
-        // can give.
+        // Warn rather than debug: this is a quality reduction that is otherwise
+        // difficult to diagnose when the rollback scanner is selected.
         let limit = limit.min(MAX_KNN_K);
 
         // `prepare`, not `prepare_cached`: `limit` is interpolated into the
@@ -1838,7 +1835,7 @@ mod tests {
 
     #[test]
     fn search_clamps_limit_above_sqlite_vec_knn_cap() {
-        let store = VectorStore::open_in_memory(4).unwrap();
+        let store = VectorStore::open_in_memory_with_mode(4, VectorScanMode::Vec0).unwrap();
         for i in 0..10 {
             let v = vec![i as f32, 0.0, 0.0, 0.0];
             store.insert(&format!("c{i}"), &v).unwrap();
@@ -2447,15 +2444,21 @@ mod tests {
     }
 
     #[test]
-    fn flat_scan_clamps_limit_above_knn_cap() {
-        let store = VectorStore::open_in_memory_with_mode(4, VectorScanMode::Flat).unwrap();
-        for index in 0..10 {
-            store
-                .insert(&format!("chunk-{index}"), &[index as f32, 0.0, 0.0, 0.0])
-                .unwrap();
-        }
+    fn flat_scan_serves_limits_above_the_vec0_knn_cap() {
+        let store = VectorStore::open_in_memory_with_mode(1, VectorScanMode::Flat).unwrap();
+        let count = MAX_KNN_K + 1;
+        let ids: Vec<String> = (0..count).map(|index| format!("chunk-{index}")).collect();
+        let vectors: Vec<[f32; 1]> = (0..count).map(|index| [index as f32]).collect();
+        let items: Vec<(&str, &[f32])> = ids
+            .iter()
+            .zip(&vectors)
+            .map(|(id, vector)| (id.as_str(), vector.as_slice()))
+            .collect();
+        store.insert_batch_fresh(&items).unwrap();
 
-        let results = store.search(&[5.0, 0.0, 0.0, 0.0], MAX_KNN_K + 1).unwrap();
-        assert_eq!(results.len(), 10);
+        // The flat scanner has no sqlite-vec KNN limit. Capping it here loses
+        // candidates before post-retrieval path and metadata filters run.
+        let results = store.search(&[0.0], count).unwrap();
+        assert_eq!(results.len(), count);
     }
 }
