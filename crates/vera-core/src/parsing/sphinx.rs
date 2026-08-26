@@ -42,8 +42,10 @@ pub(crate) fn preprocess_rst_with_limit(
 ) -> Result<String> {
     // Seed the stack with the canonicalized path: resolve_include_path
     // returns canonicalized paths (resolve_within), so a non-canonical seed
-    // (macOS /var -> /private/var, symlinked checkouts) never compares equal
-    // and include cycles expand to MAX_INCLUDE_DEPTH instead of terminating.
+    // (macOS /var -> /private/var, symlinked checkouts) never compares equal.
+    // A cycle back to this file is then caught one level late, by the
+    // canonical entry pushed below it: the file's content is expanded twice
+    // and the surviving literal directive names the wrong file.
     let stack_seed = current_file
         .canonicalize()
         .unwrap_or_else(|_| current_file.to_path_buf());
@@ -538,15 +540,25 @@ mod tests {
         let source_path = root.join("root.rst");
         let child_path = root.join("child.rst");
 
-        fs::write(&child_path, "child\n.. include:: root.rst\n").unwrap();
-        let source = "root\n.. include:: child.rst\n";
+        // Distinct from the directive text: `contains("root")` would be
+        // satisfied by `.. include:: root.rst` even if nothing was expanded.
+        fs::write(&child_path, "CHILD-BODY\n.. include:: root.rst\n").unwrap();
+        let source = "ROOT-BODY\n.. include:: child.rst\n";
         fs::write(&source_path, source).unwrap();
         let processed = preprocess_rst_with_limit(source, &source_path, root, 128).unwrap();
 
-        assert!(processed.contains("root"));
-        assert!(processed.contains("child"));
-        assert!(processed.contains(".. include:: root.rst"));
-        assert!(processed.len() < 128 * 4);
+        // The cycle edge back to root.rst stays literal, and each body is
+        // expanded exactly once. Counting rather than probing for presence is
+        // what distinguishes termination from expanding one lap too far: an
+        // uncanonical stack seed duplicates CHILD-BODY and leaves
+        // `.. include:: child.rst` as the surviving directive instead.
+        assert_eq!(
+            processed, "ROOT-BODY\nCHILD-BODY\n.. include:: root.rst\n",
+            "cycle should terminate at the first repeat of root.rst"
+        );
+        assert_eq!(processed.matches("ROOT-BODY").count(), 1);
+        assert_eq!(processed.matches("CHILD-BODY").count(), 1);
+        assert_eq!(processed.matches(".. include::").count(), 1);
     }
 
     /// Diamond with a back-edge (#205): `b` and `c` include `d`, and `d`
