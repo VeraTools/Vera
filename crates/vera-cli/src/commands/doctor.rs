@@ -1,5 +1,7 @@
 //! `vera doctor` — inspect the current Vera setup for common failures.
 
+use std::path::Path;
+
 use serde::Serialize;
 
 use crate::state;
@@ -36,17 +38,14 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
     checks.push(version_check(&version_status));
 
     let config_path = state::config_path()?;
-    checks.push(DoctorCheck {
-        name: "config-file",
-        status: if config_path.exists() {
-            CheckStatus::Ok
-        } else {
-            CheckStatus::Warn
-        },
-        detail: config_path.display().to_string(),
-    });
-
-    let saved_config = state::load_saved_config()?;
+    // A config we cannot parse is the situation doctor exists to report, so it
+    // becomes a failing check rather than an early return. Continuing with the
+    // defaults keeps the remaining checks available; they describe what the
+    // process would actually do, since a broken stored config is ignored at
+    // load time everywhere else too.
+    let loaded = state::load_saved_config();
+    checks.push(config_file_check(&config_path, loaded.as_ref().err()));
+    let saved_config = loaded.unwrap_or_default();
     checks.push(saved_backend_check(&saved_config));
 
     let backend = vera_core::config::resolve_backend(None);
@@ -68,12 +67,29 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
 
     match backend {
         vera_core::config::InferenceBackend::OnnxJina(ep) => {
-            let embedding_model = vera_core::local_models::LocalEmbeddingModelConfig::from_env()?;
-            checks.push(DoctorCheck {
-                name: "local-embedding-model",
-                status: CheckStatus::Ok,
-                detail: embedding_model.display_name(),
-            });
+            // Same reasoning as the stored config above: a bad
+            // VERA_LOCAL_EMBEDDING_* override is a thing to report, not a
+            // reason to stop. The runtime check below needs only the execution
+            // provider, so it still runs and is still worth having.
+            let embedding_model =
+                match vera_core::local_models::LocalEmbeddingModelConfig::from_env() {
+                    Ok(embedding_model) => {
+                        checks.push(DoctorCheck {
+                            name: "local-embedding-model",
+                            status: CheckStatus::Ok,
+                            detail: embedding_model.display_name(),
+                        });
+                        Some(embedding_model)
+                    }
+                    Err(err) => {
+                        checks.push(DoctorCheck {
+                            name: "local-embedding-model",
+                            status: CheckStatus::Fail,
+                            detail: one_line_error(&err),
+                        });
+                        None
+                    }
+                };
             let runtime_path = vera_core::local_models::ort_library_path_for_ep(ep)?;
             let runtime_check = vera_core::local_models::ensure_ort_runtime(Some(&runtime_path));
             let runtime_detail = match &runtime_check {
@@ -90,12 +106,33 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
                 detail: runtime_detail,
             });
 
-            let model_assets =
-                vera_core::local_models::inspect_local_model_files_for_ep(ep, &embedding_model)?;
-            let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
-            checks.push(local_model_assets_check(&model_assets, &repair_hint));
-            if probe {
-                checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
+            match embedding_model {
+                Some(embedding_model) => {
+                    let model_assets = vera_core::local_models::inspect_local_model_files_for_ep(
+                        ep,
+                        &embedding_model,
+                    )?;
+                    let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
+                    checks.push(local_model_assets_check(&model_assets, &repair_hint));
+                    if probe {
+                        checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
+                    }
+                }
+                None => {
+                    // Which files to look for is derived from the model
+                    // configuration that just failed to load, so there is
+                    // nothing to inspect rather than nothing wrong.
+                    checks.push(skipped_check(
+                        "local-model-assets",
+                        "skipped: the embedding model configuration could not be read",
+                    ));
+                    if probe {
+                        checks.push(skipped_check(
+                            "probe",
+                            "skipped: the embedding model configuration could not be read",
+                        ));
+                    }
+                }
             }
         }
         vera_core::config::InferenceBackend::PotionCode => {
@@ -626,8 +663,37 @@ fn version_check(status: &update_check::BinaryVersionStatus) -> DoctorCheck {
     }
 }
 
+/// Status for the stored config, including the case where it cannot be parsed.
+///
+/// A config the CLI cannot read is the situation `vera doctor` exists to
+/// report, so it is a failing check carrying the parse error rather than an
+/// early return that discards every other check. Pure so the three outcomes can
+/// be tested without a home directory.
+fn config_file_check(config_path: &Path, load_error: Option<&anyhow::Error>) -> DoctorCheck {
+    match load_error {
+        Some(err) => DoctorCheck {
+            name: "config-file",
+            status: CheckStatus::Fail,
+            detail: format!("{}: {}", config_path.display(), one_line_error(err)),
+        },
+        None => DoctorCheck {
+            name: "config-file",
+            status: if config_path.exists() {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Warn
+            },
+            detail: config_path.display().to_string(),
+        },
+    }
+}
+
 fn one_line_error(err: &anyhow::Error) -> String {
-    err.to_string()
+    // `{:#}` rather than `to_string()`: the plain Display of an anyhow error is
+    // the outermost context alone, so a wrapped failure renders as "failed to
+    // parse persistent state" with the parse error — the part the user needs —
+    // discarded. Every caller here is building a check detail for a human.
+    format!("{err:#}")
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -656,6 +722,66 @@ mod tests {
             check("onnx-runtime", CheckStatus::Fail),
             check("local-models", CheckStatus::Fail),
         ]
+    }
+
+    #[test]
+    fn an_unparseable_config_fails_the_check_and_carries_the_parse_error() {
+        let path = Path::new("/nonexistent/vera/config.json");
+        let err = anyhow::anyhow!("EOF while parsing a value at line 2 column 0")
+            .context("failed to parse persistent state");
+
+        let check = config_file_check(path, Some(&err));
+
+        assert!(
+            matches!(check.status, CheckStatus::Fail),
+            "an unparseable config must fail the check, not warn: {:?}",
+            check.status
+        );
+        // The point of the check is that the user learns what is wrong with the
+        // file, so both the path and the underlying parse error have to survive
+        // into the detail. Asserting only the status would pass on a check that
+        // reported "something is wrong" and nothing else.
+        assert!(
+            check.detail.contains("/nonexistent/vera/config.json"),
+            "detail lost the path: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("EOF while parsing a value"),
+            "detail lost the parse error: {}",
+            check.detail
+        );
+        assert_eq!(
+            failed_check_names(&[check]),
+            vec!["config-file"],
+            "the failure must reach the verdict, so the exit code is non-zero"
+        );
+    }
+
+    #[test]
+    fn a_readable_config_keeps_the_existing_ok_and_warn_split() {
+        // The negative half: introducing the failure case must not disturb the
+        // two outcomes that were already there.
+        let temp = tempfile::tempdir().unwrap();
+        let present = temp.path().join("config.json");
+        std::fs::write(&present, "{}").unwrap();
+        let absent = temp.path().join("missing.json");
+
+        let found = config_file_check(&present, None);
+        assert!(matches!(found.status, CheckStatus::Ok), "{found:?}");
+        assert_eq!(found.detail, present.display().to_string());
+
+        let not_found = config_file_check(&absent, None);
+        assert!(
+            matches!(not_found.status, CheckStatus::Warn),
+            "{not_found:?}"
+        );
+        assert_eq!(not_found.detail, absent.display().to_string());
+
+        assert!(
+            failed_check_names(&[found, not_found]).is_empty(),
+            "a missing config is not a failure; exit code must stay 0"
+        );
     }
 
     #[test]

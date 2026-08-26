@@ -36,8 +36,16 @@ fn main() {
     vera_core::init_tls();
     let cli = Cli::parse();
     if let Err(err) = state::apply_saved_env() {
-        eprintln!("Error: {err:#}");
-        process::exit(1);
+        // `vera doctor` is the command for finding out why a config is broken,
+        // so it must survive one that cannot be parsed. It reports the same
+        // failure itself, as the `config-file` check, and still exits non-zero
+        // through the usual verdict — so this is not silence, it is the report
+        // moving to where the user was looking for it. Every other command
+        // needs the applied environment and still refuses to run without it.
+        if !matches!(cli.command, Commands::Doctor { .. }) {
+            eprintln!("Error: {err:#}");
+            process::exit(1);
+        }
     }
 
     let show_nudges = !matches!(
