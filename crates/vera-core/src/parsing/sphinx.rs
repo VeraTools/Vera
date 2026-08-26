@@ -40,7 +40,14 @@ pub(crate) fn preprocess_rst_with_limit(
     repo_root: &Path,
     max_file_size_bytes: u64,
 ) -> Result<String> {
-    let mut stack = vec![current_file.to_path_buf()];
+    // Seed the stack with the canonicalized path: resolve_include_path
+    // returns canonicalized paths (resolve_within), so a non-canonical seed
+    // (macOS /var -> /private/var, symlinked checkouts) never compares equal
+    // and include cycles expand to MAX_INCLUDE_DEPTH instead of terminating.
+    let stack_seed = current_file
+        .canonicalize()
+        .unwrap_or_else(|_| current_file.to_path_buf());
+    let mut stack = vec![stack_seed];
     let mut expansion_cache = HashMap::new();
     let canonical_repo_root = repo_root
         .canonicalize()
