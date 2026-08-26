@@ -101,12 +101,10 @@ fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
     let launches_from_vera_home = |text: &str| {
         text.lines()
             .map(str::trim)
-            .filter(|line| !line.starts_with('#') && !line.starts_with("::"))
+            .filter(|line| !is_comment_line(line))
             .any(|line| {
-                line.split_whitespace().any(|token| {
-                    let token = token.trim_matches(['"', '\'']);
-                    token.starts_with(&vera_home_prefix) && is_vera_executable(token)
-                })
+                launcher_tokens(line)
+                    .any(|token| token.starts_with(&vera_home_prefix) && is_vera_executable(&token))
             })
     };
 
@@ -132,6 +130,58 @@ fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
         // a Vera binary to report rather than as an unrelated file to ignore.
         Err(_) => ShimKind::ForeignBinary,
     }
+}
+
+/// Whether a launcher line is a comment in any of the shells that write shims.
+///
+/// `sh` uses `#`; batch uses `::`, `rem`, and `@rem`, none of which are
+/// case-sensitive. A comment that happens to name the data directory must not
+/// count as evidence that this launcher runs it.
+fn is_comment_line(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.starts_with('#') || line.starts_with("::") {
+        return true;
+    }
+    let lowered = line.to_ascii_lowercase();
+    let lowered = lowered.strip_prefix('@').unwrap_or(&lowered);
+    lowered == "rem" || lowered.starts_with("rem ") || lowered.starts_with("rem\t")
+}
+
+/// Split a launcher line into candidate path tokens, keeping quoted runs whole.
+///
+/// `split_whitespace` alone would tear `"C:\Users\First Last\.vera\...\vera.exe"`
+/// into three tokens and lose the path, so a real shim under a home directory
+/// with a space in it would stop being recognised as ours.
+fn launcher_tokens(line: &str) -> impl Iterator<Item = String> + '_ {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in line.chars() {
+        match quote {
+            Some(open) if ch == open => {
+                quote = None;
+                tokens.push(std::mem::take(&mut current));
+            }
+            Some(_) => current.push(ch),
+            None if ch == '"' || ch == '\'' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                quote = Some(ch);
+            }
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens.into_iter()
 }
 
 fn is_cargo_bin(path: &Path) -> bool {
@@ -317,6 +367,7 @@ fn fold_skill_removal(removal: Result<agent::SkillRemoval>) -> agent::SkillRemov
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::MAIN_SEPARATOR;
     use tempfile::tempdir;
 
     struct Roots {
@@ -715,6 +766,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(classify_shim(&ours, &vera_home), ShimKind::Ours);
+    }
+
+    #[test]
+    fn batch_comments_are_comments_too() {
+        // `.cmd` shims comment with `rem`, `@rem` and `::`, in any case. A
+        // comment naming the data directory is not evidence that the launcher
+        // runs it — the same rule as `#`, which was the only one handled.
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+        let launch = format!(
+            "{}{}bin{}1.0.0{}vera.exe",
+            vera_home.display(),
+            MAIN_SEPARATOR,
+            MAIN_SEPARATOR,
+            MAIN_SEPARATOR
+        );
+
+        for prefix in ["rem", "REM", "@rem", "@REM", "::"] {
+            let shim = temp
+                .path()
+                .join(format!("cmd-{}", prefix.replace('@', "at")));
+            fs::write(
+                &shim,
+                format!("@echo off\n{prefix} launcher for {launch}\nother.exe %*\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                classify_shim(&shim, &vera_home),
+                ShimKind::Ambiguous,
+                "`{prefix}` must be treated as a comment"
+            );
+        }
+
+        // Positive control: the same path on a real command line is ownership.
+        let real = temp.path().join("cmd-real");
+        fs::write(&real, format!("@echo off\n\"{launch}\" %*\n")).unwrap();
+        assert_eq!(classify_shim(&real, &vera_home), ShimKind::Ours);
+    }
+
+    #[test]
+    fn a_quoted_launcher_path_containing_spaces_is_still_ours() {
+        // Whitespace splitting alone tears a quoted path apart, so a home
+        // directory with a space in it would stop being recognised — common on
+        // Windows, where the shim lives under `C:\Users\First Last\`.
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join("First Last").join(".vera");
+        let shim = temp.path().join("vera");
+        fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nexec \"{}{}bin{}1.0.0{}vera\" \"$@\"\n",
+                vera_home.display(),
+                MAIN_SEPARATOR,
+                MAIN_SEPARATOR,
+                MAIN_SEPARATOR
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            classify_shim(&shim, &vera_home),
+            ShimKind::Ours,
+            "a quoted path with a space in it is still our launcher"
+        );
     }
 
     #[test]
