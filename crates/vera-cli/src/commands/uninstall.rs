@@ -76,8 +76,39 @@ fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
     // directory, so neither accepts a sibling whose name merely begins the same
     // way.
     let vera_home_prefix = format!("{}{}", vera_home.display(), std::path::MAIN_SEPARATOR);
-    let names_vera_home = |text: &str| text.contains(&vera_home_prefix);
     let mentions_vera = |text: &str| text.to_ascii_lowercase().contains("vera");
+    // Match on the stem rather than the whole file name: a `vera.cmd` launcher
+    // execs `vera.exe`, so requiring the launcher's own name would stop
+    // recognising our own Windows shim.
+    let is_vera_executable = |token: &str| {
+        Path::new(token)
+            .file_stem()
+            .is_some_and(|stem| stem == "vera")
+    };
+
+    // Ownership needs a line that *launches* something inside `vera_home`, not
+    // a file that mentions the path anywhere. A foreign launcher naming
+    // `~/.vera/config.json` in a comment would satisfy a whole-file substring
+    // and be deleted for it. Requiring a non-comment line that carries a
+    // `vera_home`-rooted path ending in this shim's own executable name is what
+    // separates "runs our binary" from "talks about our directory".
+    //
+    // This recognises the launcher shapes shipped today, which point at
+    // `<vera_home>/bin/<version>/<target>/vera`. A layout that stores the path
+    // some other way falls through to `Ambiguous` and is reported rather than
+    // deleted, which is the safe direction for a check that cannot be proven
+    // exhaustive.
+    let launches_from_vera_home = |text: &str| {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.starts_with("::"))
+            .any(|line| {
+                line.split_whitespace().any(|token| {
+                    let token = token.trim_matches(['"', '\'']);
+                    token.starts_with(&vera_home_prefix) && is_vera_executable(token)
+                })
+            })
+    };
 
     // `read_link` rather than anything that resolves the target: `vera_home` is
     // already deleted by the time this runs, so an owned shim pointing into it
@@ -93,7 +124,7 @@ fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
     }
 
     match fs::read_to_string(shim) {
-        Ok(contents) if names_vera_home(&contents) => ShimKind::Ours,
+        Ok(contents) if launches_from_vera_home(&contents) => ShimKind::Ours,
         Ok(contents) if mentions_vera(&contents) => ShimKind::Ambiguous,
         Ok(_) => ShimKind::Unrelated,
         // Not valid UTF-8, or otherwise unreadable as text. The file is named
@@ -632,6 +663,58 @@ mod tests {
             ShimKind::Ambiguous,
             "case must not decide whether a stranger's file gets deleted"
         );
+    }
+
+    #[test]
+    fn merely_naming_the_data_directory_is_not_ownership() {
+        // A foreign launcher that mentions the data path — in a comment, or as
+        // an argument to something else entirely — must not be deleted for it.
+        // Ownership means launching a binary from inside vera_home.
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+
+        let commented = temp.path().join("commented");
+        fs::write(
+            &commented,
+            format!(
+                "#!/bin/sh\n# reads config from {}/config.json\nexec /opt/other/bin/other \"$@\"\n",
+                vera_home.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            classify_shim(&commented, &vera_home),
+            ShimKind::Ambiguous,
+            "a comment naming the data dir is not proof of ownership"
+        );
+
+        let argument = temp.path().join("argument");
+        fs::write(
+            &argument,
+            format!(
+                "#!/bin/sh\nexec /usr/bin/backup-tool --source \"{}/models\" \"$@\"\n",
+                vera_home.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            classify_shim(&argument, &vera_home),
+            ShimKind::Ambiguous,
+            "a tool that reads our directory is not our launcher"
+        );
+
+        // And the positive control, so this test cannot pass by classifying
+        // everything as Ambiguous.
+        let ours = temp.path().join("ours");
+        fs::write(
+            &ours,
+            format!(
+                "#!/bin/sh\nexec \"{}/bin/1.0.0/aarch64-apple-darwin/vera\" \"$@\"\n",
+                vera_home.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(classify_shim(&ours, &vera_home), ShimKind::Ours);
     }
 
     #[test]
