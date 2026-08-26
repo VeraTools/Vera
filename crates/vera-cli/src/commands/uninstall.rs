@@ -70,15 +70,22 @@ enum ShimKind {
 /// an install layout we do not recognise still surfaces instead of vanishing
 /// from the report.
 fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
-    let vera_home = vera_home.to_string_lossy();
-    let names_vera_home = |text: &str| text.contains(vera_home.as_ref());
+    // A prefix is not a path boundary: `${vera_home}-backup/bin/vera` starts
+    // with the same characters and belongs to somebody else. The symlink arm
+    // compares components, and the text arm requires a separator after the
+    // directory, so neither accepts a sibling whose name merely begins the same
+    // way.
+    let vera_home_prefix = format!("{}{}", vera_home.display(), std::path::MAIN_SEPARATOR);
+    let names_vera_home = |text: &str| text.contains(&vera_home_prefix);
     let mentions_vera = |text: &str| text.to_ascii_lowercase().contains("vera");
 
+    // `read_link` rather than anything that resolves the target: `vera_home` is
+    // already deleted by the time this runs, so an owned shim pointing into it
+    // is a dangling symlink and every existence check on the target says no.
     if let Ok(target) = fs::read_link(shim) {
-        let target = target.to_string_lossy().into_owned();
-        return if names_vera_home(&target) {
+        return if target.starts_with(vera_home) {
             ShimKind::Ours
-        } else if mentions_vera(&target) {
+        } else if mentions_vera(&target.to_string_lossy()) {
             ShimKind::Ambiguous
         } else {
             ShimKind::Unrelated
@@ -173,7 +180,12 @@ fn run_at(
     let mut left_in_place: Vec<(PathBuf, &str)> = Vec::new();
     for dir in shim_candidates(home, user_bin_dir) {
         let shim = dir.join(name);
-        if !shim.exists() {
+        // `symlink_metadata`, not `exists`: step 2 above has already removed
+        // `vera_home`, so a shim symlinked into it is now dangling and
+        // `exists()` — which follows the link — reports it as absent. That is
+        // how an owned shim could be left on PATH while the run still called
+        // itself complete.
+        if fs::symlink_metadata(&shim).is_err() {
             continue;
         }
         match classify_shim(&shim, vera_home) {
@@ -620,6 +632,77 @@ mod tests {
             ShimKind::Ambiguous,
             "case must not decide whether a stranger's file gets deleted"
         );
+    }
+
+    #[test]
+    fn a_sibling_directory_sharing_the_prefix_is_not_ours() {
+        // `${vera_home}-backup/bin/vera` starts with the same characters as
+        // vera_home and belongs to somebody else. A prefix is not a boundary.
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+        let backup = temp.path().join(".vera-backup");
+
+        let shim = temp.path().join("vera");
+        fs::write(
+            &shim,
+            format!("#!/bin/sh\nexec \"{}/bin/vera\" \"$@\"\n", backup.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            classify_shim(&shim, &vera_home),
+            ShimKind::Ambiguous,
+            "a sibling directory that merely shares the prefix must not be deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_a_sibling_directory_sharing_the_prefix_is_not_ours() {
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+        let target = temp.path().join(".vera-backup").join("bin").join("vera");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, BINARY_MAGIC).unwrap();
+        let link = temp.path().join("vera");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            classify_shim(&link, &vera_home),
+            ShimKind::Ambiguous,
+            "path comparison must be component-wise, not a string prefix"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_owned_symlink_is_removed_even_though_its_target_is_already_gone() {
+        // Uninstall deletes vera_home before it reaches the shim loop, so an
+        // owned shim symlinked into it is dangling by then. Anything that
+        // follows the link — `Path::exists`, `read_to_string` — reports it as
+        // absent, and the shim survives on PATH while the run reports success.
+        let roots = roots();
+        let target = roots.vera_home.join("bin").join("1.0.0").join("vera");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, BINARY_MAGIC).unwrap();
+        let link = roots.user_bin_dir.join(shim_name());
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (stdout, _) = uninstall(&roots, true);
+
+        assert!(
+            fs::symlink_metadata(&link).is_err(),
+            "the owned shim must be removed even though its target was deleted first"
+        );
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert!(
+            document["removed"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("PATH shim")),
+            "the removal must be reported, not silent: {stdout}"
+        );
+        assert_eq!(document["complete"], serde_json::json!(true), "{stdout}");
     }
 
     #[cfg(unix)]
