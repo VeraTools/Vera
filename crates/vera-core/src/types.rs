@@ -205,6 +205,31 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 
 /// Recursive glob matching helper.
 fn glob_match_recursive(pattern: &str, text: &str) -> bool {
+    // `HashSet::new` does not allocate until something is inserted, and only
+    // the wildcard arms insert, so a pattern that matches without backtracking
+    // pays nothing for this.
+    let mut failed = HashSet::new();
+    glob_match_memo(pattern, text, &mut failed)
+}
+
+/// `glob_match_recursive` with the set of states already known to fail.
+///
+/// Both wildcard arms try `rest` against every remaining position, so without
+/// memoization the same (pattern suffix, text suffix) pair is re-derived along
+/// every path that reaches it and each additional `**/` multiplies the work by
+/// the number of segments. Every recursive call passes a suffix of the original
+/// pattern and text, so the pair of remaining lengths identifies a state
+/// uniquely and recording the failures collapses the search to
+/// `O(pattern x text)`.
+///
+/// Only failures are recorded: a success returns immediately and is never
+/// revisited.
+fn glob_match_memo(pattern: &str, text: &str, failed: &mut HashSet<(usize, usize)>) -> bool {
+    let state = (pattern.len(), text.len());
+    if failed.contains(&state) {
+        return false;
+    }
+
     // Handle standalone `**` — matches everything (any path, any depth).
     if pattern == "**" {
         return true;
@@ -213,16 +238,17 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
     // Handle `**` patterns (match any path segments).
     if let Some(rest) = pattern.strip_prefix("**/") {
         // `**/X` matches X at any depth.
-        if glob_match_recursive(rest, text) {
+        if glob_match_memo(rest, text, failed) {
             return true;
         }
         // Try skipping path segments.
         for (i, ch) in text.char_indices() {
             let next = i + ch.len_utf8();
-            if ch == '/' && glob_match_recursive(rest, &text[next..]) {
+            if ch == '/' && glob_match_memo(rest, &text[next..], failed) {
                 return true;
             }
         }
+        failed.insert(state);
         return false;
     }
 
@@ -236,7 +262,7 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
     // Handle `*` within a segment (matches anything except `/`).
     if let Some(rest) = pattern.strip_prefix('*') {
         // Try matching * against 0..n characters (not crossing `/`).
-        if glob_match_recursive(rest, text) {
+        if glob_match_memo(rest, text, failed) {
             return true;
         }
         for (i, ch) in text.char_indices() {
@@ -244,10 +270,11 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
                 break;
             }
             let next = i + ch.len_utf8();
-            if glob_match_recursive(rest, &text[next..]) {
+            if glob_match_memo(rest, &text[next..], failed) {
                 return true;
             }
         }
+        failed.insert(state);
         return false;
     }
 
@@ -257,7 +284,7 @@ fn glob_match_recursive(pattern: &str, text: &str) -> bool {
     if let (Some(pc), Some(tc)) = (p_chars.next(), t_chars.next())
         && pc == tc
     {
-        return glob_match_recursive(p_chars.as_str(), t_chars.as_str());
+        return glob_match_memo(p_chars.as_str(), t_chars.as_str(), failed);
     }
 
     false
@@ -1579,6 +1606,50 @@ mod tests {
         // the directory-prefix fallback.
         assert!(glob_matches("app/[slug]", "app/[slug]/page.tsx"));
         assert!(!glob_matches("app/[slug]", "app/other/page.tsx"));
+    }
+
+    #[test]
+    fn glob_pathological_backtracking_pattern_terminates() {
+        // Repeated `**/` against a path that cannot match. Each repetition used
+        // to multiply the work by the number of segments, so through the CLI a
+        // 60-repetition pattern took 10 s and an 80-repetition one took 44 s.
+        //
+        // The budget covers one pure function call: no I/O, no threads, and no
+        // allocation beyond the memo set, so there is nothing else in the total.
+        //
+        // Repetitions are tuned against the unoptimized profile these tests
+        // actually run in, not a release build. Measured here with the memo
+        // removed: 9 repetitions 4.59 s, 8 repetitions 1.21 s, and it grows
+        // about 3x per repetition (12 repetitions took 162 s, which is why this
+        // is not set higher — a regression must fail, not hang). Memoized, the
+        // same call is microseconds. A 1 s ceiling is therefore ~5 orders above
+        // the fixed path and ~4.5x below the defective one, so no amount of
+        // scheduler jitter crosses it in either direction.
+        let pattern = "**/".repeat(9) + "x";
+        let path = "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/y/z.rs";
+
+        let started = std::time::Instant::now();
+        assert!(!glob_matches(&pattern, path));
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "pathological glob took {elapsed:?}; the matcher is backtracking without memoization"
+        );
+    }
+
+    #[test]
+    fn glob_memoization_preserves_wildcard_semantics() {
+        // The memo records failing states only, so a pattern that matches must
+        // still match no matter how many times a shared sub-state was reached
+        // and rejected on the way there.
+        assert!(glob_matches("**/**/**/*.rs", "a/b/c/d/main.rs"));
+        assert!(glob_matches("**/a/**/b/**/c.rs", "x/a/y/b/z/c.rs"));
+        assert!(!glob_matches("**/a/**/b/**/c.rs", "x/a/y/z/c.rs"));
+        // `*` still does not cross a separator, even after a failed branch has
+        // been memoized at the same text position.
+        assert!(!glob_matches("src/*/*.rs", "src/a/b/c.rs"));
+        assert!(glob_matches("src/*/*.rs", "src/a/b.rs"));
     }
 
     #[test]
