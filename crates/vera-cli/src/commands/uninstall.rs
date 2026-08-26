@@ -75,16 +75,12 @@ fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
     // compares components, and the text arm requires a separator after the
     // directory, so neither accepts a sibling whose name merely begins the same
     // way.
-    let vera_home_prefix = format!("{}{}", vera_home.display(), std::path::MAIN_SEPARATOR);
+    let shim_dir = shim.parent().unwrap_or(Path::new(""));
     let mentions_vera = |text: &str| text.to_ascii_lowercase().contains("vera");
     // Match on the stem rather than the whole file name: a `vera.cmd` launcher
     // execs `vera.exe`, so requiring the launcher's own name would stop
     // recognising our own Windows shim.
-    let is_vera_executable = |token: &str| {
-        Path::new(token)
-            .file_stem()
-            .is_some_and(|stem| stem == "vera")
-    };
+    let is_vera_executable = |token: &Path| token.file_stem().is_some_and(|stem| stem == "vera");
 
     // Ownership needs a line that *launches* something inside `vera_home`, not
     // a file that mentions the path anywhere. A foreign launcher naming
@@ -102,17 +98,20 @@ fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
         text.lines()
             .map(str::trim)
             .filter(|line| !is_comment_line(line))
-            .any(|line| {
-                launcher_tokens(line)
-                    .any(|token| token.starts_with(&vera_home_prefix) && is_vera_executable(&token))
+            .filter_map(launched_program)
+            .any(|program| {
+                let program = Path::new(&program);
+                is_vera_executable(program) && is_inside(program, shim_dir, vera_home)
             })
     };
 
     // `read_link` rather than anything that resolves the target: `vera_home` is
     // already deleted by the time this runs, so an owned shim pointing into it
     // is a dangling symlink and every existence check on the target says no.
+    // A relative target is resolved against the shim's own directory, which is
+    // what the filesystem would do, but lexically.
     if let Ok(target) = fs::read_link(shim) {
-        return if target.starts_with(vera_home) {
+        return if is_inside(&target, shim_dir, vera_home) {
             ShimKind::Ours
         } else if mentions_vera(&target.to_string_lossy()) {
             ShimKind::Ambiguous
@@ -145,6 +144,73 @@ fn is_comment_line(line: &str) -> bool {
     let lowered = line.to_ascii_lowercase();
     let lowered = lowered.strip_prefix('@').unwrap_or(&lowered);
     lowered == "rem" || lowered.starts_with("rem ") || lowered.starts_with("rem\t")
+}
+
+/// Lexically normalize a path, resolving `.` and `..` without touching disk.
+///
+/// `<vera_home>/bin/../../other/vera` passes a prefix test while resolving
+/// outside the directory entirely. Nothing here may resolve against the real
+/// filesystem: `vera_home` has already been deleted by the time these checks
+/// run, so `canonicalize` would fail on precisely the paths that matter.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `candidate`, resolved against `base` if relative, sits inside `root`.
+fn is_inside(candidate: &Path, base: &Path, root: &Path) -> bool {
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    lexically_normalize(&absolute).starts_with(lexically_normalize(root))
+}
+
+/// The program a launcher line executes, if the line executes one.
+///
+/// Only the program position counts. A foreign launcher can pass our binary
+/// path as an *argument* — `exec /usr/bin/backup --runner "<vera_home>/.../vera"`
+/// — and that is not our shim. Leading `exec`, `call`, `start`, `cmd /c` and
+/// environment assignments are skipped because every shim shape shipped today
+/// puts one of them before the program.
+///
+/// Deliberately not a shell parser. A line this does not understand yields
+/// `None`, which lands the file in `Ambiguous`: reported, never deleted. That
+/// is the safe direction for a rule that cannot be proven exhaustive, and it is
+/// why `Ambiguous` exists rather than a stricter rule alone.
+fn launched_program(line: &str) -> Option<String> {
+    // Strip a trailing sh comment. Batch comment *lines* are handled by
+    // `is_comment_line`; batch has no inline comment form worth modelling.
+    let line = match line.find(" #") {
+        Some(at) => &line[..at],
+        None => line,
+    };
+
+    for token in launcher_tokens(line) {
+        let bare = token.trim_start_matches('@');
+        let lowered = bare.to_ascii_lowercase();
+        let is_prelude = matches!(
+            lowered.as_str(),
+            "" | "exec" | "call" | "start" | "cmd" | "/c" | "/d" | "sh" | "-c"
+        );
+        // `VAR=value` prefixes, but not a path that happens to contain `=`.
+        let is_assignment = !bare.contains(std::path::MAIN_SEPARATOR) && bare.contains('=');
+        if is_prelude || is_assignment {
+            continue;
+        }
+        return Some(token);
+    }
+    None
 }
 
 /// Split a launcher line into candidate path tokens, keeping quoted runs whole.
@@ -766,6 +832,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(classify_shim(&ours, &vera_home), ShimKind::Ours);
+    }
+
+    #[test]
+    fn our_path_as_an_argument_is_not_our_launcher() {
+        // Only the program position counts. A tool that takes our binary as an
+        // argument runs something else, and deleting it would be deleting a
+        // stranger's file.
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+        let vera_bin = format!(
+            "{}{}bin{}1.0.0{}vera",
+            vera_home.display(),
+            MAIN_SEPARATOR,
+            MAIN_SEPARATOR,
+            MAIN_SEPARATOR
+        );
+
+        let runner = temp.path().join("runner");
+        fs::write(
+            &runner,
+            format!("#!/bin/sh\nexec /usr/bin/backup --runner \"{vera_bin}\" \"$@\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            classify_shim(&runner, &vera_home),
+            ShimKind::Ambiguous,
+            "our binary passed as an argument does not make this our launcher"
+        );
+
+        let inline_comment = temp.path().join("inline");
+        fs::write(
+            &inline_comment,
+            format!("#!/bin/sh\nexec /usr/bin/other \"$@\" # was {vera_bin}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            classify_shim(&inline_comment, &vera_home),
+            ShimKind::Ambiguous,
+            "a trailing comment is not a launch"
+        );
+
+        // Positive control, including the `exec` prelude and an env assignment.
+        let ours = temp.path().join("ours");
+        fs::write(
+            &ours,
+            format!("#!/bin/sh\nVERA_LOG=warn exec \"{vera_bin}\" \"$@\"\n"),
+        )
+        .unwrap();
+        assert_eq!(classify_shim(&ours, &vera_home), ShimKind::Ours);
+    }
+
+    #[test]
+    fn a_parent_traversal_escaping_the_data_directory_is_not_ours() {
+        // `<vera_home>/bin/../../other/vera` passes a prefix test and resolves
+        // outside. Normalization is lexical on purpose: vera_home is already
+        // deleted by the time this runs, so canonicalize would fail on exactly
+        // the paths that matter.
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+        let escaping = format!(
+            "{}{}bin{}..{}..{}other{}vera",
+            vera_home.display(),
+            MAIN_SEPARATOR,
+            MAIN_SEPARATOR,
+            MAIN_SEPARATOR,
+            MAIN_SEPARATOR,
+            MAIN_SEPARATOR
+        );
+
+        let shim = temp.path().join("vera");
+        fs::write(&shim, format!("#!/bin/sh\nexec \"{escaping}\" \"$@\"\n")).unwrap();
+
+        assert_eq!(
+            classify_shim(&shim, &vera_home),
+            ShimKind::Ambiguous,
+            "a target that traverses out of the data directory is not inside it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_owned_symlink_is_still_ours() {
+        // `ln -s` commonly writes a relative target. Resolving it against the
+        // shim's own directory is what the filesystem would do; without that a
+        // real shim is reported instead of removed.
+        let temp = tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let vera_home = temp.path().join(".vera");
+        let target = vera_home.join("bin").join("1.0.0").join("vera");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, BINARY_MAGIC).unwrap();
+
+        let link = bin.join("vera");
+        std::os::unix::fs::symlink(Path::new("..").join(".vera/bin/1.0.0/vera"), &link).unwrap();
+        assert!(
+            fs::read_link(&link).unwrap().is_relative(),
+            "fixture must be a relative symlink or it tests the absolute path again"
+        );
+
+        assert_eq!(classify_shim(&link, &vera_home), ShimKind::Ours);
     }
 
     #[test]
