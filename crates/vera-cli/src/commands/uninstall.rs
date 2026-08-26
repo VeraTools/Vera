@@ -42,13 +42,16 @@ fn shim_name() -> &'static str {
 /// What the file sitting at a shim candidate path actually is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShimKind {
-    /// A launcher we installed: a text script naming vera, or a symlink to one.
+    /// A launcher we installed: it points into the Vera data directory.
     Ours,
+    /// Readable text that mentions Vera but does not point into the data
+    /// directory, so it cannot be proven ours. Reported, never deleted.
+    Ambiguous,
     /// A file we cannot read as text, i.e. a compiled binary. `cargo install`
     /// puts the real executable on `PATH` rather than a shim, so this is a Vera
     /// the uninstaller did not install and does not own.
     ForeignBinary,
-    /// Readable text that says nothing about Vera. Someone else's `vera`.
+    /// Nothing to do with Vera. Someone else's `vera`.
     Unrelated,
 }
 
@@ -57,13 +60,34 @@ enum ShimKind {
 /// Split out from the removal loop because the previous inline check collapsed
 /// "this is not ours" and "I could not read this" into one `unwrap_or(false)`,
 /// which is exactly the distinction that decides whether the uninstall was
-/// complete. Pure, so all three outcomes can be tested.
-fn classify_shim(shim: &Path) -> ShimKind {
-    if fs::read_link(shim).is_ok_and(|target| target.to_string_lossy().contains("vera")) {
-        return ShimKind::Ours;
+/// complete. Pure, so every outcome can be tested.
+///
+/// Ownership is proven by pointing into `vera_home`, not by containing the
+/// substring "vera". A launcher naming `/opt/veracrypt`, or a symlink to
+/// `vera-tool`, contains it — and deleting a stranger's file is the one outcome
+/// here that cannot be undone. Anything that mentions Vera without proving
+/// ownership is `Ambiguous`: reported and left alone, so a real shim written by
+/// an install layout we do not recognise still surfaces instead of vanishing
+/// from the report.
+fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
+    let vera_home = vera_home.to_string_lossy();
+    let names_vera_home = |text: &str| text.contains(vera_home.as_ref());
+    let mentions_vera = |text: &str| text.to_ascii_lowercase().contains("vera");
+
+    if let Ok(target) = fs::read_link(shim) {
+        let target = target.to_string_lossy().into_owned();
+        return if names_vera_home(&target) {
+            ShimKind::Ours
+        } else if mentions_vera(&target) {
+            ShimKind::Ambiguous
+        } else {
+            ShimKind::Unrelated
+        };
     }
+
     match fs::read_to_string(shim) {
-        Ok(contents) if contents.contains("vera") => ShimKind::Ours,
+        Ok(contents) if names_vera_home(&contents) => ShimKind::Ours,
+        Ok(contents) if mentions_vera(&contents) => ShimKind::Ambiguous,
         Ok(_) => ShimKind::Unrelated,
         // Not valid UTF-8, or otherwise unreadable as text. The file is named
         // exactly `vera`/`vera.cmd` and sits in a bin directory, so treat it as
@@ -146,13 +170,13 @@ fn run_at(
     // 3. Remove the PATH shim.
     let name = shim_name();
     let mut removed_any_shim = false;
-    let mut left_in_place: Vec<PathBuf> = Vec::new();
+    let mut left_in_place: Vec<(PathBuf, &str)> = Vec::new();
     for dir in shim_candidates(home, user_bin_dir) {
         let shim = dir.join(name);
         if !shim.exists() {
             continue;
         }
-        match classify_shim(&shim) {
+        match classify_shim(&shim, vera_home) {
             ShimKind::Ours => {
                 fs::remove_file(&shim)?;
                 removed_any_shim = true;
@@ -160,22 +184,25 @@ fn run_at(
                     writeln!(stderr, "  Removed shim {}", shim.display())?;
                 }
             }
-            ShimKind::ForeignBinary => left_in_place.push(shim),
+            ShimKind::ForeignBinary => left_in_place.push((shim, "a binary, not a shim")),
+            ShimKind::Ambiguous => {
+                left_in_place.push((shim, "mentions Vera but does not point into its data dir"))
+            }
             ShimKind::Unrelated => {}
         }
     }
     if removed_any_shim {
         removed.push("PATH shim");
     }
-    for path in &left_in_place {
+    for (path, reason) in &left_in_place {
         writeln!(
             stderr,
-            "  Left in place: {} is a binary, not a shim we installed{}",
+            "  Left in place: {} — {reason}{}",
             path.display(),
             if is_cargo_bin(path) {
-                " — run `cargo uninstall vera` to remove it"
+                ". Run `cargo uninstall vera` to remove it"
             } else {
-                " — remove it yourself if you no longer want it"
+                ". Remove it yourself if you no longer want it"
             }
         )?;
     }
@@ -195,7 +222,7 @@ fn run_at(
                 "skills": removed_skills,
                 "left_in_place": left_in_place
                     .iter()
-                    .map(|path| path.display().to_string())
+                    .map(|(path, _)| path.display().to_string())
                     .collect::<Vec<_>>(),
             })
         )?;
@@ -495,7 +522,10 @@ mod tests {
         let shim = roots.user_bin_dir.join(shim_name());
         fs::write(
             &shim,
-            "#!/bin/sh\nexec \"$HOME/.vera/bin/1.0.0/vera\" \"$@\"\n",
+            format!(
+                "#!/bin/sh\nexec \"{}/bin/1.0.0/vera\" \"$@\"\n",
+                roots.vera_home.display()
+            ),
         )
         .unwrap();
 
@@ -535,31 +565,117 @@ mod tests {
         // the distinction that decides whether the uninstall was complete.
         let temp = tempdir().unwrap();
 
+        let vera_home = temp.path().join("home").join(".vera");
+
         let ours = temp.path().join("ours");
-        fs::write(&ours, "#!/bin/sh\nexec .../vera \"$@\"\n").unwrap();
-        assert_eq!(classify_shim(&ours), ShimKind::Ours);
+        fs::write(
+            &ours,
+            format!(
+                "#!/bin/sh\nexec \"{}/bin/1.0.0/vera\" \"$@\"\n",
+                vera_home.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(classify_shim(&ours, &vera_home), ShimKind::Ours);
 
         let binary = temp.path().join("binary");
         fs::write(&binary, BINARY_MAGIC).unwrap();
-        assert_eq!(classify_shim(&binary), ShimKind::ForeignBinary);
+        assert_eq!(classify_shim(&binary, &vera_home), ShimKind::ForeignBinary);
 
         let unrelated = temp.path().join("unrelated");
         fs::write(&unrelated, "#!/bin/sh\necho not this tool\n").unwrap();
-        assert_eq!(classify_shim(&unrelated), ShimKind::Unrelated);
+        assert_eq!(classify_shim(&unrelated, &vera_home), ShimKind::Unrelated);
+    }
+
+    #[test]
+    fn a_near_miss_name_is_never_deleted() {
+        // `contains("vera")` matches /opt/veracrypt and vera-tool. Deleting a
+        // stranger's launcher is the one outcome here that cannot be undone, so
+        // ownership must be proven by pointing into the data directory. These
+        // are reported rather than ignored: a real shim from an install layout
+        // we do not recognise lands here too, and must not vanish silently.
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+
+        let veracrypt = temp.path().join("veracrypt-launcher");
+        fs::write(
+            &veracrypt,
+            "#!/bin/sh\nexec /opt/veracrypt/bin/veracrypt \"$@\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            classify_shim(&veracrypt, &vera_home),
+            ShimKind::Ambiguous,
+            "a veracrypt launcher must never be classified as ours"
+        );
+
+        let capitalized = temp.path().join("capitalized");
+        fs::write(
+            &capitalized,
+            "#!/bin/sh\nexec /opt/VeraCrypt/bin/x \"$@\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            classify_shim(&capitalized, &vera_home),
+            ShimKind::Ambiguous,
+            "case must not decide whether a stranger's file gets deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_near_miss_target_is_never_deleted() {
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+        let target = temp.path().join("vera-tool");
+        fs::write(&target, "#!/bin/sh\necho other tool\n").unwrap();
+        let link = temp.path().join("vera");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            classify_shim(&link, &vera_home),
+            ShimKind::Ambiguous,
+            "a symlink to vera-tool is not proof of ownership"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_shim_is_reported_and_blocks_the_complete_claim() {
+        let roots = roots();
+        let shim = roots.user_bin_dir.join(shim_name());
+        fs::write(
+            &shim,
+            "#!/bin/sh\nexec /opt/veracrypt/bin/veracrypt \"$@\"\n",
+        )
+        .unwrap();
+
+        let (stdout, stderr) = uninstall(&roots, true);
+
+        assert!(shim.exists(), "an unproven file must never be deleted");
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["complete"], serde_json::json!(false), "{stdout}");
+        assert_eq!(
+            document["left_in_place"],
+            serde_json::json!([shim.display().to_string()]),
+            "{stdout}"
+        );
+        assert!(stderr.contains("Left in place"), "{stderr}");
     }
 
     #[cfg(unix)]
     #[test]
     fn classify_shim_recognizes_a_symlink_to_vera() {
         let temp = tempdir().unwrap();
-        let target = temp.path().join("vera-real");
+        let vera_home = temp.path().join(".vera");
+        let target = vera_home.join("bin").join("1.0.0").join("vera");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, BINARY_MAGIC).unwrap();
         let link = temp.path().join("vera");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         // Reached through the symlink arm, not the text arm: the target is
         // unreadable as text, so without that arm this would be ForeignBinary.
-        assert_eq!(classify_shim(&link), ShimKind::Ours);
+        assert_eq!(classify_shim(&link, &vera_home), ShimKind::Ours);
     }
 
     #[cfg(unix)]
