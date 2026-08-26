@@ -11,6 +11,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::parsing::type_relations::{RawTypeRelation, TypeRelationKind};
 use crate::types::{Chunk, Language, SymbolType};
 
+use super::SQL_PARAMETER_BATCH;
+
 /// A call site where a symbol is called from.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CallerRef {
@@ -172,10 +174,6 @@ const REQUIRED_TABLES: &[&str] = &[
     "references",
     "type_relations",
 ];
-
-/// Stay below SQLite's lowest plausible host-parameter limit so a single
-/// `IN (...)` batch never fails on large file sets.
-const SQL_PARAMETER_BATCH: usize = 900;
 
 /// SQLite-backed metadata store for chunk attributes.
 pub struct MetadataStore {
@@ -432,7 +430,7 @@ impl MetadataStore {
         }
     }
 
-    /// Get multiple chunks by id in a single query.
+    /// Get multiple chunks by id in bounded queries.
     ///
     /// Returns a lookup map keyed by chunk id rather than a `Vec`, because
     /// SQLite does not preserve any particular row order for `IN (...)`
@@ -443,29 +441,32 @@ impl MetadataStore {
             return Ok(HashMap::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT id, file_path, line_start, line_end, content, language,
-                    symbol_type, symbol_name
-             FROM chunks WHERE id IN ({placeholders})"
-        );
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .context("failed to prepare batch chunk query")?;
+        let mut chunks = HashMap::with_capacity(ids.len());
+        for batch in ids.chunks(SQL_PARAMETER_BATCH) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, file_path, line_start, line_end, content, language,
+                        symbol_type, symbol_name
+                 FROM chunks WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("failed to prepare batch chunk query")?;
 
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-                Ok(row_to_chunk(row))
-            })
-            .context("failed to query chunks by id batch")?;
-
-        let chunks: Vec<Chunk> = collect_rows(rows)?
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        Ok(chunks.into_iter().map(|c| (c.id.clone(), c)).collect())
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok(row_to_chunk(row))
+                })
+                .context("failed to query chunks by id batch")?;
+            for chunk in collect_rows(rows)? {
+                let chunk = chunk?;
+                chunks.insert(chunk.id.clone(), chunk);
+            }
+        }
+        Ok(chunks)
     }
 
     /// Get all chunks for a given file path.
@@ -2026,6 +2027,47 @@ mod tests {
         assert!(summaries.values().all(|summary| summary.chunk_count == 1));
         // No chunk set a symbol type, so the totals are empty rather than wrong.
         assert!(store.symbol_type_counts(&files).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_chunks_by_ids_covers_batches_beyond_the_parameter_limit() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let total = SQL_PARAMETER_BATCH + 50;
+        let chunks: Vec<Chunk> = (0..total)
+            .map(|index| Chunk {
+                id: format!("f{index}:0"),
+                file_path: format!("f{index}.rs"),
+                line_start: 1,
+                line_end: 1,
+                content: String::new(),
+                language: Language::Rust,
+                symbol_type: None,
+                symbol_name: None,
+            })
+            .collect();
+        store.insert_chunks(&chunks).unwrap();
+
+        // Pin the connection below the requested chunk count so a single IN
+        // query fails even on SQLite builds with a higher compiled ceiling.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                store.conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                SQL_PARAMETER_BATCH as i32,
+            );
+        }
+        let ids: Vec<String> = chunks.iter().map(|chunk| chunk.id.clone()).collect();
+        let found = store.get_chunks_by_ids(&ids).unwrap();
+
+        assert_eq!(found.len(), total);
+        assert_eq!(
+            found.get("f0:0").map(|chunk| chunk.file_path.as_str()),
+            Some("f0.rs")
+        );
+        assert_eq!(
+            found.get("f949:0").map(|chunk| chunk.file_path.as_str()),
+            Some("f949.rs")
+        );
     }
 
     #[test]

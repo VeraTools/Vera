@@ -21,6 +21,8 @@ use simsimd::SpatialSimilarity;
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::IntoBytes;
 
+use super::SQL_PARAMETER_BATCH;
+
 const PREFIX_RANGE_SQL: &str =
     "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2";
 const PREFIX_LOWER_BOUND_SQL: &str = "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1";
@@ -1416,30 +1418,35 @@ impl VectorStore {
             .collect()
     }
 
-    /// Resolve many rowids to their chunk ids in a single query.
+    /// Resolve many rowids to their chunk ids in bounded queries.
     fn chunk_ids_for_rowids(&self, rowids: &[i64]) -> Result<HashMap<i64, String>> {
         if rowids.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", rowids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        // Text varies with the number of ids, so plain `prepare` here too.
-        let mut stmt = self
-            .conn
-            .prepare(&format!(
-                "SELECT rowid, chunk_id FROM chunk_id_map WHERE rowid IN ({placeholders})"
-            ))
-            .context("failed to prepare chunk id lookup")?;
+        let mut mapped = HashMap::with_capacity(rowids.len());
+        for batch in rowids.chunks(SQL_PARAMETER_BATCH) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            // Text varies with the number of ids, so plain `prepare` here too.
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "SELECT rowid, chunk_id FROM chunk_id_map WHERE rowid IN ({placeholders})"
+                ))
+                .context("failed to prepare chunk id lookup")?;
 
-        let mapped = stmt
-            .query_map(rusqlite::params_from_iter(rowids.iter()), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .context("failed to query chunk ids")?
-            .collect::<std::result::Result<HashMap<_, _>, _>>()
-            .context("failed to collect chunk ids")?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("failed to query chunk ids")?;
+            mapped.extend(
+                rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+                    .context("failed to collect chunk ids")?,
+            );
+        }
         Ok(mapped)
     }
 
@@ -1794,9 +1801,10 @@ mod tests {
     }
 
     #[test]
-    fn chunk_id_batch_lookup_handles_4096_bound_parameters() {
+    fn chunk_id_batch_lookup_covers_batches_beyond_the_parameter_limit() {
         let store = VectorStore::open_in_memory(4).unwrap();
-        for index in 1..=4096 {
+        let total = SQL_PARAMETER_BATCH as i64 + 50;
+        for index in 1..=total {
             store
                 .conn
                 .execute(
@@ -1806,12 +1814,21 @@ mod tests {
                 .unwrap();
         }
 
-        let rowids: Vec<i64> = (1..=4096).collect();
+        // Pin the connection below the requested row count so a single IN
+        // query fails even on SQLite builds with a higher compiled ceiling.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                store.conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                SQL_PARAMETER_BATCH as i32,
+            );
+        }
+        let rowids: Vec<i64> = (1..=total).collect();
         let mapped = store.chunk_ids_for_rowids(&rowids).unwrap();
 
-        assert_eq!(mapped.len(), 4096);
+        assert_eq!(mapped.len(), total as usize);
         assert_eq!(mapped.get(&1).map(String::as_str), Some("chunk-1"));
-        assert_eq!(mapped.get(&4096).map(String::as_str), Some("chunk-4096"));
+        assert_eq!(mapped.get(&total).map(String::as_str), Some("chunk-950"));
     }
 
     #[test]
