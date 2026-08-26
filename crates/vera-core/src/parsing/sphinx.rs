@@ -460,6 +460,7 @@ fn strip_wrapping_quotes(input: &str) -> &str {
 mod tests {
     use super::{preprocess_rst, preprocess_rst_with_limit};
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn preprocess_inlines_relative_include() {
@@ -533,37 +534,31 @@ mod tests {
         assert!(!processed.contains(&"x".repeat(33)));
     }
 
-    #[test]
-    fn preprocess_terminates_on_include_cycle() {
-        let temp = tempfile::tempdir().unwrap();
-        let real_root = temp.path().canonicalize().unwrap();
-        let files = real_root.join("files");
-        fs::create_dir(&files).unwrap();
-
-        // Reach the fixture through a symlink so the as-written path differs
-        // from its canonical form on every platform. Without this the test
-        // only discriminates where TMPDIR itself contains a symlink: on macOS
-        // it does (/var -> /private/var), on Linux it does not, so reverting
-        // the seed fix leaves this test green there.
-        let root = real_root.join("link");
-        std::os::unix::fs::symlink(&files, &root).unwrap();
-
+    /// Write the root.rst <-> child.rst cycle under `root` and expand it.
+    ///
+    /// Bodies are deliberately distinct from the directive text: asserting
+    /// `contains("root")` would be satisfied by `.. include:: root.rst` even
+    /// if nothing had been expanded.
+    fn expand_include_cycle(root: &Path) -> String {
         let source_path = root.join("root.rst");
         let child_path = root.join("child.rst");
 
-        // Distinct from the directive text: `contains("root")` would be
-        // satisfied by `.. include:: root.rst` even if nothing was expanded.
         fs::write(&child_path, "CHILD-BODY\n.. include:: root.rst\n").unwrap();
         let source = "ROOT-BODY\n.. include:: child.rst\n";
         fs::write(&source_path, source).unwrap();
-        let processed = preprocess_rst_with_limit(source, &source_path, &root, 128).unwrap();
+        preprocess_rst_with_limit(source, &source_path, root, 128).unwrap()
+    }
 
-        // The cycle edge back to root.rst stays literal, and each body is
-        // expanded exactly once. An uncanonical stack seed fails to match the
-        // canonical entry pushed beneath it, so root.rst is expanded a second
-        // time at depth 2 and `.. include:: child.rst` survives as the literal
-        // instead: the discriminating checks are the exact expansion and the
-        // ROOT-BODY count, which reaches 2. CHILD-BODY stays at 1 either way.
+    /// The cycle edge back to root.rst stays literal and each body is expanded
+    /// exactly once.
+    ///
+    /// An uncanonical stack seed fails to match the canonical entry pushed
+    /// beneath it, so root.rst is expanded a second time at depth 2 and
+    /// `.. include:: child.rst` survives as the literal instead. The
+    /// discriminating checks are the exact expansion and the ROOT-BODY count,
+    /// which reaches 2; CHILD-BODY stays at 1 in both states and is asserted
+    /// as the negative half, pinning that the child body is not duplicated.
+    fn assert_cycle_terminated(processed: &str) {
         assert_eq!(
             processed, "ROOT-BODY\nCHILD-BODY\n.. include:: root.rst\n",
             "cycle should terminate at the first repeat of root.rst"
@@ -619,6 +614,37 @@ mod tests {
         lines_c_first.sort_unstable();
         assert_eq!(lines_b_first, lines_c_first);
         assert_eq!(expanded_b_first.len(), expanded_c_first.len());
+    }
+
+    #[test]
+    fn preprocess_terminates_on_include_cycle() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_cycle_terminated(&expand_include_cycle(temp.path()));
+    }
+
+    /// Whether this catches a non-canonical stack seed depends on the path it
+    /// is given, so it cannot be folded into the test above: under a `TMPDIR`
+    /// that is already canonical the seed compares equal anyway and the bug
+    /// does not reproduce. macOS has the symlink by luck (`/var` ->
+    /// `/private/var`), Linux does not, so reaching the fixture through an
+    /// explicit symlink is what makes the regression reproducible on both.
+    #[cfg(unix)]
+    #[test]
+    fn preprocess_terminates_on_include_cycle_under_a_symlinked_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_root = temp.path().canonicalize().unwrap();
+        let files = real_root.join("files");
+        fs::create_dir(&files).unwrap();
+
+        let root = real_root.join("link");
+        std::os::unix::fs::symlink(&files, &root).unwrap();
+        assert_ne!(
+            root,
+            root.canonicalize().unwrap(),
+            "fixture must be reached through a path that is not its own canonical form"
+        );
+
+        assert_cycle_terminated(&expand_include_cycle(&root));
     }
 
     #[test]
