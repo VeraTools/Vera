@@ -262,13 +262,22 @@ pub fn read_source_lossy_capped(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "{} is larger than the {max_file_size_bytes} byte limit; it grew after it was indexed",
+                "{} exceeds the {max_file_size_bytes} byte file size limit",
                 relative_path.display()
             ),
         ));
     }
 
     Ok(lossy_string(bytes))
+}
+
+/// Whether a read failed because the file is over the size limit.
+///
+/// Callers skip either way, but the two cases deserve different volume: an
+/// unreadable file is ordinary, while a file silently dropped from results for
+/// being oversized is something the user needs told.
+pub fn is_size_limit_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::InvalidData
 }
 
 fn lossy_string(bytes: Vec<u8>) -> String {
@@ -1380,7 +1389,7 @@ mod tests {
             .expect_err("a file past the limit must not be read");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
-            err.to_string().contains("over.rs") && err.to_string().contains("larger than"),
+            err.to_string().contains("over.rs") && err.to_string().contains("exceeds"),
             "the error must say which file and why, it reaches a user-facing warning: {err}"
         );
 

@@ -54,8 +54,15 @@ pub fn search_explicit_implementations(
             max_file_size_bytes,
         ) {
             Ok(content) => content,
-            Err(e) => {
-                tracing::debug!("skipping {}: {e}", relation.file_path);
+            Err(err) => {
+                // A file dropped from results for being oversized is not an
+                // ordinary read failure: without this the results are simply
+                // missing entries with nothing said.
+                if crate::discovery::is_size_limit_error(&err) {
+                    tracing::warn!("skipping {}: {err}", relation.file_path);
+                } else {
+                    tracing::debug!("skipping {}: {err}", relation.file_path);
+                }
                 continue;
             }
         };

@@ -117,6 +117,11 @@ pub struct LanguageHealthStat {
     pub files_with_parse_failures: u64,
 }
 
+/// `index_metadata` key recording the size limit the index was built with.
+///
+/// Shared so the writer and the reader cannot drift apart.
+pub const MAX_FILE_SIZE_META_KEY: &str = "max_file_size_bytes";
+
 /// Case-insensitive lookup queries, held as constants so the query-plan tests
 /// assert against the exact text the production methods run.
 ///
@@ -124,11 +129,6 @@ pub struct LanguageHealthStat {
 /// query text. A test that asserted on its own copy of the SQL would keep
 /// passing after the original drifted, and the planner would silently fall
 /// back to a full scan with nothing failing.
-/// `index_metadata` key recording the size limit the index was built with.
-///
-/// Shared so the writer and the reader cannot drift apart.
-pub const MAX_FILE_SIZE_META_KEY: &str = "max_file_size_bytes";
-
 const SQL_CHUNKS_BY_SYMBOL_NAME: &str =
     "SELECT id, file_path, line_start, line_end, content, language,
                         symbol_type, symbol_name

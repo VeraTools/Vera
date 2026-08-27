@@ -81,7 +81,17 @@ pub fn search_regex(
             max_file_size_bytes,
         ) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(err) => {
+                // A file dropped from results for being oversized is not an
+                // ordinary read failure: without this the results are simply
+                // missing entries with nothing said.
+                if crate::discovery::is_size_limit_error(&err) {
+                    tracing::warn!("skipping {}: {err}", file_rel);
+                } else {
+                    tracing::debug!("skipping {}: {err}", file_rel);
+                }
+                continue;
+            }
         };
         let class = classify_content(file_rel, language, &content);
 
@@ -261,6 +271,62 @@ mod tests {
         .unwrap();
 
         assert_eq!(results[0].file_path, "src/hotkeys.ts");
+    }
+
+    #[test]
+    fn a_file_that_grew_past_the_indexed_limit_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        let index_dir = repo_root.join(".vera");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::create_dir_all(&index_dir).unwrap();
+
+        let store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        // Stamp a small limit, as an index built with that setting would.
+        store
+            .set_index_meta(crate::storage::metadata::MAX_FILE_SIZE_META_KEY, "64")
+            .unwrap();
+        for name in ["small.rs", "grown.rs"] {
+            store
+                .insert_chunks(&[Chunk {
+                    id: format!("{name}:0"),
+                    file_path: format!("src/{name}"),
+                    line_start: 1,
+                    line_end: 1,
+                    content: "fn target_symbol() {}".to_string(),
+                    language: Language::Rust,
+                    symbol_type: None,
+                    symbol_name: None,
+                }])
+                .unwrap();
+        }
+
+        // Both are indexed and both contain the pattern on disk. Only the size
+        // differs, so a result set that keeps `grown.rs` proves the read was
+        // not bounded rather than that the file was missing or unmatched.
+        std::fs::write(repo_root.join("src/small.rs"), "fn target_symbol() {}\n").unwrap();
+        std::fs::write(
+            repo_root.join("src/grown.rs"),
+            format!("fn target_symbol() {{}}\n{}\n", "z".repeat(4096)),
+        )
+        .unwrap();
+
+        let results = search_regex(
+            &index_dir,
+            "target_symbol",
+            10,
+            false,
+            0,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+
+        let files: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["src/small.rs"],
+            "the file within the limit must still match, and the grown one must not"
+        );
     }
 
     #[test]

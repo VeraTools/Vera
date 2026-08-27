@@ -333,6 +333,17 @@ where
     let metadata_store =
         MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
 
+    // Re-stamp the size limit: an incremental update can run with a different
+    // `indexing.max_file_size_bytes` than the full index was built with, and
+    // retrieval reads this value to bound its own reads. Leaving the old stamp
+    // makes retrieval skip files this update just indexed.
+    metadata_store
+        .set_index_meta(
+            crate::storage::metadata::MAX_FILE_SIZE_META_KEY,
+            &config.indexing.max_file_size_bytes.to_string(),
+        )
+        .context("failed to record max_file_size_bytes")?;
+
     let mut stored_dim = config.embedding.max_stored_dim;
 
     // Check for provider mismatch.

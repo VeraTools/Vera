@@ -67,7 +67,17 @@ pub fn search_callers_through(
             max_file_size_bytes,
         ) {
             Ok(content) => content,
-            Err(_) => continue,
+            Err(err) => {
+                // A file dropped from results for being oversized is not an
+                // ordinary read failure: without this the results are simply
+                // missing entries with nothing said.
+                if crate::discovery::is_size_limit_error(&err) {
+                    tracing::warn!("skipping {}: {err}", caller.file_path);
+                } else {
+                    tracing::debug!("skipping {}: {err}", caller.file_path);
+                }
+                continue;
+            }
         };
         let class = classify_content(&caller.file_path, language, &content);
         if !allows_class(filters, class) {
