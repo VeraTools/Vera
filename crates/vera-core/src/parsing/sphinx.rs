@@ -55,6 +55,7 @@ pub(crate) fn preprocess_rst_with_limit(
     let mut context = IncludeResolutionContext {
         canonical_repo_root: &canonical_repo_root,
         stack: &mut stack,
+        ancestor_ids: Vec::new(),
         stack_ids: FileSet::default(),
         file_ids: HashMap::new(),
         expansion_cache: &mut expansion_cache,
@@ -62,7 +63,13 @@ pub(crate) fn preprocess_rst_with_limit(
         max_file_size_bytes,
     };
 
-    let root_id = context.file_id(current_file);
+    // Intern the seed that was actually pushed, not `current_file`: they differ
+    // whenever canonicalization changes the path (macOS /var, symlinked
+    // checkouts), and every dependency id comes from the canonical form that
+    // `resolve_include_path` returns.
+    let seed = context.stack[0].clone();
+    let root_id = context.file_id(&seed);
+    context.ancestor_ids.push(root_id);
     context.stack_ids.insert(root_id);
 
     let (expanded, _deps) =
@@ -97,8 +104,11 @@ fn toctree_entry_re() -> &'static Regex {
 struct IncludeResolutionContext<'a> {
     canonical_repo_root: &'a Path,
     stack: &'a mut Vec<PathBuf>,
-    /// The same ancestors as `stack`, as a bitset, so validity checks are word
-    /// operations rather than repeated path comparisons.
+    /// The same ancestors as `stack`, kept as ids so the bitset can be rebuilt
+    /// after a pop without cloning and re-hashing every ancestor path.
+    ancestor_ids: Vec<usize>,
+    /// `ancestor_ids` as a bitset, so validity checks are word operations
+    /// rather than repeated path comparisons.
     stack_ids: FileSet,
     file_ids: HashMap<PathBuf, usize>,
     expansion_cache: &'a mut HashMap<PathBuf, CachedExpansion>,
@@ -181,7 +191,14 @@ struct CachedExpansion {
 
 impl CachedExpansion {
     fn is_valid_for(&self, stack: &FileSet, depth: usize) -> bool {
-        if self.deps.truncated_by_depth && self.built_at_depth != depth {
+        if self.deps.truncated_by_depth {
+            // Describes the cap at the depth it was built at, nothing more.
+            if self.built_at_depth != depth {
+                return false;
+            }
+        } else if depth + self.deps.height >= MAX_INCLUDE_DEPTH {
+            // Fully expanded, but its deepest descendant would not fit here.
+            // Replaying it would return more than this position should hold.
             return false;
         }
         self.deps.is_valid_for(stack)
@@ -189,16 +206,24 @@ impl CachedExpansion {
 }
 
 impl<'a> IncludeResolutionContext<'a> {
-    /// Recompute the ancestor bitset after a pop.
+    fn push_ancestor(&mut self, path: PathBuf, id: usize) {
+        self.stack.push(path);
+        self.ancestor_ids.push(id);
+        self.stack_ids.insert(id);
+    }
+
+    /// Drop the innermost ancestor and rebuild the bitset from the ids that
+    /// remain.
     ///
-    /// The stack is at most `MAX_INCLUDE_DEPTH` deep, so this is cheaper than
-    /// threading removal through the bitset and cannot drift from `stack`.
-    fn rebuild_stack_ids(&mut self) {
-        let ancestors = self.stack.clone();
+    /// A bitset cannot be un-set by id alone — the same file can appear at more
+    /// than one depth — and the stack is at most `MAX_INCLUDE_DEPTH` deep, so
+    /// rebuilding from ids is cheap and cannot drift from `stack`.
+    fn pop_ancestor(&mut self) {
+        self.stack.pop();
+        self.ancestor_ids.pop();
         self.stack_ids = FileSet::default();
-        for ancestor in ancestors {
-            let id = self.file_id(&ancestor);
-            self.stack_ids.insert(id);
+        for id in &self.ancestor_ids {
+            self.stack_ids.insert(*id);
         }
     }
 
@@ -221,6 +246,13 @@ struct ExpansionDeps {
     /// already was rather than of the file, so such a result may only be reused
     /// at the same depth.
     truncated_by_depth: bool,
+    /// Levels of include nesting below this expansion, 0 for one with none.
+    ///
+    /// A fully expanded entry is still depth-sensitive: replayed at a site deep
+    /// enough that fresh evaluation would have hit the cap, it returns more
+    /// than the expansion at that position should contain, and the result then
+    /// depends on which branch populated the cache first.
+    height: usize,
 }
 
 impl ExpansionDeps {
@@ -228,6 +260,7 @@ impl ExpansionDeps {
         self.suppressed.union_with(&other.suppressed);
         self.inlined.union_with(&other.inlined);
         self.truncated_by_depth |= other.truncated_by_depth;
+        self.height = self.height.max(other.height + 1);
     }
 
     /// Whether an expansion with these dependencies is valid under `stack`.
@@ -298,8 +331,7 @@ fn resolve_includes_recursive(
                     } else {
                         match read_include_file(&include_path, context.max_file_size_bytes)? {
                             Some(include_text) => {
-                                context.stack.push(include_path.clone());
-                                context.stack_ids.insert(include_id);
+                                context.push_ancestor(include_path.clone(), include_id);
                                 let (resolved, child_deps) = resolve_includes_recursive(
                                     &include_text,
                                     &include_path,
@@ -307,8 +339,7 @@ fn resolve_includes_recursive(
                                     context.output_budget,
                                     context,
                                 )?;
-                                context.stack.pop();
-                                context.rebuild_stack_ids();
+                                context.pop_ancestor();
                                 let resolved: Arc<str> = Arc::from(resolved);
                                 context.expansion_cache.insert(
                                     include_path.clone(),
@@ -768,6 +799,70 @@ mod tests {
             "a cycle-free shared include expands on every branch:\n{processed}"
         );
         assert!(processed.contains("X-BODY") && processed.contains("Y-BODY"));
+    }
+
+    /// Build a tree where `shared.rst` is reachable both near the root and at
+    /// the bottom of a chain long enough that expanding it there would cross
+    /// `MAX_INCLUDE_DEPTH`, and expand it with the two branches in `order`.
+    fn expand_shallow_and_deep(root: &Path, order: [&str; 2]) -> String {
+        // shared.rst has a subtree of its own, so where it is expanded decides
+        // how much of that subtree fits under the cap.
+        for i in 0..4 {
+            fs::write(
+                root.join(format!("sub{i}.rst")),
+                format!("SUB{i}\n.. include:: sub{}.rst\n", i + 1),
+            )
+            .unwrap();
+        }
+        fs::write(root.join("sub4.rst"), "SUB-LEAF\n").unwrap();
+        fs::write(root.join("shared.rst"), "SHARED\n.. include:: sub0.rst\n").unwrap();
+
+        // A chain that reaches shared.rst just under the cap.
+        let chain = super::MAX_INCLUDE_DEPTH - 2;
+        for i in 0..chain {
+            let next = if i + 1 == chain {
+                "shared.rst".to_string()
+            } else {
+                format!("deep{}.rst", i + 1)
+            };
+            fs::write(
+                root.join(format!("deep{i}.rst")),
+                format!("DEEP{i}\n.. include:: {next}\n"),
+            )
+            .unwrap();
+        }
+
+        let source = format!(
+            "TOP\n.. include:: {}\n.. include:: {}\n",
+            order[0], order[1]
+        );
+        let source_path = root.join("top.rst");
+        fs::write(&source_path, &source).unwrap();
+        preprocess_rst_with_limit(&source, &source_path, root, 4096).unwrap()
+    }
+
+    #[test]
+    fn a_cached_expansion_is_not_replayed_where_the_depth_cap_would_bite() {
+        let shallow_first = tempfile::tempdir().unwrap();
+        let deep_first = tempfile::tempdir().unwrap();
+
+        // Same files, same graph. Only which branch populates the cache first
+        // differs, and that must not decide what the other branch gets: an
+        // entry expanded near the root reaches deeper than one expanded at the
+        // bottom of the chain is allowed to.
+        let a = expand_shallow_and_deep(shallow_first.path(), ["shared.rst", "deep0.rst"]);
+        let b = expand_shallow_and_deep(deep_first.path(), ["deep0.rst", "shared.rst"]);
+
+        let sorted = |text: &str| {
+            let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            lines.sort_unstable();
+            lines.join("\n")
+        };
+        assert_eq!(
+            sorted(&a),
+            sorted(&b),
+            "cache population order changed the expansion:\n--- shallow first ---\n{a}\n--- deep first ---\n{b}"
+        );
     }
 
     #[test]
