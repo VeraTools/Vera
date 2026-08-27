@@ -175,6 +175,11 @@ impl SearchFilters {
     /// Exposed so the CLI can say which pattern was the empty one rather than
     /// guessing, and pure so it can be tested without an index.
     pub fn path_patterns_matching_nothing<'a>(&'a self, files: &[impl AsRef<str>]) -> Vec<&'a str> {
+        // An empty index excludes everything on its own, so every pattern would
+        // look unmatched and the filter would be blamed for it.
+        if files.is_empty() {
+            return Vec::new();
+        }
         self.path_glob
             .iter()
             .filter(|pattern| {
@@ -1558,6 +1563,11 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.path_patterns_matching_nothing(&files).is_empty());
+
+        // An empty index is not the filter's doing: every pattern would look
+        // unmatched and the note would blame the wrong thing.
+        let empty: Vec<String> = Vec::new();
+        assert!(filters.path_patterns_matching_nothing(&empty).is_empty());
 
         // And no filter means nothing to say.
         assert!(

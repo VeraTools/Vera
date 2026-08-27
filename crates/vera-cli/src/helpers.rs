@@ -823,14 +823,25 @@ pub fn path_filter_hint(
         vera_core::storage::metadata::MetadataStore::open(&index_dir.join("metadata.db")).ok()?;
     let files = store.indexed_files().ok()?;
     let unmatched = filters.path_patterns_matching_nothing(&files);
-    if unmatched.is_empty() {
+    // `path_glob` is OR-combined, so one working pattern still admits files and
+    // the empty result is then a genuine miss rather than the filter's doing.
+    if unmatched.is_empty() || unmatched.len() != filters.path_glob.len() {
         return None;
     }
 
     let quoted: Vec<String> = unmatched.iter().map(|p| format!("`{p}`")).collect();
     let suggestions: Vec<String> = unmatched
         .iter()
-        .filter(|pattern| pattern.contains('*') && !pattern.ends_with("**"))
+        // Only directory-shaped patterns. Appending `/**` to a file glob gives
+        // `*.rs/**`, which asks for files beneath a directory named `*.rs`.
+        .filter(|pattern| {
+            pattern.contains('*')
+                && !pattern.ends_with("**")
+                && !pattern
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|segment| segment.contains('.'))
+        })
         .map(|pattern| format!("`{}/**`", pattern.trim_end_matches('/')))
         .collect();
 
