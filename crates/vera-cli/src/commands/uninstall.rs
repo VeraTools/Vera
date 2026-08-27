@@ -167,13 +167,26 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 }
 
 /// Whether `candidate`, resolved against `base` if relative, sits inside `root`.
+///
+/// Both operands are made absolute first. `VERA_HOME` is taken verbatim
+/// (`local_models::vera_home_dir`), so it can be relative: `VERA_HOME=.`
+/// normalizes to the empty path, and every path starts with that — which would
+/// classify every executable-shaped launcher on `PATH` as ours and delete it.
 fn is_inside(candidate: &Path, base: &Path, root: &Path) -> bool {
-    let absolute = if candidate.is_absolute() {
+    let candidate = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         base.join(candidate)
     };
-    lexically_normalize(&absolute).starts_with(lexically_normalize(root))
+
+    let (Ok(candidate), Ok(root)) = (std::path::absolute(&candidate), std::path::absolute(root))
+    else {
+        // Only fails when the process has no usable cwd. Refusing to claim
+        // ownership is the safe answer: the file is reported, not deleted.
+        return false;
+    };
+
+    lexically_normalize(&candidate).starts_with(lexically_normalize(&root))
 }
 
 /// The program a launcher line executes, if the line executes one.
@@ -881,6 +894,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(classify_shim(&ours, &vera_home), ShimKind::Ours);
+    }
+
+    #[test]
+    fn a_relative_data_dir_does_not_make_everything_ours() {
+        // VERA_HOME is taken verbatim, so it can be relative. `.` normalizes to
+        // the empty path and every path starts with that, which would classify
+        // every executable-shaped launcher on PATH as ours and delete it.
+        let temp = tempdir().unwrap();
+        let stranger = temp.path().join("vera");
+        fs::write(
+            &stranger,
+            "#!/bin/sh\nexec /opt/somebody-else/bin/vera \"$@\"\n",
+        )
+        .unwrap();
+
+        for relative in [".", "./", "relative/.vera"] {
+            assert_eq!(
+                classify_shim(&stranger, Path::new(relative)),
+                ShimKind::Ambiguous,
+                "VERA_HOME={relative:?} must not make a stranger's launcher ours"
+            );
+        }
     }
 
     #[test]
