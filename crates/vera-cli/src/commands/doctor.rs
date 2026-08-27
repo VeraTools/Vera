@@ -108,14 +108,38 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
 
             match embedding_model {
                 Some(embedding_model) => {
-                    let model_assets = vera_core::local_models::inspect_local_model_files_for_ep(
+                    // Inspecting the assets can fail on its own — an unreadable
+                    // model directory, a revision that cannot be resolved — and
+                    // that is another thing to report rather than a reason to
+                    // abandon the checks already gathered.
+                    match vera_core::local_models::inspect_local_model_files_for_ep(
                         ep,
                         &embedding_model,
-                    )?;
-                    let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
-                    checks.push(local_model_assets_check(&model_assets, &repair_hint));
-                    if probe {
-                        checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
+                    ) {
+                        Ok(model_assets) => {
+                            let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
+                            checks.push(local_model_assets_check(&model_assets, &repair_hint));
+                            if probe {
+                                checks.extend(probe_local_backend(
+                                    ep,
+                                    &runtime_path,
+                                    &model_assets,
+                                )?);
+                            }
+                        }
+                        Err(err) => {
+                            checks.push(DoctorCheck {
+                                name: "local-model-assets",
+                                status: CheckStatus::Fail,
+                                detail: one_line_error(&err),
+                            });
+                            if probe {
+                                checks.push(skipped_check(
+                                    "probe",
+                                    "skipped: the local model assets could not be inspected",
+                                ));
+                            }
+                        }
                     }
                 }
                 None => {
@@ -141,13 +165,29 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
                 status: CheckStatus::Ok,
                 detail: vera_core::local_models::potion_code_model_name(),
             });
-            let model_assets = vera_core::local_models::inspect_potion_code_model_files()?;
-            checks.push(local_model_assets_check(
-                &model_assets,
-                "run `vera repair --potion-code`",
-            ));
-            if probe {
-                checks.extend(probe_potion_backend(&model_assets));
+            match vera_core::local_models::inspect_potion_code_model_files() {
+                Ok(model_assets) => {
+                    checks.push(local_model_assets_check(
+                        &model_assets,
+                        "run `vera repair --potion-code`",
+                    ));
+                    if probe {
+                        checks.extend(probe_potion_backend(&model_assets));
+                    }
+                }
+                Err(err) => {
+                    checks.push(DoctorCheck {
+                        name: "local-model-assets",
+                        status: CheckStatus::Fail,
+                        detail: one_line_error(&err),
+                    });
+                    if probe {
+                        checks.push(skipped_check(
+                            "probe",
+                            "skipped: the local model assets could not be inspected",
+                        ));
+                    }
+                }
             }
         }
         vera_core::config::InferenceBackend::Api => {
