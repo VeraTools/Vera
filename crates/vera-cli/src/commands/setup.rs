@@ -461,38 +461,29 @@ fn windows_backend(has_adapter: bool) -> Option<InferenceBackend> {
     has_adapter.then_some(InferenceBackend::OnnxJina(OnnxExecutionProvider::DirectMl))
 }
 
-/// Whether Windows reports a display adapter DirectML could run on.
+/// Whether a Direct3D 12 adapter DirectML can run on was confirmed.
 ///
-/// Deliberately not behind `cfg(target_os = "windows")`: the body is compiled
-/// and type-checked on every platform, and the early return is what makes it
-/// false elsewhere. There is no Windows job in CI and this was written on
-/// macOS, so a `cfg`-gated body would be code nobody had compiled.
+/// Always false, deliberately, and that is the fix rather than a stub.
 ///
-/// A probe that cannot run answers "no", which falls through to the CPU
-/// default. That is the safe direction: the cost of a wrong "no" is a slower
-/// backend, and the cost of a wrong "yes" is a provider that fails when a
-/// session is built.
+/// The branch this feeds used to return DirectML unconditionally, so a Windows
+/// machine with no suitable GPU was auto-assigned a provider that fails when a
+/// session is built. Confirming the opposite needs `D3D12CreateDevice`: a
+/// `cfg(windows)` dependency on `windows-sys` and an `unsafe` call. A cheaper
+/// shell-out that lists display adapters was tried and rejected in review, and
+/// the rejection was right — a non-Basic adapter is not proof of Direct3D 12
+/// support, so a legacy or virtual adapter would still select DirectML and
+/// still fail later.
+///
+/// Unconfirmed therefore means "no", which falls through to the CPU default
+/// exactly as every other platform does when its probe finds nothing. Windows
+/// users with a real Direct3D 12 GPU can still choose DirectML from the setup
+/// menu or `--backend`; what they no longer get is it chosen for them on
+/// evidence nobody has.
+///
+/// Wired as a function rather than deleted so a real probe has one place to
+/// go, and so the decision it feeds stays covered by the tests below.
 fn has_directx12_adapter() -> bool {
-    if !cfg!(target_os = "windows") {
-        return false;
-    }
-
-    // `wmic` is deprecated and absent on current Windows; CIM is the supported
-    // replacement. Any adapter other than the Basic Display Adapter, which is
-    // the software fallback Windows uses when no real driver is present.
-    let probe = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "if (Get-CimInstance Win32_VideoController | \
-              Where-Object { $_.Name -notmatch 'Basic Display Adapter' }) { exit 0 } else { exit 1 }",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    probe.is_ok_and(|status| status.success())
+    false
 }
 
 /// Show an interactive backend selection menu. Potion Code is the default.
@@ -854,16 +845,13 @@ mod tests {
         // no Windows job in CI, a `cfg`-gated test would assert nothing
         // anywhere it could actually run.
         //
-        // Off Windows the probe must answer "no" without shelling out, so
-        // `detect_gpu` cannot reach DirectML here and every other platform's
-        // detection is unaffected. On Windows the honest answer depends on the
-        // machine, so there is nothing to assert: the probe result is the
-        // input to the decision below, not something this test can predict.
-        #[cfg(not(target_os = "windows"))]
+        // No Direct3D 12 support is confirmable without `D3D12CreateDevice`,
+        // so nothing may be confirmed — on any host, Windows included. This is
+        // the property that stops DirectML being auto-selected on evidence
+        // that does not establish it.
         assert!(
             !has_directx12_adapter(),
-            "the probe must be inert off Windows; it is compiled everywhere so \
-             the Windows branch is type-checked, not so it runs"
+            "DirectML must not be auto-selected until a probe actually confirms an adapter"
         );
 
         // The decision itself, which is what actually changed. Asserting on
