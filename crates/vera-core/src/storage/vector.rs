@@ -21,7 +21,7 @@ use simsimd::SpatialSimilarity;
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::IntoBytes;
 
-use super::SQL_PARAMETER_BATCH;
+use super::{SQL_PARAMETER_BATCH, sql_placeholders};
 
 const PREFIX_RANGE_SQL: &str =
     "SELECT rowid FROM chunk_id_map WHERE chunk_id >= ?1 AND chunk_id < ?2";
@@ -1426,9 +1426,7 @@ impl VectorStore {
 
         let mut mapped = HashMap::with_capacity(rowids.len());
         for batch in rowids.chunks(SQL_PARAMETER_BATCH) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = sql_placeholders(batch.len());
             // Text varies with the number of ids, so plain `prepare` here too.
             let mut stmt = self
                 .conn

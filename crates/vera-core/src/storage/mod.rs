@@ -11,6 +11,12 @@
 /// storage lookups remain portable across SQLite builds.
 const SQL_PARAMETER_BATCH: usize = 900;
 
+fn sql_placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub mod bm25;
 pub mod metadata;
 pub mod vector;

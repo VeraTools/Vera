@@ -11,7 +11,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::parsing::type_relations::{RawTypeRelation, TypeRelationKind};
 use crate::types::{Chunk, Language, SymbolType};
 
-use super::SQL_PARAMETER_BATCH;
+use super::{SQL_PARAMETER_BATCH, sql_placeholders};
 
 /// A call site where a symbol is called from.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -443,9 +443,7 @@ impl MetadataStore {
 
         let mut chunks = HashMap::with_capacity(ids.len());
         for batch in ids.chunks(SQL_PARAMETER_BATCH) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = sql_placeholders(batch.len());
             let sql = format!(
                 "SELECT id, file_path, line_start, line_end, content, language,
                         symbol_type, symbol_name
@@ -498,9 +496,7 @@ impl MetadataStore {
     ) -> Result<HashMap<String, FileChunkSummary>> {
         let mut summaries = HashMap::with_capacity(file_paths.len());
         for batch in file_paths.chunks(SQL_PARAMETER_BATCH) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = sql_placeholders(batch.len());
             let sql = format!(
                 "SELECT file_path, COUNT(*), MAX(line_end), MIN(language)
                  FROM chunks WHERE file_path IN ({placeholders})
@@ -533,9 +529,7 @@ impl MetadataStore {
     pub fn symbol_type_counts(&self, file_paths: &[String]) -> Result<Vec<(String, u64)>> {
         let mut totals: HashMap<String, u64> = HashMap::new();
         for batch in file_paths.chunks(SQL_PARAMETER_BATCH) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = sql_placeholders(batch.len());
             let sql = format!(
                 "SELECT symbol_type, COUNT(*) FROM chunks
                  WHERE file_path IN ({placeholders}) AND symbol_type IS NOT NULL
