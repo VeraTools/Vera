@@ -15,6 +15,7 @@
 //! - Custom override patterns
 
 use std::fmt;
+use std::io::Read;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -232,9 +233,48 @@ pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
 /// returns.
 pub fn read_source_lossy_at(root_dir: &Dir, relative_path: &Path) -> std::io::Result<String> {
     let bytes = root_dir.read(relative_path)?;
+    Ok(lossy_string(bytes))
+}
+
+/// Read a source file, refusing one larger than `max_file_size_bytes`.
+///
+/// The discovery gate bounds which files are *considered*, at the moment the
+/// tree is walked. It says nothing about how much is *read* later: a file that
+/// passed the gate and then grew is read whole by every caller of the uncapped
+/// version above. Reading through `take` bounds the allocation, and one byte
+/// past the limit is enough to tell "at the limit" from "over it" without
+/// pulling the rest of the file in.
+///
+/// Refusing rather than truncating is deliberate. Truncated content would be
+/// chunked, embedded and hashed as if it were the file, so the index would
+/// disagree with the tree while looking healthy.
+pub fn read_source_lossy_capped(
+    root_dir: &Dir,
+    relative_path: &Path,
+    max_file_size_bytes: u64,
+) -> std::io::Result<String> {
+    let file = root_dir.open(relative_path)?;
+    let mut bytes = Vec::new();
+    file.take(max_file_size_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+
+    if bytes.len() as u64 > max_file_size_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is larger than the {max_file_size_bytes} byte limit; it grew after it was indexed",
+                relative_path.display()
+            ),
+        ));
+    }
+
+    Ok(lossy_string(bytes))
+}
+
+fn lossy_string(bytes: Vec<u8>) -> String {
     match String::from_utf8(bytes) {
-        Ok(text) => Ok(text),
-        Err(err) => Ok(String::from_utf8_lossy(err.as_bytes()).into_owned()),
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
     }
 }
 
@@ -1319,6 +1359,54 @@ mod tests {
         let good = dir.path().join("ok.rs");
         fs::write(&good, "fn main() {}\n").unwrap();
         assert_eq!(read_source_lossy(&good).unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn capped_read_refuses_a_file_that_grew_past_the_limit() {
+        let dir = TempDir::new().unwrap();
+        let root = Dir::open_ambient_dir(dir.path(), ambient_authority()).unwrap();
+        let limit = 1_024u64;
+
+        // At the limit exactly: still readable. This is the boundary the
+        // `+ 1` in the implementation exists to distinguish, so a test that
+        // only checked a much larger file would pass on an off-by-one.
+        fs::write(dir.path().join("exact.rs"), "a".repeat(limit as usize)).unwrap();
+        let exact = read_source_lossy_capped(&root, Path::new("exact.rs"), limit).unwrap();
+        assert_eq!(exact.len(), limit as usize);
+
+        // One byte over: refused.
+        fs::write(dir.path().join("over.rs"), "a".repeat(limit as usize + 1)).unwrap();
+        let err = read_source_lossy_capped(&root, Path::new("over.rs"), limit)
+            .expect_err("a file past the limit must not be read");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("over.rs") && err.to_string().contains("larger than"),
+            "the error must say which file and why, it reaches a user-facing warning: {err}"
+        );
+
+        // Refused, not truncated: a partial read would be chunked, embedded and
+        // hashed as if it were the file.
+        assert!(
+            read_source_lossy_capped(&root, Path::new("over.rs"), limit).is_err(),
+            "must not fall back to a truncated read"
+        );
+    }
+
+    #[test]
+    fn capped_read_returns_the_same_content_as_the_uncapped_read() {
+        // The negative half: for every file within the limit the capped read is
+        // a drop-in, including the lossy path for invalid UTF-8.
+        let dir = TempDir::new().unwrap();
+        let root = Dir::open_ambient_dir(dir.path(), ambient_authority()).unwrap();
+
+        fs::write(dir.path().join("ok.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("bad.rs"), [0xff, 0xfe, b'a', b'\n']).unwrap();
+
+        for name in ["ok.rs", "bad.rs"] {
+            let capped = read_source_lossy_capped(&root, Path::new(name), 1_000_000).unwrap();
+            let uncapped = read_source_lossy_at(&root, Path::new(name)).unwrap();
+            assert_eq!(capped, uncapped, "{name} differs between the two readers");
+        }
     }
 
     #[cfg(unix)]

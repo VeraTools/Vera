@@ -29,6 +29,10 @@ pub fn search_explicit_implementations(
     let store = MetadataStore::open(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
     let root_dir = crate::discovery::open_root_dir(&repo_root)?;
+    // Read by stored path, long after the discovery gate ran: the limit the
+    // index was built with is the only bound available here.
+    let max_file_size_bytes = store.indexed_max_file_size_bytes();
+
     let symbol = super::structural::normalize_impl_target(symbol);
     let relations = store.find_type_relations(&symbol)?;
     let mut results = Vec::new();
@@ -44,15 +48,17 @@ pub fn search_explicit_implementations(
             continue;
         }
 
-        let content =
-            match crate::discovery::read_source_lossy_at(&root_dir, Path::new(&relation.file_path))
-            {
-                Ok(content) => content,
-                Err(e) => {
-                    tracing::debug!("skipping {}: {e}", relation.file_path);
-                    continue;
-                }
-            };
+        let content = match crate::discovery::read_source_lossy_capped(
+            &root_dir,
+            Path::new(&relation.file_path),
+            max_file_size_bytes,
+        ) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::debug!("skipping {}: {e}", relation.file_path);
+                continue;
+            }
+        };
         let class = classify_content(&relation.file_path, language, &content);
         if !allows_class(filters, class) {
             continue;

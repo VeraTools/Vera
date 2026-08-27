@@ -306,6 +306,7 @@ where
         staging.build_dir.clone(),
         model_name.to_string(),
         provider.document_prefix_identity(),
+        config.indexing.max_file_size_bytes,
     );
 
     // ── 3. Parse, embed, and store bounded windows ───────────────
@@ -604,12 +605,23 @@ struct StoreHandle {
 }
 
 impl StoreHandle {
-    fn spawn(build_dir: PathBuf, model_name: String, document_prefix: String) -> Self {
+    fn spawn(
+        build_dir: PathBuf,
+        model_name: String,
+        document_prefix: String,
+        max_file_size_bytes: u64,
+    ) -> Self {
         // Capacity bounds in-flight windows to one being stored plus one
         // queued, applying backpressure to the embed stage if stores lag.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let worker = tokio::task::spawn_blocking(move || {
-            store_worker(&build_dir, &model_name, &document_prefix, rx)
+            store_worker(
+                &build_dir,
+                &model_name,
+                &document_prefix,
+                max_file_size_bytes,
+                rx,
+            )
         });
         Self {
             tx,
@@ -675,6 +687,7 @@ fn store_worker(
     build_dir: &Path,
     model_name: &str,
     document_prefix: &str,
+    max_file_size_bytes: u64,
     mut rx: tokio::sync::mpsc::Receiver<StoreCommand>,
 ) -> Result<()> {
     let metadata_store = MetadataStore::open(&build_dir.join(METADATA_DB))
@@ -685,6 +698,14 @@ fn store_worker(
     metadata_store
         .set_index_meta("document_prefix", document_prefix)
         .context("failed to store document_prefix")?;
+    // Recorded so retrieval, which reads files by stored path long after the
+    // discovery gate ran, can bound its own reads by the same limit.
+    metadata_store
+        .set_index_meta(
+            crate::storage::metadata::MAX_FILE_SIZE_META_KEY,
+            &max_file_size_bytes.to_string(),
+        )
+        .context("failed to store max_file_size_bytes")?;
     let bm25_index = Bm25Index::open(&build_dir.join(BM25_SUBDIR))
         .context("failed to open staging BM25 index")?;
     // One writer for the whole build: a writer per window would pay creation,
@@ -833,9 +854,10 @@ fn parse_discovered_files_parallel(
                 };
             }
 
-            let source = match crate::discovery::read_source_lossy_at(
+            let source = match crate::discovery::read_source_lossy_capped(
                 &discovery.root_dir,
                 Path::new(&file.relative_path),
+                config.indexing.max_file_size_bytes,
             ) {
                 Ok(source) => source,
                 Err(err) => {

@@ -124,6 +124,11 @@ pub struct LanguageHealthStat {
 /// query text. A test that asserted on its own copy of the SQL would keep
 /// passing after the original drifted, and the planner would silently fall
 /// back to a full scan with nothing failing.
+/// `index_metadata` key recording the size limit the index was built with.
+///
+/// Shared so the writer and the reader cannot drift apart.
+pub const MAX_FILE_SIZE_META_KEY: &str = "max_file_size_bytes";
+
 const SQL_CHUNKS_BY_SYMBOL_NAME: &str =
     "SELECT id, file_path, line_start, line_end, content, language,
                         symbol_type, symbol_name
@@ -676,6 +681,20 @@ impl MetadataStore {
             )
             .context("failed to set index metadata")?;
         Ok(())
+    }
+
+    /// The `indexing.max_file_size_bytes` this index was built with.
+    ///
+    /// Retrieval reads files by stored path, long after the discovery gate ran,
+    /// so it has no other way to know how large a file is allowed to be. An
+    /// index written before this key existed falls back to the default, which
+    /// is what such an index was built with unless the setting was raised.
+    pub fn indexed_max_file_size_bytes(&self) -> u64 {
+        self.get_index_meta(MAX_FILE_SIZE_META_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(crate::config::DEFAULT_MAX_FILE_SIZE_BYTES)
     }
 
     /// Retrieve a key's value from index_metadata.
@@ -1926,6 +1945,41 @@ mod tests {
     fn parse_language_unknown_input() {
         assert_eq!(parse_language("nonexistent"), Language::Unknown);
         assert_eq!(parse_language(""), Language::Unknown);
+    }
+
+    #[test]
+    fn indexed_max_file_size_falls_back_only_when_nothing_was_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetadataStore::open(&dir.path().join("metadata.db")).unwrap();
+
+        // An index written before this key existed. The fallback has to be the
+        // default, because that is what such an index was built with unless the
+        // setting was raised — and a wrong fallback here silently changes which
+        // files retrieval will read.
+        assert_eq!(
+            store.indexed_max_file_size_bytes(),
+            crate::config::DEFAULT_MAX_FILE_SIZE_BYTES
+        );
+
+        // A stamped value must win over the default, including one below it:
+        // reading the default back for a smaller configured limit would let
+        // retrieval read files the index itself refused.
+        for stamped in [10_u64, 5_000_000] {
+            store
+                .set_index_meta(MAX_FILE_SIZE_META_KEY, &stamped.to_string())
+                .unwrap();
+            assert_eq!(store.indexed_max_file_size_bytes(), stamped);
+        }
+
+        // Garbage does not panic and does not silently become zero, which would
+        // reject every file.
+        store
+            .set_index_meta(MAX_FILE_SIZE_META_KEY, "not-a-number")
+            .unwrap();
+        assert_eq!(
+            store.indexed_max_file_size_bytes(),
+            crate::config::DEFAULT_MAX_FILE_SIZE_BYTES
+        );
     }
 
     #[test]

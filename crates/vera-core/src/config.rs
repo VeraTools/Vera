@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-pub(crate) const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 1_000_000;
+pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 1_000_000;
 
 /// Top-level configuration for Vera.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

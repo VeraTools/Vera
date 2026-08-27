@@ -163,18 +163,21 @@ fn count_modified_files(
     let hashed: Vec<(&String, Option<String>)> = tracked_current
         .par_iter()
         .map(|(rel_path, _absolute_path)| {
-            let content =
-                match crate::discovery::read_source_lossy_at(root_dir, Path::new(rel_path)) {
-                    Ok(content) => content,
-                    Err(err) => {
-                        warn!(
-                            file = %rel_path,
-                            error = %err,
-                            "failed to read file during freshness scan"
-                        );
-                        return (*rel_path, None);
-                    }
-                };
+            let content = match crate::discovery::read_source_lossy_capped(
+                root_dir,
+                Path::new(rel_path),
+                max_file_size_bytes,
+            ) {
+                Ok(content) => content,
+                Err(err) => {
+                    warn!(
+                        file = %rel_path,
+                        error = %err,
+                        "failed to read file during freshness scan"
+                    );
+                    return (*rel_path, None);
+                }
+            };
             let language = detect_language_for_path(rel_path);
             let current_hash = hash_for_indexing_source(
                 &content,

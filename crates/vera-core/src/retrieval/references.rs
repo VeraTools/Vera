@@ -43,6 +43,10 @@ pub fn search_callers_through(
     let store = MetadataStore::open(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
     let root_dir = crate::discovery::open_root_dir(&repo_root)?;
+    // Read by stored path, long after the discovery gate ran: the limit the
+    // index was built with is the only bound available here.
+    let max_file_size_bytes = store.indexed_max_file_size_bytes();
+
     let callers = store.find_callers_through(symbol, receiver)?;
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -57,11 +61,14 @@ pub fn search_callers_through(
             continue;
         }
 
-        let content =
-            match crate::discovery::read_source_lossy_at(&root_dir, Path::new(&caller.file_path)) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
+        let content = match crate::discovery::read_source_lossy_capped(
+            &root_dir,
+            Path::new(&caller.file_path),
+            max_file_size_bytes,
+        ) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
         let class = classify_content(&caller.file_path, language, &content);
         if !allows_class(filters, class) {
             continue;

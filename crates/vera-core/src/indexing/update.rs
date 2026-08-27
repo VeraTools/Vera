@@ -403,9 +403,10 @@ where
         .par_iter()
         .map(|file| {
             cancellation.check()?;
-            let content = match discovery::read_source_lossy_at(
+            let content = match discovery::read_source_lossy_capped(
                 &disc.root_dir,
                 Path::new(&file.relative_path),
+                config.indexing.max_file_size_bytes,
             ) {
                 Ok(content) => Some(content),
                 Err(err) => {

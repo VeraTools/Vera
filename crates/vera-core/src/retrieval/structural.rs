@@ -68,6 +68,7 @@ pub fn search_structural(
     let store = MetadataStore::open(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
     let root_dir = crate::discovery::open_root_dir(&repo_root)?;
+
     let filters = structural_filters(filters);
 
     match kind {
@@ -276,6 +277,9 @@ where
 {
     let mut files = store.indexed_files()?;
     sort_files_by_scan_priority(&mut files, filters);
+    // Read by stored path, long after the discovery gate ran: the limit the
+    // index was built with is the only bound available here.
+    let max_file_size_bytes = store.indexed_max_file_size_bytes();
 
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -290,7 +294,11 @@ where
             continue;
         }
 
-        let content = match crate::discovery::read_source_lossy_at(root_dir, Path::new(&file_rel)) {
+        let content = match crate::discovery::read_source_lossy_capped(
+            root_dir,
+            Path::new(&file_rel),
+            max_file_size_bytes,
+        ) {
             Ok(content) => content,
             Err(e) => {
                 tracing::debug!("skipping {}: {e}", file_rel);
