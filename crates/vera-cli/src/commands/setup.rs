@@ -856,7 +856,10 @@ mod tests {
         //
         // Off Windows the probe must answer "no" without shelling out, so
         // `detect_gpu` cannot reach DirectML here and every other platform's
-        // detection is unaffected by this change.
+        // detection is unaffected. On Windows the honest answer depends on the
+        // machine, so there is nothing to assert: the probe result is the
+        // input to the decision below, not something this test can predict.
+        #[cfg(not(target_os = "windows"))]
         assert!(
             !has_directx12_adapter(),
             "the probe must be inert off Windows; it is compiled everywhere so \
