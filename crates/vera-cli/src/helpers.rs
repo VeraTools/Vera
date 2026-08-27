@@ -798,3 +798,51 @@ mod tests {
         assert_eq!(error.to_string(), "operation cancelled safely");
     }
 }
+
+/// Warn when a `--path` pattern matched none of the indexed files.
+///
+/// Empty results look the same whether the query found nothing or the filter
+/// excluded everything, and the two want different fixes. The common case is a
+/// directory pattern carrying a wildcard: `--path 'crates/*/src'` matches no
+/// *file*, while the wildcard-free `--path crates/vera-core/src` is treated as
+/// a directory prefix and matches everything beneath it.
+///
+/// Returns `None` when every pattern matched something, so a genuinely empty
+/// result set stays quiet.
+pub fn path_filter_hint(
+    index_dir: &std::path::Path,
+    filters: &vera_core::types::SearchFilters,
+) -> Option<String> {
+    if filters.path_glob.is_empty() {
+        return None;
+    }
+
+    // Best effort: this runs only on an empty result set, and a hint is not
+    // worth failing a command over.
+    let store =
+        vera_core::storage::metadata::MetadataStore::open(&index_dir.join("metadata.db")).ok()?;
+    let files = store.indexed_files().ok()?;
+    let unmatched = filters.path_patterns_matching_nothing(&files);
+    if unmatched.is_empty() {
+        return None;
+    }
+
+    let quoted: Vec<String> = unmatched.iter().map(|p| format!("`{p}`")).collect();
+    let suggestions: Vec<String> = unmatched
+        .iter()
+        .filter(|pattern| pattern.contains('*') && !pattern.ends_with("**"))
+        .map(|pattern| format!("`{}/**`", pattern.trim_end_matches('/')))
+        .collect();
+
+    let mut hint = format!(
+        "note: no indexed file matches {}; the path filter excluded everything, so this is not necessarily an empty search",
+        quoted.join(", ")
+    );
+    if !suggestions.is_empty() {
+        hint.push_str(&format!(
+            "\n      a directory pattern containing a wildcard matches no file on its own; try {}",
+            suggestions.join(", ")
+        ));
+    }
+    Some(hint)
+}

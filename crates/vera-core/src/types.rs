@@ -167,6 +167,26 @@ impl SearchFilters {
     }
 }
 
+impl SearchFilters {
+    /// Which of the active `--path` patterns match none of `files`.
+    ///
+    /// A pattern that matches nothing is indistinguishable in the output from a
+    /// query that genuinely has no results, and the two want different fixes.
+    /// Exposed so the CLI can say which pattern was the empty one rather than
+    /// guessing, and pure so it can be tested without an index.
+    pub fn path_patterns_matching_nothing<'a>(&'a self, files: &[impl AsRef<str>]) -> Vec<&'a str> {
+        self.path_glob
+            .iter()
+            .filter(|pattern| {
+                !files
+                    .iter()
+                    .any(|path| glob_matches(pattern, path.as_ref()))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+}
+
 /// Simple glob matching supporting `*` (any segment) and `**` (any path).
 ///
 /// Supports common patterns: `*.rs`, `src/**/*.ts`, `**/test_*`.
@@ -1508,6 +1528,44 @@ mod tests {
     }
 
     // ── glob_matches tests ──────────────────────────────────────
+
+    #[test]
+    fn path_patterns_matching_nothing_names_only_the_empty_ones() {
+        let files = vec![
+            "crates/vera-core/src/lib.rs".to_string(),
+            "docs/guide.md".to_string(),
+        ];
+
+        // The wildcard-free directory pattern matches via the prefix fallback,
+        // the wildcarded one matches no file at all. Both spellings look the
+        // same to a user, which is why the empty one has to be named.
+        let filters = SearchFilters {
+            path_glob: vec![
+                "crates/vera-core/src".to_string(),
+                "crates/*/src".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            filters.path_patterns_matching_nothing(&files),
+            vec!["crates/*/src"]
+        );
+
+        // Nothing to report when every pattern matched something: a genuinely
+        // empty result set must stay quiet.
+        let ok = SearchFilters {
+            path_glob: vec!["crates/**/*.rs".to_string(), "docs/*.md".to_string()],
+            ..Default::default()
+        };
+        assert!(ok.path_patterns_matching_nothing(&files).is_empty());
+
+        // And no filter means nothing to say.
+        assert!(
+            SearchFilters::default()
+                .path_patterns_matching_nothing(&files)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn glob_star_matches_extension() {
