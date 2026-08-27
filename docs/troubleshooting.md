@@ -75,6 +75,8 @@ If the active embedding model name differs from the one stored in the index, re-
 
 If you're using a reranker in non-interactive setup, its three variables (`RERANKER_MODEL_BASE_URL`, `RERANKER_MODEL_ID`, `RERANKER_MODEL_API_KEY`) must either all be set or all be absent. Partial configuration will fail.
 
+On a 429 the reranker retries briefly and then returns unreranked results, because a minute-long wait is wrong for interactive search. For batch workloads against free-tier endpoints with per-minute quotas, set `VERA_RERANK_RATE_LIMIT_WAIT_SECS` (for example `65`) to make retries wait out the provider's reset window instead of degrading.
+
 If the provider returns a batch-size error such as `at most 100 requests can be in one batch`, lower the embedding batch size:
 
 ```bash

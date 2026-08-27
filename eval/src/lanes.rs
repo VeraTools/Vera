@@ -93,6 +93,18 @@ pub struct LaneSpec {
     /// Whether to enable Vera's reranker for this lane.
     #[serde(default = "default_rerank")]
     pub rerank: bool,
+    /// Optional embedding batch size override (API lanes).
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    /// Optional cap on concurrent embedding requests (API lanes).
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+    /// Optional embedding request timeout in seconds (API lanes).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Optional embedding max-retries override (API lanes).
+    #[serde(default)]
+    pub max_retries: Option<u32>,
     /// Additional environment overrides, useful for API endpoints and keys.
     /// Secret values are redacted in report provenance.
     #[serde(default, alias = "env")]
@@ -290,6 +302,21 @@ impl ResolvedLane {
         if let Some(max_length) = provenance.max_length {
             config.insert("lane.max_length".to_string(), max_length.to_string());
         }
+        if let Some(batch_size) = self.spec.batch_size {
+            config.insert("lane.batch_size".to_string(), batch_size.to_string());
+        }
+        if let Some(max_concurrent) = self.spec.max_concurrent_requests {
+            config.insert(
+                "lane.max_concurrent_requests".to_string(),
+                max_concurrent.to_string(),
+            );
+        }
+        if let Some(timeout_secs) = self.spec.timeout_secs {
+            config.insert("lane.timeout_secs".to_string(), timeout_secs.to_string());
+        }
+        if let Some(max_retries) = self.spec.max_retries {
+            config.insert("lane.max_retries".to_string(), max_retries.to_string());
+        }
         config
     }
 }
@@ -457,6 +484,10 @@ pub fn preset(name: &str) -> Option<LaneSpec> {
         dim: None,
         max_length: None,
         rerank,
+        batch_size: None,
+        max_concurrent_requests: None,
+        timeout_secs: None,
+        max_retries: None,
         environment: BTreeMap::new(),
     })
 }

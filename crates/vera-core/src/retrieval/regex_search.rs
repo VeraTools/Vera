@@ -46,6 +46,7 @@ pub fn search_regex(
     // Resolve the project root (index_dir is .vera/, parent is project root).
     let project_root = canonical_project_root(index_dir)?;
     let root_dir = crate::discovery::open_root_dir(&project_root)?;
+    let max_file_size_bytes = super::configured_max_file_size_bytes(&store);
 
     let mut results = Vec::new();
 
@@ -72,7 +73,11 @@ pub fn search_regex(
             None
         };
 
-        let content = match crate::discovery::read_source_lossy_at(&root_dir, Path::new(file_rel)) {
+        let content = match crate::discovery::read_source_lossy_capped(
+            &root_dir,
+            Path::new(file_rel),
+            max_file_size_bytes,
+        ) {
             Ok(c) => c,
             Err(_) => continue,
         };

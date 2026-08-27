@@ -435,12 +435,61 @@ fn detect_gpu() -> InferenceBackend {
         }
     }
 
-    // Windows: DirectML works with any DirectX 12 GPU
-    if cfg!(target_os = "windows") {
-        return InferenceBackend::OnnxJina(OnnxExecutionProvider::DirectMl);
+    // Windows: probe the video-controller list like every other platform's
+    // branch asks the machine a question (#213). Only a real display adapter
+    // earns DirectML; Basic Display fallbacks and an unanswerable probe fall
+    // through to the common Potion Code fallback below.
+    if cfg!(target_os = "windows")
+        && let Some(provider) =
+            directml_provider_for_adapters(list_windows_video_controllers().as_deref())
+    {
+        return InferenceBackend::OnnxJina(provider);
     }
 
     InferenceBackend::PotionCode
+}
+
+/// Maps a video-controller name listing onto the DirectML execution provider.
+///
+/// `None` means no usable DirectX 12 GPU: the probe produced nothing, or
+/// every adapter is one of Microsoft's software-only fallbacks, whose names
+/// contain "Basic" (#213). Pure over its input so non-Windows tests exercise
+/// both the selection and the fallthrough.
+fn directml_provider_for_adapters(adapters: Option<&str>) -> Option<OnnxExecutionProvider> {
+    let has_directx12_gpu = adapters
+        .into_iter()
+        .flat_map(|names| names.lines())
+        .map(str::trim)
+        .any(|name| !name.is_empty() && !name.to_ascii_lowercase().contains("basic"));
+    has_directx12_gpu.then_some(OnnxExecutionProvider::DirectMl)
+}
+
+/// The installed video-controller names. `wmic` is gone from current Windows
+/// builds, so ask CIM instead; a missing tool or any other query failure
+/// reads as no GPU. Non-Windows targets compile an always-absent answer so
+/// the shared `detect_gpu` body stays referenced on every platform.
+fn list_windows_video_controllers() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_VideoController).Name",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
 }
 
 /// Show an interactive backend selection menu. Potion Code is the default.
@@ -859,5 +908,38 @@ mod tests {
         // Kept, but still nothing: an empty prefix embeds the text unchanged.
         assert_eq!(model.query_text("find main"), "find main");
         assert_eq!(model.document_text("fn main() {}"), "fn main() {}");
+    }
+
+    /// #213: the Windows auto-detect must earn DirectML the way the CUDA,
+    /// ROCm, and OpenVINO branches do, by finding a real adapter. Microsoft's
+    /// software-only fallbacks, an empty list, and a failed probe all fall
+    /// through to Potion Code instead of selecting a backend that cannot run.
+    #[test]
+    fn windows_auto_detect_earns_directml_only_with_a_real_display_adapter() {
+        assert_eq!(
+            directml_provider_for_adapters(Some(
+                "NVIDIA GeForce RTX 5090\nIntel(R) Arc(TM) B580\n"
+            )),
+            Some(OnnxExecutionProvider::DirectMl)
+        );
+        // One qualifying adapter is enough even next to Basic ones.
+        assert_eq!(
+            directml_provider_for_adapters(Some(
+                "Microsoft Basic Display Adapter\nAMD Radeon RX 7900 XT"
+            )),
+            Some(OnnxExecutionProvider::DirectMl)
+        );
+        for unusable in [
+            None,
+            Some(""),
+            Some("Microsoft Basic Display Adapter"),
+            Some("Microsoft Basic Render Driver"),
+        ] {
+            assert_eq!(
+                directml_provider_for_adapters(unusable),
+                None,
+                "no usable DirectX 12 GPU here: {unusable:?}"
+            );
+        }
     }
 }

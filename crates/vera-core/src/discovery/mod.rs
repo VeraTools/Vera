@@ -15,6 +15,7 @@
 //! - Custom override patterns
 
 use std::fmt;
+use std::io::Read;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -229,12 +230,52 @@ pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
 /// `relative_path` is resolved relative to `root_dir`. The capability follows
 /// symlinks that resolve within the directory tree and rejects paths that would
 /// escape it. The file descriptor used for the read is closed when this call
-/// returns.
+/// returns. The whole file is read; callers that need the true file content
+/// (hashing, parsing) use this variant.
 pub fn read_source_lossy_at(root_dir: &Dir, relative_path: &Path) -> std::io::Result<String> {
     let bytes = root_dir.read(relative_path)?;
+    Ok(lossy_utf8(bytes))
+}
+
+/// Read a source file through an already-open directory capability, reading at
+/// most `limit` bytes.
+///
+/// The first `limit + 1` bytes are read so truncation is detected without a
+/// separate stat; a file larger than `limit` fails with
+/// [`std::io::ErrorKind::FileTooLarge`] instead of returning partial content,
+/// so the existing too-large policy applies rather than a silent truncate
+/// (#208). Query-time readers call this so a file that grew after indexing is
+/// skipped instead of being read into memory whole.
+pub fn read_source_lossy_capped(
+    root_dir: &Dir,
+    relative_path: &Path,
+    limit: u64,
+) -> std::io::Result<String> {
+    let mut file = root_dir.open(relative_path)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("file exceeds the {limit}-byte read limit"),
+        ));
+    }
+
+    Ok(lossy_utf8(bytes))
+}
+
+/// Decode source bytes to UTF-8, replacing invalid sequences lossily.
+///
+/// Discovery already excludes binary files, so this helper handles text files
+/// with stray invalid bytes (mixed encodings, latin-1 notes) by indexing them
+/// instead of dropping them from the index.
+fn lossy_utf8(bytes: Vec<u8>) -> String {
     match String::from_utf8(bytes) {
-        Ok(text) => Ok(text),
-        Err(err) => Ok(String::from_utf8_lossy(err.as_bytes()).into_owned()),
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
     }
 }
 
@@ -1319,6 +1360,59 @@ mod tests {
         let good = dir.path().join("ok.rs");
         fs::write(&good, "fn main() {}\n").unwrap();
         assert_eq!(read_source_lossy(&good).unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn capped_read_returns_full_content_within_limit() {
+        let dir = TempDir::new().unwrap();
+        let root_dir = open_root_dir(dir.path()).unwrap();
+
+        fs::write(dir.path().join("src.rs"), b"small content\n").unwrap();
+        let content = read_source_lossy_capped(
+            &root_dir,
+            Path::new("src.rs"),
+            crate::config::DEFAULT_MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(content, "small content\n");
+
+        // Exactly at the limit is still a full read, not a truncation.
+        let exact = vec![b'x'; 32];
+        fs::write(dir.path().join("exact.txt"), &exact).unwrap();
+        let content = read_source_lossy_capped(&root_dir, Path::new("exact.txt"), 32).unwrap();
+        assert_eq!(content.len(), 32);
+    }
+
+    #[test]
+    fn capped_read_rejects_oversized_file_instead_of_truncating() {
+        let dir = TempDir::new().unwrap();
+        let root_dir = open_root_dir(dir.path()).unwrap();
+
+        let oversized = vec![b'a'; 33];
+        fs::write(dir.path().join("big.txt"), &oversized).unwrap();
+        let result = read_source_lossy_capped(&root_dir, Path::new("big.txt"), 32);
+
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert!(
+            err.to_string().contains("read limit"),
+            "error should be observable: {err}"
+        );
+    }
+
+    #[test]
+    fn capped_read_decodes_invalid_utf8_lossily() {
+        let dir = TempDir::new().unwrap();
+        let root_dir = open_root_dir(dir.path()).unwrap();
+
+        fs::write(dir.path().join("notes.txt"), b"caf\xe9 text\n").unwrap();
+        let content = read_source_lossy_capped(
+            &root_dir,
+            Path::new("notes.txt"),
+            crate::config::DEFAULT_MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        assert!(content.contains("caf\u{FFFD}"));
     }
 
     #[cfg(unix)]

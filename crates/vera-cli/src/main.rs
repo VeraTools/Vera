@@ -36,8 +36,23 @@ fn main() {
     vera_core::init_tls();
     let cli = Cli::parse();
     if let Err(err) = state::apply_saved_env() {
-        eprintln!("Error: {err:#}");
-        process::exit(1);
+        // Diagnose/repair commands must still run against a broken saved
+        // config; everything else keeps failing fast with the parse error.
+        let tolerates_broken_config = matches!(
+            cli.command,
+            Commands::Doctor { .. }
+                | Commands::Setup { .. }
+                | Commands::Backend { .. }
+                | Commands::Repair { .. }
+                | Commands::Config { .. }
+                | Commands::Uninstall
+        );
+        if tolerates_broken_config {
+            eprintln!("Warning: ignoring broken saved configuration: {err:#}");
+        } else {
+            eprintln!("Error: {err:#}");
+            process::exit(1);
+        }
     }
 
     let show_nudges = !matches!(

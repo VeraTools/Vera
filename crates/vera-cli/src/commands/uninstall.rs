@@ -35,8 +35,72 @@ fn shim_candidates(home: &Path, user_bin_dir: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
-fn shim_name() -> &'static str {
-    if cfg!(windows) { "vera.cmd" } else { "vera" }
+/// File names Vera may occupy in the candidate directories: the script shim
+/// the npm/pip/bun installers write, plus the binary `cargo install` places
+/// next to them (#212). Only exact matches are treated as Vera's.
+fn entry_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["vera.cmd", "vera.exe"]
+    } else {
+        &["vera"]
+    }
+}
+
+/// The two shapes of PATH entry that belong to Vera.
+enum LaunchEntry {
+    /// Script shim written by the installers; remove directly.
+    Shim,
+    /// Real ELF/Mach-O/PE binary left by `cargo install` (#212); also ours.
+    CargoBinary,
+}
+
+impl LaunchEntry {
+    fn removed_label(&self) -> &'static str {
+        match self {
+            Self::Shim => "PATH shim",
+            Self::CargoBinary => "cargo-installed binary",
+        }
+    }
+}
+
+/// Recognizes a candidate path as a removable Vera launcher, or leaves it
+/// unclassified so unrelated files stay untouched.
+///
+/// A shim is UTF-8 text mentioning vera or a symlink pointing at one. The
+/// cargo-installed binary is neither: it fails UTF-8 decoding by construction
+/// (#212), so only "unreadable as text plus a regular executable file with an
+/// exact Vera entry name" attributes it to cargo without grabbing anything
+/// else named `vera`.
+fn classify_launch_entry(entry: &Path) -> Option<LaunchEntry> {
+    let read_as_text = fs::read_to_string(entry);
+    if read_as_text
+        .as_ref()
+        .is_ok_and(|text| text.contains("vera"))
+        || fs::read_link(entry).is_ok_and(|target| target.to_string_lossy().contains("vera"))
+    {
+        return Some(LaunchEntry::Shim);
+    }
+    // Decodable text that never mentions vera belongs to someone else.
+    let is_cargo_binary = read_as_text.is_err()
+        && fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file())
+        && is_executable(entry);
+    is_cargo_binary.then_some(LaunchEntry::CargoBinary)
+}
+
+/// Executability where the platform tracks it. Windows has no file mode bit;
+/// membership among the exact entry names above is what restricts candidates.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn configured_user_bin_dir() -> Option<PathBuf> {
@@ -75,7 +139,6 @@ fn run_at(
 
     // 1. Remove agent skill files (all clients, all scopes).
     let skill_removal = fold_skill_removal(agent::remove_all_skills(cwd, home));
-    let complete = skill_removal.failures.is_empty();
     // Uninstall continues past a failure so the rest of the cleanup still runs,
     // but it must not end in success: the failures are reported on stderr here,
     // echoed into the exit code at the bottom of this function, and reflected
@@ -105,52 +168,73 @@ fn run_at(
         }
     }
 
-    // 3. Remove the PATH shim.
-    let name = shim_name();
-    let mut removed_any_shim = false;
+    // 3. Remove the PATH shim or cargo-installed launcher binary (#212).
+    let mut removed_any_entry = false;
+    // Removals that were skipped: the trailing report must name what stayed
+    // instead of claiming a complete uninstall.
+    let mut leftover_failures: Vec<(PathBuf, anyhow::Error)> = Vec::new();
     for dir in shim_candidates(home, user_bin_dir) {
-        let shim = dir.join(name);
-        if shim.exists() {
-            // Only remove if it's a Vera shim (contains "vera" in content or is a symlink to vera).
-            let is_vera_shim = fs::read_to_string(&shim)
-                .map(|c| c.contains("vera"))
-                .unwrap_or(false)
-                || fs::read_link(&shim)
-                    .map(|t| t.to_string_lossy().contains("vera"))
-                    .unwrap_or(false);
-            if is_vera_shim {
-                fs::remove_file(&shim)?;
-                removed_any_shim = true;
-                if !json_output {
-                    writeln!(stderr, "  Removed shim {}", shim.display())?;
+        for name in entry_names() {
+            let entry = dir.join(name);
+            if !entry.exists() {
+                continue;
+            }
+            let Some(kind) = classify_launch_entry(&entry) else {
+                // Not ours: leave it alone silently, as before.
+                continue;
+            };
+            match fs::remove_file(&entry) {
+                Ok(()) => {
+                    if !removed_any_entry {
+                        removed.push(kind.removed_label());
+                    }
+                    removed_any_entry = true;
+                    if !json_output {
+                        writeln!(
+                            stderr,
+                            "  Removed {} {}",
+                            kind.removed_label(),
+                            entry.display()
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    writeln!(stderr, "  Left in place: {}: {error}", entry.display())?;
+                    leftover_failures.push((entry.clone(), error.into()));
                 }
             }
         }
     }
-    if removed_any_shim {
-        removed.push("PATH shim");
-    }
+
+    // Completion covers every phase that can strand files on disk: agent
+    // skills and PATH entries.
+    let complete = skill_removal.failures.is_empty() && leftover_failures.is_empty();
 
     if json_output {
-        writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({
-                "uninstalled": true,
-                "complete": complete,
-                "removed": removed,
-                "skills": removed_skills,
-            })
-        )?;
+        let mut document = serde_json::json!({
+            "uninstalled": true,
+            "complete": complete,
+            "removed": removed,
+            "skills": removed_skills,
+        });
+        if !leftover_failures.is_empty() {
+            // #212: a partial removal must not masquerade as a clean one, and
+            // the report has to say what was left behind.
+            document["left_behind"] = serde_json::json!(
+                leftover_failures
+                    .iter()
+                    .map(|(path, _)| path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+        writeln!(stdout, "{}", document)?;
     } else {
         writeln!(stderr)?;
         if complete {
             writeln!(stderr, "Vera has been uninstalled.")?;
         } else {
-            writeln!(
-                stderr,
-                "Vera was partially uninstalled; some skills could not be removed."
-            )?;
+            // The per-item stderr lines above carry the specifics.
+            writeln!(stderr, "Vera was partially uninstalled.")?;
         }
         writeln!(
             stderr,
@@ -160,9 +244,15 @@ fn run_at(
 
     // Mirror `agent::do_remove`: report everything first, then let the first
     // failure fail the command so automation cannot read exit 0 while skill
-    // directories survive on disk.
+    // directories or PATH launchers survive on disk.
     if let Some(first) = skill_removal.failures.into_iter().next() {
         return Err(first.context("uninstall did not complete"));
+    }
+    if let Some((left_behind, error)) = leftover_failures.into_iter().next() {
+        return Err(error.context(format!(
+            "uninstall did not complete; {} remains on PATH",
+            left_behind.display()
+        )));
     }
     Ok(())
 }
@@ -242,13 +332,10 @@ mod tests {
         )
     }
 
-    /// A run whose skill removal fails partway: captures what was printed even
+    /// A run whose cleanup fails partway: captures what was printed even
     /// though the command reports failure.
     #[cfg(unix)]
-    fn uninstall_with_failing_skill(
-        roots: &Roots,
-        json_output: bool,
-    ) -> (Option<String>, String, String) {
+    fn capture_failing_run(roots: &Roots, json_output: bool) -> (Option<String>, String, String) {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let error = run_at(
@@ -347,7 +434,7 @@ mod tests {
         // #149 regression: a partial removal is a failed uninstall. The JSON
         // document still reaches stdout, but `complete` must be false and the
         // process error must be set.
-        let (error, stdout, _) = uninstall_with_failing_skill(&roots, true);
+        let (error, stdout, _) = capture_failing_run(&roots, true);
         let claude_was_deleted = !claude.exists();
         allow_cleanup(&locked);
 
@@ -393,7 +480,7 @@ mod tests {
         let claude = install_claude_global_skill(&roots.home);
         let locked = install_unremovable_gemini_global_skill(&roots.home);
 
-        let (error, stdout, stderr) = uninstall_with_failing_skill(&roots, false);
+        let (error, stdout, stderr) = capture_failing_run(&roots, false);
         let claude_was_deleted = !claude.exists();
         allow_cleanup(&locked);
 
@@ -431,7 +518,7 @@ mod tests {
         let roots = roots();
         let locked = install_unremovable_gemini_global_skill(&roots.home);
 
-        let (error, stdout, stderr) = uninstall_with_failing_skill(&roots, false);
+        let (error, stdout, stderr) = capture_failing_run(&roots, false);
         allow_cleanup(&locked);
 
         assert!(error.is_some(), "partial removal must fail the command");
@@ -465,7 +552,7 @@ mod tests {
         let roots = roots();
         let locked = install_uninspectable_claude_global_skill(&roots.home);
 
-        let (error, stdout, stderr) = uninstall_with_failing_skill(&roots, false);
+        let (error, stdout, stderr) = capture_failing_run(&roots, false);
         allow_cleanup(&locked);
         let skill_survived = locked.join("SKILL.md").exists();
 
@@ -510,5 +597,148 @@ mod tests {
 
         assert_eq!(stdout.trim(), "No Vera skill installations found.");
         assert!(stderr.contains("Vera has been uninstalled."));
+    }
+
+    /// Stands in for the payload `cargo install vera` writes (#212): raw
+    /// bytes starting with ELF magic, which fails UTF-8 decoding exactly like
+    /// the real ELF/Mach-O binary does.
+    #[cfg(unix)]
+    fn install_cargo_binary(home: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = home.join(".cargo").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let path = bin_dir.join("vera");
+        fs::write(&path, [0x7f, b'E', b'L', b'F', 0xcf]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// #212 regression: a cargo-installed launcher used to fail the text read,
+    /// get skipped, and stay on PATH while the uninstall claimed success.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_the_cargo_installed_binary_from_the_path() {
+        let roots = roots();
+        let binary = install_cargo_binary(&roots.home);
+
+        let (stdout, _) = uninstall(&roots, true);
+
+        assert!(
+            !binary.exists(),
+            "the cargo-installed {} stayed on PATH",
+            binary.display()
+        );
+        let document: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout is not a single JSON document ({e}): {stdout}"));
+        assert_eq!(document["complete"], serde_json::json!(true), "{stdout}");
+        assert!(
+            document["removed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tag| tag == "cargo-installed binary"),
+            "{stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_human_output_reports_the_removed_cargo_binary() {
+        let roots = roots();
+        install_cargo_binary(&roots.home);
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            stderr.contains("Removed cargo-installed binary"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// Two lookalikes that are not ours: a readable script that never mentions
+    /// vera, and unreadable data without an executable bit. Neither may be
+    /// deleted, and skipping them silently keeps the run complete (#212).
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_leaves_foreign_lookalikes_in_place_without_failing() {
+        use std::os::unix::fs::PermissionsExt;
+        let roots = roots();
+        let script_dir = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&script_dir).unwrap();
+        let foreign_script = script_dir.join("vera");
+        // The content must not contain the string "vera", or it would look
+        // like our shim by today's matching rule.
+        fs::write(&foreign_script, "#!/bin/sh\necho hello\n").unwrap();
+        fs::set_permissions(&foreign_script, fs::Permissions::from_mode(0o755)).unwrap();
+        let data_dir = roots.home.join("bin");
+        fs::create_dir_all(&data_dir).unwrap();
+        let foreign_data = data_dir.join("vera");
+        fs::write(&foreign_data, [0xcf]).unwrap();
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(foreign_script.exists(), "deleted someone else's script");
+        assert!(foreign_data.exists(), "deleted someone else's data file");
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// #212: when a recognized launcher cannot be removed, the JSON document
+    /// must stop claiming `"complete": true`, name what stayed behind, and the
+    /// command must not end in success. The human output carries the same
+    /// honesty in both directions.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_reports_a_leftover_instead_of_claiming_complete_removal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The temp tree has to stay alive through every assertion, so this is
+        // a loop with inline fixtures rather than a capturing closure.
+        for json_output in [true, false] {
+            let roots = roots();
+            let binary = install_cargo_binary(&roots.home);
+            let bin_dir = roots.home.join(".cargo").join("bin");
+            fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+            let (error, stdout, stderr) = capture_failing_run(&roots, json_output);
+
+            assert!(
+                binary.exists(),
+                "fixture does not discriminate: the removal succeeded"
+            );
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("uninstall did not complete")),
+                "a skipped removal must fail the command: {error:?}"
+            );
+            if json_output {
+                let document: serde_json::Value =
+                    serde_json::from_str(&stdout).unwrap_or_else(|e| {
+                        panic!("stdout is not a single JSON document ({e}): {stdout}")
+                    });
+                assert_eq!(document["complete"], serde_json::json!(false), "{stdout}");
+                assert_eq!(document["removed"], serde_json::json!([]), "{stdout}");
+                assert_eq!(
+                    document["left_behind"],
+                    serde_json::json!([binary.display().to_string()]),
+                    "{stdout}"
+                );
+            } else {
+                assert!(stderr.contains("Left in place:"), "{stderr}");
+                assert!(
+                    stderr.contains("Vera was partially uninstalled."),
+                    "{stderr}"
+                );
+                assert!(
+                    !stderr.contains("Vera has been uninstalled."),
+                    "claimed complete removal while {} remained: {stderr}",
+                    binary.display()
+                );
+            }
+
+            // Restore before the next iteration's temp tree replaces this one.
+            fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 }

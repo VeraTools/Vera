@@ -68,6 +68,7 @@ pub fn search_structural(
     let store = MetadataStore::open(&metadata_path)?;
     let repo_root = canonical_project_root(index_dir)?;
     let root_dir = crate::discovery::open_root_dir(&repo_root)?;
+    let max_file_size_bytes = super::configured_max_file_size_bytes(&store);
     let filters = structural_filters(filters);
 
     match kind {
@@ -75,16 +76,21 @@ pub fn search_structural(
             let symbol = required_query(kind, query)?;
             search_definitions(&store, symbol, limit, &filters)
         }
-        StructuralSearchKind::EnvReads => {
-            search_env_reads(&root_dir, &store, query, limit, &filters)
-        }
+        StructuralSearchKind::EnvReads => search_env_reads(
+            &root_dir,
+            &store,
+            max_file_size_bytes,
+            query,
+            limit,
+            &filters,
+        ),
         StructuralSearchKind::RouteHandlers => {
             reject_query(kind, query)?;
-            search_route_handlers(&root_dir, &store, limit, &filters)
+            search_route_handlers(&root_dir, &store, max_file_size_bytes, limit, &filters)
         }
         StructuralSearchKind::SqlQueries => {
             reject_query(kind, query)?;
-            search_sql_queries(&root_dir, &store, limit, &filters)
+            search_sql_queries(&root_dir, &store, max_file_size_bytes, limit, &filters)
         }
         StructuralSearchKind::Implementations => {
             let target = required_query(kind, query)?;
@@ -158,6 +164,7 @@ fn search_definitions(
 fn search_env_reads(
     root_dir: &Dir,
     store: &MetadataStore,
+    max_file_size_bytes: u64,
     query: Option<&str>,
     limit: usize,
     filters: &SearchFilters,
@@ -166,6 +173,7 @@ fn search_env_reads(
     search_regex_intent(
         root_dir,
         store,
+        max_file_size_bytes,
         limit,
         filters,
         true,
@@ -201,12 +209,14 @@ fn search_env_reads(
 fn search_route_handlers(
     root_dir: &Dir,
     store: &MetadataStore,
+    max_file_size_bytes: u64,
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     search_regex_intent(
         root_dir,
         store,
+        max_file_size_bytes,
         limit,
         filters,
         true,
@@ -229,12 +239,14 @@ fn search_route_handlers(
 fn search_sql_queries(
     root_dir: &Dir,
     store: &MetadataStore,
+    max_file_size_bytes: u64,
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<SearchResult>> {
     search_regex_intent(
         root_dir,
         store,
+        max_file_size_bytes,
         limit,
         filters,
         true,
@@ -266,6 +278,7 @@ fn search_implementations(
 fn search_regex_intent<F>(
     root_dir: &Dir,
     store: &MetadataStore,
+    max_file_size_bytes: u64,
     limit: usize,
     filters: &SearchFilters,
     prefer_chunk: bool,
@@ -290,7 +303,11 @@ where
             continue;
         }
 
-        let content = match crate::discovery::read_source_lossy_at(root_dir, Path::new(&file_rel)) {
+        let content = match crate::discovery::read_source_lossy_capped(
+            root_dir,
+            Path::new(&file_rel),
+            max_file_size_bytes,
+        ) {
             Ok(content) => content,
             Err(e) => {
                 tracing::debug!("skipping {}: {e}", file_rel);

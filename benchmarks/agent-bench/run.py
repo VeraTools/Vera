@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_REPO = REPO_ROOT / ".bench" / "semble-repos" / "flask"
 QUESTIONS_FILE = Path(__file__).resolve().parent / "flask" / "questions.md"
 VERA_BINARY = REPO_ROOT / "target" / "release" / "vera"
-RUNS_ROOT = Path("/tmp/agent-bench")
+RUNS_ROOT = Path(os.environ.get("AGENT_BENCH_RUNS", Path.home() / ".cache" / "agent-bench"))
 ARMS = ("with-vera", "with-semble", "control")
 # Shims make a binary exit 127 so an arm cannot reach another arm's tool.
 ARM_SHIMS = {

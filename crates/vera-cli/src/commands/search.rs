@@ -91,6 +91,10 @@ pub fn run(
         config.retrieval.max_output_chars,
     );
 
+    if results.is_empty() && !json_output {
+        print_path_glob_hint(&filters, &index_dir);
+    }
+
     if timing {
         print_timings(&timings);
     }
@@ -188,6 +192,32 @@ fn add_duration(target: &mut Option<Duration>, incoming: Option<Duration>) {
     if let Some(incoming) = incoming {
         *target = Some(target.unwrap_or_default() + incoming);
     }
+}
+
+/// Issue #215: a wildcarded `--path` pattern that names only directories
+/// matches no files under strict glob semantics, silently. When the search
+/// came back empty and such a pattern would have acted as a directory filter,
+/// say so once on stderr so the empty result is explainable.
+fn print_path_glob_hint(filters: &SearchFilters, index_dir: &Path) {
+    if filters.path_glob.is_empty() {
+        return;
+    }
+    let Ok(store) =
+        vera_core::storage::metadata::MetadataStore::open_existing(&index_dir.join("metadata.db"))
+    else {
+        return;
+    };
+    let Ok(indexed_files) = store.indexed_files() else {
+        return;
+    };
+    let misses = vera_core::types::directory_prefix_near_misses(&filters.path_glob, &indexed_files);
+    if misses.is_empty() {
+        return;
+    }
+    eprintln!(
+        "Hint: '{}' matched no files directly: wildcarded directory patterns do not get prefix matching, but appending '/**' would select everything beneath them.",
+        misses.join("', '")
+    );
 }
 
 fn print_timings(timings: &SearchTimings) {

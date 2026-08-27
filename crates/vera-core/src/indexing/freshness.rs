@@ -15,7 +15,7 @@ use crate::storage::metadata::MetadataStore;
 use super::index_dir;
 use super::update::{detect_language_for_path, hash_for_indexing_source};
 
-const INDEXING_CONFIG_KEY: &str = "indexing_config";
+pub(crate) const INDEXING_CONFIG_KEY: &str = "indexing_config";
 const INDEX_REFRESHED_AT_KEY: &str = "index_refreshed_at_unix_ms";
 
 /// Summary of drift between the working tree and the current index.

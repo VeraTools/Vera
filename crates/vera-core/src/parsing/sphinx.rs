@@ -60,7 +60,7 @@ pub(crate) fn preprocess_rst_with_limit(
         max_file_size_bytes,
     };
 
-    let expanded =
+    let (expanded, _cycle_dependent) =
         resolve_includes_recursive(source, current_file, 0, context.output_budget, &mut context)?;
 
     let with_toctree = normalize_toctree_blocks(&expanded);
@@ -97,19 +97,28 @@ struct IncludeResolutionContext<'a> {
     max_file_size_bytes: u64,
 }
 
+/// Expand includes in `text`, returning the expansion plus whether any include
+/// beneath it was suppressed by the cycle guard.
+///
+/// A suppression makes the result depend on which ancestors are on the cycle
+/// stack, so such expansions must never be cached under their path alone (#205):
+/// a sibling branch without those ancestors would replay content that was cut
+/// only because of them. Expansions whose subtree saw no suppression are pure
+/// functions of their file and are safe to cache.
 fn resolve_includes_recursive(
     text: &str,
     current_file: &Path,
     depth: usize,
     output_budget: usize,
     context: &mut IncludeResolutionContext<'_>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let mut remaining_output_bytes = output_budget;
+    let mut cycle_dependent = false;
 
     if depth >= MAX_INCLUDE_DEPTH {
         let mut output = String::new();
         append_with_budget(&mut output, text, &mut remaining_output_bytes);
-        return Ok(output);
+        return Ok((output, cycle_dependent));
     }
 
     let mut output = String::with_capacity(text.len().min(remaining_output_bytes));
@@ -143,6 +152,7 @@ fn resolve_includes_recursive(
             match resolve_include_path(include_ref, current_file, context.canonical_repo_root)? {
                 Some(include_path) => {
                     if context.stack.contains(&include_path) {
+                        cycle_dependent = true;
                         None
                     } else if let Some(cached) = context.expansion_cache.get(&include_path) {
                         Some(Arc::clone(cached))
@@ -150,18 +160,22 @@ fn resolve_includes_recursive(
                         match read_include_file(&include_path, context.max_file_size_bytes)? {
                             Some(include_text) => {
                                 context.stack.push(include_path.clone());
-                                let resolved = resolve_includes_recursive(
-                                    &include_text,
-                                    &include_path,
-                                    depth + 1,
-                                    context.output_budget,
-                                    context,
-                                )?;
+                                let (resolved, include_cycle_dependent) =
+                                    resolve_includes_recursive(
+                                        &include_text,
+                                        &include_path,
+                                        depth + 1,
+                                        context.output_budget,
+                                        context,
+                                    )?;
                                 context.stack.pop();
+                                cycle_dependent |= include_cycle_dependent;
                                 let resolved: Arc<str> = Arc::from(resolved);
-                                context
-                                    .expansion_cache
-                                    .insert(include_path.clone(), Arc::clone(&resolved));
+                                if !include_cycle_dependent {
+                                    context
+                                        .expansion_cache
+                                        .insert(include_path.clone(), Arc::clone(&resolved));
+                                }
                                 Some(resolved)
                             }
                             None => None,
@@ -180,7 +194,7 @@ fn resolve_includes_recursive(
     }
 
     append_with_budget(&mut output, &text[last_end..], &mut remaining_output_bytes);
-    Ok(output)
+    Ok((output, cycle_dependent))
 }
 
 fn read_include_file(path: &Path, max_file_size_bytes: u64) -> Result<Option<String>> {
@@ -533,6 +547,54 @@ mod tests {
         assert!(processed.contains("child"));
         assert!(processed.contains(".. include:: root.rst"));
         assert!(processed.len() < 128 * 4);
+    }
+
+    /// Diamond with a back-edge (#205): `b` and `c` include `d`, and `d`
+    /// includes `b`. The cached expansion of a file on the cycle stack must not
+    /// be replayed for branches whose ancestors differ, so swapping the two
+    /// directives in the parent must yield the same content (the branch texts
+    /// swap position, but no branch may lose or gain bodies).
+    #[test]
+    fn preprocess_include_expansion_is_independent_of_directive_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("b.rst"),
+            "B-BODY-UNIQUE-TOKEN\n.. include:: d.rst\n",
+        )
+        .unwrap();
+        fs::write(root.join("c.rst"), "C-BODY\n.. include:: d.rst\n").unwrap();
+        fs::write(root.join("d.rst"), "D-BODY\n.. include:: b.rst\n").unwrap();
+
+        let source_path = root.join("a.rst");
+        let b_first = "A-BODY\n.. include:: b.rst\n.. include:: c.rst\n";
+        let c_first = "A-BODY\n.. include:: c.rst\n.. include:: b.rst\n";
+
+        let expanded_b_first =
+            preprocess_rst_with_limit(b_first, &source_path, root, 1024).unwrap();
+        let expanded_c_first =
+            preprocess_rst_with_limit(c_first, &source_path, root, 1024).unwrap();
+
+        for expanded in [&expanded_b_first, &expanded_c_first] {
+            assert_eq!(
+                expanded.matches("B-BODY-UNIQUE-TOKEN").count(),
+                2,
+                "b's body must stay searchable through both branches"
+            );
+            assert!(expanded.contains("C-BODY"));
+            assert!(expanded.contains("D-BODY"));
+        }
+
+        // The two runs inline the same material, only in swapped directive
+        // order; the issue made them differ in which bodies were inlined at
+        // all (86 vs 99 bytes).
+        let mut lines_b_first: Vec<&str> = expanded_b_first.lines().collect();
+        lines_b_first.sort_unstable();
+        let mut lines_c_first: Vec<&str> = expanded_c_first.lines().collect();
+        lines_c_first.sort_unstable();
+        assert_eq!(lines_b_first, lines_c_first);
+        assert_eq!(expanded_b_first.len(), expanded_c_first.len());
     }
 
     #[test]

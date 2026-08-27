@@ -129,10 +129,51 @@ fn cmd_run(
         }
         let specs = lanes::load_file(path)?;
         let resolved = lanes::resolve_specs(specs)?;
-        resolved
-            .iter()
-            .map(|lane| run_lane(tasks.clone(), corpus_path, lane))
-            .collect::<Result<Vec<_>>>()?
+        let mut reports = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for lane in &resolved {
+            eprintln!("Running lane '{}'", lane.name());
+            // Isolate failures: one lane's panic must not lose the reports
+            // already produced, so catch and keep going.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_lane(tasks.clone(), corpus_path, lane)
+            }));
+            match result {
+                Ok(Ok(report)) => {
+                    reports.push(report);
+                    if let Some(path) = output_path {
+                        output::write_json_reports(&reports, path)?;
+                        eprintln!(
+                            "JSON report written to {} ({} lane(s) so far)",
+                            path.display(),
+                            reports.len()
+                        );
+                    }
+                }
+                Ok(Err(err)) => {
+                    eprintln!("lane '{}' failed: {err:#}", lane.name());
+                    failed.push(lane.name().to_string());
+                }
+                Err(_) => {
+                    eprintln!(
+                        "lane '{}' panicked; continuing with remaining lanes",
+                        lane.name()
+                    );
+                    failed.push(lane.name().to_string());
+                }
+            }
+        }
+        if reports.is_empty() {
+            anyhow::bail!("all lanes failed: {}", failed.join(", "));
+        }
+        if !failed.is_empty() {
+            eprintln!(
+                "WARNING: {} lane(s) failed: {}",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
+        reports
     } else if let Some(spec) = lanes::preset(tool_name) {
         let lane = lanes::resolve(spec)?;
         vec![run_lane(tasks, corpus_path, &lane)?]
@@ -288,8 +329,12 @@ fn run_lane(
         (report, tasks)
     } else {
         let backend = lane.backend.expect("non-BM25 lane must have a backend");
-        let vera =
-            vera_adapter::VeraFullAdapter::new_with_options(backend, lane.rerank(), lane.name())?;
+        let vera = vera_adapter::VeraFullAdapter::new_with_options(
+            backend,
+            lane.rerank(),
+            lane.name(),
+            &lane.spec,
+        )?;
         let report = runner::run_benchmark_scoped(
             &vera,
             &tasks,

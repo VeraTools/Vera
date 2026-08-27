@@ -184,7 +184,8 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
         .trim_end_matches('/');
     let path = path.strip_prefix("./").unwrap_or(&path);
 
-    if glob_match_recursive(pattern, path) {
+    let mut matcher = GlobMatcher::new(pattern.as_bytes(), path.as_bytes());
+    if matcher.matches(0, 0) {
         return true;
     }
 
@@ -203,64 +204,155 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
     false
 }
 
-/// Recursive glob matching helper.
-fn glob_match_recursive(pattern: &str, text: &str) -> bool {
-    // Handle standalone `**` — matches everything (any path, any depth).
-    if pattern == "**" {
-        return true;
-    }
+/// Detects the near-miss behind wildcarded directory patterns (#215): the
+/// subset of `patterns` that selects none of `paths` as files, yet fully
+/// matches a proper directory ancestor of at least one of them under strict
+/// glob semantics. Callers can use this to explain empty results, because
+/// appending `/**` would select the files beneath those directories.
+///
+/// Example: `crates/*/src` matches no file directly, but it matches the
+/// directory `crates/vera-core/src`, so `crates/*/src/**` matches everything
+/// beneath it.
+pub fn directory_prefix_near_misses(patterns: &[String], paths: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .filter(|pattern| {
+            !paths.iter().any(|path| glob_matches(pattern, path))
+                && paths
+                    .iter()
+                    .any(|path| glob_matches_as_dir_prefix(pattern, path))
+        })
+        .cloned()
+        .collect()
+}
 
-    // Handle `**` patterns (match any path segments).
-    if let Some(rest) = pattern.strip_prefix("**/") {
-        // `**/X` matches X at any depth.
-        if glob_match_recursive(rest, text) {
+/// True when `pattern` fully matches a proper directory ancestor of `path`
+/// under the strict glob matcher, i.e. treating the pattern as a directory
+/// filter covers this path.
+fn glob_matches_as_dir_prefix(pattern: &str, path: &str) -> bool {
+    // Same normalization as `glob_matches`.
+    let pattern = pattern.replace('\\', "/");
+    let pattern = pattern
+        .strip_prefix("./")
+        .unwrap_or(&pattern)
+        .trim_end_matches('/');
+    let path = path.replace('\\', "/");
+    let path = path.strip_prefix("./").unwrap_or(&path);
+
+    // Each `/` marks a directory boundary whose left side is an ancestor.
+    // `/` is ASCII, so it can never occur inside a multi-byte UTF-8 sequence.
+    for (end, _) in path.match_indices('/') {
+        if end == 0 {
+            continue;
+        }
+        let mut matcher = GlobMatcher::new(pattern.as_bytes(), &path.as_bytes()[..end]);
+        if matcher.matches(0, 0) {
             return true;
         }
-        // Try skipping path segments.
-        for (i, ch) in text.char_indices() {
-            let next = i + ch.len_utf8();
-            if ch == '/' && glob_match_recursive(rest, &text[next..]) {
-                return true;
-            }
-        }
-        return false;
     }
-
-    if pattern.is_empty() && text.is_empty() {
-        return true;
-    }
-    if pattern.is_empty() {
-        return false;
-    }
-
-    // Handle `*` within a segment (matches anything except `/`).
-    if let Some(rest) = pattern.strip_prefix('*') {
-        // Try matching * against 0..n characters (not crossing `/`).
-        if glob_match_recursive(rest, text) {
-            return true;
-        }
-        for (i, ch) in text.char_indices() {
-            if ch == '/' {
-                break;
-            }
-            let next = i + ch.len_utf8();
-            if glob_match_recursive(rest, &text[next..]) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Match literal characters.
-    let mut p_chars = pattern.chars();
-    let mut t_chars = text.chars();
-    if let (Some(pc), Some(tc)) = (p_chars.next(), t_chars.next())
-        && pc == tc
-    {
-        return glob_match_recursive(p_chars.as_str(), t_chars.as_str());
-    }
-
     false
+}
+
+/// Recursive glob matcher over byte suffixes with memoized failed states.
+///
+/// States are addressed by absolute (pattern offset, text offset): every
+/// recursive step consumes a prefix of both inputs, so suffix pairs identify
+/// states uniquely. Matching plain bytes is semantically identical to matching
+/// chars over UTF-8 strings: a non-boundary offset always starts on a
+/// continuation byte (0x80..=0xBF), which no valid UTF-8 string begins with,
+/// so attempts at those offsets fail on their first compared byte, and `/`
+/// never appears inside a multi-byte sequence.
+///
+/// Failed states are memoized in `dead`, collapsing backtracking across
+/// repeated `**/` groups from exponential to polynomial (#214). Successful
+/// states need no entries: the first hit unwinds the whole search.
+struct GlobMatcher<'a> {
+    pattern: &'a [u8],
+    text: &'a [u8],
+    /// `dead[(text.len() + 1) * p + t]` records that state (p, t) fails.
+    dead: Vec<bool>,
+}
+
+impl<'a> GlobMatcher<'a> {
+    fn new(pattern: &'a [u8], text: &'a [u8]) -> Self {
+        Self {
+            pattern,
+            text,
+            // Cheap fresh table per call: the matcher runs once per candidate
+            // file, so a process-global cache would buy nothing.
+            dead: vec![false; (pattern.len() + 1) * (text.len() + 1)],
+        }
+    }
+
+    fn offset(&self, p: usize, t: usize) -> usize {
+        (self.text.len() + 1) * p + t
+    }
+
+    /// Match `pattern[p..]` against `text[t..]`, consulting and updating the
+    /// failure memo.
+    fn matches(&mut self, p: usize, t: usize) -> bool {
+        let cell = self.offset(p, t);
+        if self.dead[cell] {
+            return false;
+        }
+        let matched = self.advance(p, t);
+        if !matched {
+            self.dead[cell] = true;
+        }
+        matched
+    }
+
+    fn advance(&mut self, p: usize, t: usize) -> bool {
+        let pattern = self.pattern;
+        let text = self.text;
+
+        // Handle standalone `**` — matches everything (any path, any depth).
+        if pattern[p..] == *b"**" {
+            return true;
+        }
+
+        // Handle `**` patterns (match any path segments).
+        if pattern[p..].starts_with(b"**/") {
+            // `**/X` matches X at any depth.
+            let rest = p + 3;
+            if self.matches(rest, t) {
+                return true;
+            }
+            for (i, byte) in text.iter().enumerate().skip(t) {
+                if *byte == b'/' && self.matches(rest, i + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if p == pattern.len() && t == text.len() {
+            return true;
+        }
+        if p == pattern.len() {
+            return false;
+        }
+
+        // Handle `*` within a segment (matches anything except `/`).
+        if pattern[p] == b'*' {
+            let rest = p + 1;
+            if self.matches(rest, t) {
+                return true;
+            }
+            for (i, byte) in text.iter().enumerate().skip(t) {
+                if *byte == b'/' {
+                    break;
+                }
+                if self.matches(rest, i + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Match literal characters.
+        t < text.len() && pattern[p] == text[t] && self.matches(p + 1, t + 1)
+    }
 }
 
 /// A chunk of source code extracted from a parsed file.
@@ -1640,5 +1732,182 @@ mod tests {
             "docs/Daily Briefing — 2026-06-16.md"
         ));
         assert!(glob_matches("**/*kvm*", "docs/Daily Briefing — kvm.md"));
+    }
+
+    // ── glob matcher regressions (#214, #215) ───────────────────
+
+    /// Exact copy of the pre-#214 char-based recursion, kept here so the
+    /// memoized rewrite can be proven result-identical on generated inputs.
+    fn legacy_glob_match(pattern: &str, text: &str) -> bool {
+        if pattern == "**" {
+            return true;
+        }
+        if let Some(rest) = pattern.strip_prefix("**/") {
+            if legacy_glob_match(rest, text) {
+                return true;
+            }
+            for (i, ch) in text.char_indices() {
+                let next = i + ch.len_utf8();
+                if ch == '/' && legacy_glob_match(rest, &text[next..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if pattern.is_empty() && text.is_empty() {
+            return true;
+        }
+        if pattern.is_empty() {
+            return false;
+        }
+        if let Some(rest) = pattern.strip_prefix('*') {
+            if legacy_glob_match(rest, text) {
+                return true;
+            }
+            for (i, ch) in text.char_indices() {
+                if ch == '/' {
+                    break;
+                }
+                let next = i + ch.len_utf8();
+                if legacy_glob_match(rest, &text[next..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        let mut p_chars = pattern.chars();
+        let mut t_chars = text.chars();
+        if let (Some(pc), Some(tc)) = (p_chars.next(), t_chars.next())
+            && pc == tc
+        {
+            return legacy_glob_match(p_chars.as_str(), t_chars.as_str());
+        }
+        false
+    }
+
+    fn glob_memoized(pattern: &str, text: &str) -> bool {
+        let mut matcher = GlobMatcher::new(pattern.as_bytes(), text.as_bytes());
+        matcher.matches(0, 0)
+    }
+
+    /// Every string of length <= max_len over the given symbols.
+    fn all_strings(symbols: &[char], max_len: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for base in &frontier {
+                for sym in symbols {
+                    let mut candidate = base.clone();
+                    candidate.push(*sym);
+                    next.push(candidate);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    #[test]
+    fn glob_memoized_results_identical_to_legacy_exhaustive_inputs() {
+        let symbols = ['a', 'b', '/', '*', '.'];
+        let patterns = all_strings(&symbols, 4);
+        let texts = all_strings(&symbols, 4);
+        for pattern in &patterns {
+            for text in &texts {
+                assert_eq!(
+                    glob_memoized(pattern, text),
+                    legacy_glob_match(pattern, text),
+                    "divergence on pattern={pattern:?} text={text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn glob_memoized_results_identical_to_legacy_random_unicode_inputs() {
+        let xorshift = |state: &mut u64| {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        };
+        let symbols = ['a', 'r', 's', '/', '*', '.', 'é', '是'];
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for _ in 0..2000 {
+            let len = (xorshift(&mut state) % 13) as usize + 4;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push(symbols[(xorshift(&mut state) as usize) % symbols.len()]);
+            }
+            assert_eq!(
+                glob_memoized(&s.clone(), "a/b.rs"),
+                legacy_glob_match(&s, "a/b.rs"),
+                "divergence on pattern {s:?}"
+            );
+            assert_eq!(
+                glob_memoized("**/*.rs", &s),
+                legacy_glob_match("**/*.rs", &s),
+                "divergence on text {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn glob_repeated_doublestar_groups_stay_polynomial() {
+        // Pattern from issue #214: ('**/' * n) + suffix previously took
+        // exponential time (44s measured at n=80).
+        let pattern = std::iter::repeat_n("**/", 64).collect::<String>() + "x";
+        let path = "src/retrieval/hybrid_fusion_pipeline_impl.rs";
+        let started = std::time::Instant::now();
+        assert!(!glob_matches(&pattern, path));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "64 repeated '**/' groups took {:?}; backtracking memoization regressed",
+            started.elapsed()
+        );
+
+        // A matching variant must stay fast too.
+        let reachable = std::iter::repeat_n("**/", 64).collect::<String>() + path;
+        let started = std::time::Instant::now();
+        assert!(glob_matches(&reachable, path));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "matching deep '**/' chain took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn directory_prefix_near_misses_flags_wildcard_directory_patterns() {
+        let files = [
+            "crates/vera-core/src/types.rs".to_string(),
+            "crates/vera-cli/src/main.rs".to_string(),
+            "README.md".to_string(),
+        ];
+        let patterns = vec![
+            "crates/*/src".to_string(),
+            "crates/**/src".to_string(),
+            "**/src".to_string(),
+            // Directly matches a file: not a near miss.
+            "crates/**/*.rs".to_string(),
+            // No indexed directory equals this literal.
+            "crates/nope/src".to_string(),
+        ];
+        assert_eq!(
+            directory_prefix_near_misses(&patterns, &files),
+            ["crates/*/src", "crates/**/src", "**/src"]
+        );
+    }
+
+    #[test]
+    fn directory_prefix_near_misses_empty_cases() {
+        // Nothing to filter against: never a near miss.
+        let patterns = vec!["**/src".to_string()];
+        assert!(directory_prefix_near_misses(&patterns, &[]).is_empty());
+        // Patterns are checked per pattern; an empty pattern list stays empty.
+        let files = vec!["crates/vera-core/src/types.rs".to_string()];
+        assert!(directory_prefix_near_misses(&[], &files).is_empty());
     }
 }

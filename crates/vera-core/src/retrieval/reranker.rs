@@ -40,7 +40,12 @@ pub enum RerankerError {
 
     /// Rate limit exceeded.
     #[error("reranker API rate limit exceeded: {message}")]
-    RateLimitError { message: String },
+    RateLimitError {
+        message: String,
+        /// Server-provided wait hint (`Retry-After` header or a rate-limit
+        /// reset timestamp embedded in the error body), when available.
+        retry_after: Option<Duration>,
+    },
 
     /// Unexpected response format.
     #[error("unexpected reranker API response: {message}")]
@@ -108,6 +113,14 @@ pub struct RerankerConfig {
     pub timeout: Duration,
     /// Maximum retries on transient errors.
     pub max_retries: u32,
+    /// Cap on how long a 429 rate-limit wait may last before retrying.
+    ///
+    /// `None` (the default) keeps the short generic backoff, which favors
+    /// fast degradation for interactive searches. Set this (or
+    /// `VERA_RERANK_RATE_LIMIT_WAIT_SECS`) when completing the rerank
+    /// matters more than latency, e.g. batch runs against free-tier
+    /// endpoints with per-minute quotas.
+    pub rate_limit_wait_cap: Option<Duration>,
 }
 
 impl RerankerConfig {
@@ -119,6 +132,7 @@ impl RerankerConfig {
             api_key,
             timeout: Duration::from_secs(30),
             max_retries: 2,
+            rate_limit_wait_cap: None,
         }
     }
 
@@ -135,7 +149,15 @@ impl RerankerConfig {
         let api_key =
             std::env::var("RERANKER_MODEL_API_KEY").context("RERANKER_MODEL_API_KEY not set")?;
 
-        Ok(Self::new(base_url, model_id, api_key))
+        let mut config = Self::new(base_url, model_id, api_key);
+        if let Some(secs) = std::env::var("VERA_RERANK_RATE_LIMIT_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+        {
+            config.rate_limit_wait_cap = Some(Duration::from_secs(secs));
+        }
+        Ok(config)
     }
 
     /// Set the request timeout.
@@ -147,6 +169,12 @@ impl RerankerConfig {
     /// Set the maximum retry count.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// Set the rate-limit wait cap (see the field documentation).
+    pub fn with_rate_limit_wait_cap(mut self, cap: Duration) -> Self {
+        self.rate_limit_wait_cap = Some(cap);
         self
     }
 }
@@ -250,7 +278,7 @@ impl ApiReranker {
             }
 
             if attempt > 0 {
-                let delay = Duration::from_millis(500 * 2u64.pow(attempt.min(4) - 1));
+                let delay = self.retry_delay(attempt, last_err.as_ref());
                 debug!(
                     attempt,
                     delay_ms = delay.as_millis(),
@@ -291,6 +319,26 @@ impl ApiReranker {
         }))
     }
 
+    /// Compute the backoff before the next attempt.
+    ///
+    /// A 429 with a server-provided wait hint sleeps until the quota window
+    /// resets (bounded by `rate_limit_wait_cap`) instead of the short generic
+    /// backoff, which cannot outlast a per-minute quota. Without a configured
+    /// cap or a hint, the generic backoff applies unchanged.
+    fn retry_delay(&self, attempt: u32, last_err: Option<&RerankerError>) -> Duration {
+        if let (
+            Some(cap),
+            Some(RerankerError::RateLimitError {
+                retry_after: Some(wait),
+                ..
+            }),
+        ) = (self.config.rate_limit_wait_cap, last_err)
+        {
+            return (*wait).min(cap);
+        }
+        Duration::from_millis(500 * 2u64.pow(attempt.min(4) - 1))
+    }
+
     /// Send a single HTTP request and parse the response.
     async fn send_request(
         &self,
@@ -327,9 +375,12 @@ impl ApiReranker {
         }
 
         if status == 429 {
+            let retry_after = parse_retry_after_header(response.headers());
             let text = response.text().await.unwrap_or_default();
+            let retry_after = retry_after.or_else(|| parse_rate_limit_reset(&text));
             return Err(RerankerError::RateLimitError {
                 message: sanitize_error_message(&text),
+                retry_after,
             });
         }
 
@@ -555,6 +606,36 @@ fn format_for_reranker(result: &SearchResult) -> String {
     parts.push(format!("Code:\n{}", result.content));
 
     parts.join("\n")
+}
+
+// ── Rate-limit wait hints ────────────────────────────────────────────
+
+/// Parse the standard `Retry-After` header (whole seconds).
+fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+/// Extract the `X-RateLimit-Reset` unix-ms timestamp embedded in an
+/// OpenRouter-style 429 body and convert it to a wait duration.
+fn parse_rate_limit_reset(body: &str) -> Option<Duration> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let reset_ms: u64 = value
+        .pointer("/error/metadata/headers/X-RateLimit-Reset")?
+        .as_str()?
+        .parse()
+        .ok()?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some(Duration::from_millis(reset_ms.saturating_sub(now_ms)))
 }
 
 // ── Sanitization ─────────────────────────────────────────────────────
@@ -798,6 +879,119 @@ mod cancellation_tests {
         assert!(matches!(result, Err(RerankerError::Cancelled)));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn retry_after_header_parses_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(
+            parse_retry_after_header(&headers),
+            Some(Duration::from_secs(3))
+        );
+        let empty = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after_header(&empty), None);
+    }
+
+    #[test]
+    fn openrouter_reset_timestamp_becomes_wait_duration() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let reset_ms = now_ms + 30_000;
+        let body = format!(
+            r#"{{"error":{{"message":"Rate limit exceeded","code":429,"metadata":{{"headers":{{"X-RateLimit-Limit":"20","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"{reset_ms}"}}}}}}}}"#
+        );
+        let wait = parse_rate_limit_reset(&body).expect("reset hint should parse");
+        assert!(wait <= Duration::from_secs(30) && wait >= Duration::from_secs(25));
+        assert_eq!(parse_rate_limit_reset("not json"), None);
+        assert_eq!(parse_rate_limit_reset(r#"{"error":{"message":"x"}}"#), None);
+    }
+
+    /// Server that answers the first request with a 429 (`Retry-After: 1`)
+    /// and subsequent requests with a valid rerank response.
+    async fn spawn_rate_limit_server() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let count = Arc::clone(&server_count);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    // No Content-Length: the close-delimited body avoids
+                    // hand-counting bytes.
+                    let response = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nConnection: close\r\n\r\n{}".to_string()
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"results\":[{\"index\":0,\"relevance_score\":0.9}]}".to_string()
+                    };
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (format!("http://{address}"), request_count)
+    }
+
+    #[tokio::test]
+    async fn waits_out_rate_limit_window_when_cap_configured() {
+        let (url, request_count) = spawn_rate_limit_server().await;
+        let config = RerankerConfig::new(url, "model".to_string(), "key".to_string())
+            .with_timeout(Duration::from_secs(5))
+            .with_max_retries(2)
+            .with_rate_limit_wait_cap(Duration::from_secs(10));
+        let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
+
+        let scores = reranker.rerank("query", &["document".to_string()]).await;
+
+        assert!(scores.is_ok(), "429 should be retried after the wait hint");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_degrades_quickly_without_wait_cap() {
+        // Server that always answers 429 with a long Retry-After hint.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    stream
+                        .write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nConnection: close\r\n\r\n{}")
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        let config = RerankerConfig::new(url, "model".to_string(), "key".to_string())
+            .with_timeout(Duration::from_secs(5))
+            .with_max_retries(1);
+        let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
+
+        let started = Instant::now();
+        let result = reranker.rerank("query", &["document".to_string()]).await;
+
+        assert!(matches!(result, Err(RerankerError::RateLimitError { .. })));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "without a wait cap the Retry-After hint must not delay retries"
+        );
     }
 }
 

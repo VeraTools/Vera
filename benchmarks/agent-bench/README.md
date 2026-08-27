@@ -24,30 +24,30 @@ From the Vera repository root, build the harness's release binary and create the
 python3 benchmarks/agent-bench/run.py --setup-only
 ```
 
-The setup phase copies `.bench/semble-repos/flask` into a timestamped directory under `/tmp/agent-bench/`, excludes `.git`, `.vera`, and `.factory`, indexes only the Vera arm with `VERA_LOCAL=1` and installs the Droid skill there, pre-warms the Semble index in the Semble arm with one search, and writes that arm's `AGENTS.md`. It does not modify the source Flask checkout.
+The setup phase copies `.bench/semble-repos/flask` into a timestamped directory under `~/.cache/agent-bench/`, excludes `.git`, `.vera`, and `.factory`, indexes only the Vera arm with `VERA_LOCAL=1` and installs the Droid skill there, pre-warms the Semble index in the Semble arm with one search, and writes that arm's `AGENTS.md`. It does not modify the source Flask checkout.
 
 The command prints the run directory. Use that path for the question sweep:
 
 ```bash
-python3 benchmarks/agent-bench/run.py --run /tmp/agent-bench/<timestamp>
+python3 benchmarks/agent-bench/run.py --run ~/.cache/agent-bench/<timestamp>
 ```
 
 For a smoke sweep, limit the arms to the first question:
 
 ```bash
-python3 benchmarks/agent-bench/run.py --run /tmp/agent-bench/<timestamp> --questions 1
+python3 benchmarks/agent-bench/run.py --run ~/.cache/agent-bench/<timestamp> --questions 1
 ```
 
 To parse or re-parse existing JSONL outputs without invoking an agent:
 
 ```bash
-python3 benchmarks/agent-bench/run.py --analyze /tmp/agent-bench/<timestamp>
+python3 benchmarks/agent-bench/run.py --analyze ~/.cache/agent-bench/<timestamp>
 ```
 
 Analysis covers whatever arms exist in the run directory, so older two-arm runs still summarize cleanly. Pick the tested model and reasoning effort with `--model` and `--effort` (defaults: `claude-opus-5`, `medium`). Each model+effort pair writes its own transcripts (`qNN.<model>-<effort>.jsonl`) and `results.<model>-<effort>.json`, so several lanes can share one run directory. Grade a lane's answers with:
 
 ```bash
-python3 benchmarks/agent-bench/judge.py /tmp/agent-bench/<timestamp> <model>-<effort>
+python3 benchmarks/agent-bench/judge.py ~/.cache/agent-bench/<timestamp> <model>-<effort>
 ```
 
 Running the script with no mode performs setup, the full sweep, and analysis sequentially.

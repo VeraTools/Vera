@@ -36,18 +36,13 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
     checks.push(version_check(&version_status));
 
     let config_path = state::config_path()?;
-    checks.push(DoctorCheck {
-        name: "config-file",
-        status: if config_path.exists() {
-            CheckStatus::Ok
-        } else {
-            CheckStatus::Warn
-        },
-        detail: config_path.display().to_string(),
-    });
-
-    let saved_config = state::load_saved_config()?;
-    checks.push(saved_backend_check(&saved_config));
+    // #211: an unreadable or unparsable `config.json` is exactly what doctor
+    // exists to diagnose, so a load failure becomes a failing check instead
+    // of aborting before any check ran.
+    checks.extend(saved_config_checks(
+        state::load_saved_config(),
+        &config_path,
+    ));
 
     let backend = vera_core::config::resolve_backend(None);
     let local_mode = backend.is_local();
@@ -68,12 +63,24 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
 
     match backend {
         vera_core::config::InferenceBackend::OnnxJina(ep) => {
-            let embedding_model = vera_core::local_models::LocalEmbeddingModelConfig::from_env()?;
-            checks.push(DoctorCheck {
-                name: "local-embedding-model",
-                status: CheckStatus::Ok,
-                detail: embedding_model.display_name(),
-            });
+            // #211: an unparsable embedding-model environment variable or
+            // stored preset reported itself through an early return; the run
+            // must surface it as a check result and keep diagnosing.
+            let embedding_model =
+                match vera_core::local_models::LocalEmbeddingModelConfig::from_env() {
+                    Ok(model) => {
+                        checks.push(DoctorCheck {
+                            name: "local-embedding-model",
+                            status: CheckStatus::Ok,
+                            detail: model.display_name(),
+                        });
+                        Some(model)
+                    }
+                    Err(err) => {
+                        checks.push(embedding_model_parse_failure_check(err));
+                        None
+                    }
+                };
             let runtime_path = vera_core::local_models::ort_library_path_for_ep(ep)?;
             let runtime_check = vera_core::local_models::ensure_ort_runtime(Some(&runtime_path));
             let runtime_detail = match &runtime_check {
@@ -90,12 +97,33 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
                 detail: runtime_detail,
             });
 
-            let model_assets =
-                vera_core::local_models::inspect_local_model_files_for_ep(ep, &embedding_model)?;
-            let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
-            checks.push(local_model_assets_check(&model_assets, &repair_hint));
-            if probe {
-                checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
+            match &embedding_model {
+                Some(embedding_model) => {
+                    let model_assets = vera_core::local_models::inspect_local_model_files_for_ep(
+                        ep,
+                        embedding_model,
+                    )?;
+                    let repair_hint = format!("run `vera repair --onnx-jina-{ep}`");
+                    checks.push(local_model_assets_check(&model_assets, &repair_hint));
+                    if probe {
+                        checks.extend(probe_local_backend(ep, &runtime_path, &model_assets)?);
+                    }
+                }
+                None => {
+                    // Without a parsed model config the asset paths themselves
+                    // are unknown, so only the model-independent diagnosis
+                    // continues.
+                    checks.push(skipped_check(
+                        "local-models",
+                        "skipped because the embedding model configuration could not be parsed",
+                    ));
+                    if probe {
+                        checks.push(skipped_check(
+                            "probe",
+                            "skipped because the embedding model configuration could not be parsed",
+                        ));
+                    }
+                }
             }
         }
         vera_core::config::InferenceBackend::PotionCode => {
@@ -205,6 +233,48 @@ fn failed_check_names(checks: &[DoctorCheck]) -> Vec<&'static str> {
         .filter(|check| matches!(check.status, CheckStatus::Fail))
         .map(|check| check.name)
         .collect()
+}
+
+/// The config-file and saved-backend checks a healthy load produces, or the
+/// single failing check that names the file and parse error when the stored
+/// config cannot be loaded (#211). Pure over its inputs so tests can exercise
+/// both arms without touching `VERA_HOME`.
+fn saved_config_checks(
+    loaded: anyhow::Result<state::StoredConfig>,
+    config_path: &std::path::Path,
+) -> Vec<DoctorCheck> {
+    match loaded {
+        Ok(config) => vec![config_file_check(config_path), saved_backend_check(&config)],
+        Err(err) => vec![DoctorCheck {
+            name: "config-file",
+            status: CheckStatus::Fail,
+            detail: format!("{} ({})", config_path.display(), one_line_error(&err)),
+        }],
+    }
+}
+
+fn config_file_check(config_path: &std::path::Path) -> DoctorCheck {
+    DoctorCheck {
+        name: "config-file",
+        status: if config_path.exists() {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warn
+        },
+        detail: config_path.display().to_string(),
+    }
+}
+
+/// A failing model check whose detail is from_env's own error, which already
+/// names the offending variable, e.g.
+/// `invalid VERA_LOCAL_EMBEDDING_DIM: notanumber: invalid digit found in
+/// string` (#211).
+fn embedding_model_parse_failure_check(err: anyhow::Error) -> DoctorCheck {
+    DoctorCheck {
+        name: "local-embedding-model",
+        status: CheckStatus::Fail,
+        detail: one_line_error(&err),
+    }
 }
 
 fn check_env_group(name: &'static str, keys: &[&'static str]) -> DoctorCheck {
@@ -638,6 +708,7 @@ fn one_line_error(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn check(name: &'static str, status: CheckStatus) -> DoctorCheck {
         DoctorCheck {
@@ -747,5 +818,84 @@ mod tests {
         let check = check_env_values("reranker-api", 2, &absent);
         assert!(matches!(check.status, CheckStatus::Warn));
         assert_eq!(check.detail, "0/2 variables present");
+    }
+
+    /// #211: a truncated config.json must come out as a failing check that
+    /// names the file and the parse error, not as an aborted `vera doctor`
+    /// with zero checks printed.
+    #[test]
+    fn a_broken_saved_config_is_a_failing_check_naming_file_and_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let parse_error = serde_json::from_str::<state::StoredConfig>("{\n")
+            .expect_err("the fixture must be unparseable JSON");
+        let load_error: anyhow::Error = anyhow::Error::new(parse_error).context(format!(
+            "failed to parse persistent state: {}",
+            config_path.display()
+        ));
+
+        let checks = saved_config_checks(Err(load_error), &config_path);
+
+        assert_eq!(failed_check_names(&checks), vec!["config-file"]);
+        let [only] = &checks[..] else {
+            panic!("expected exactly one check, got {checks:?}")
+        };
+        assert!(
+            only.detail.contains(&config_path.display().to_string()),
+            "the failing line must name the file: {}",
+            only.detail
+        );
+        assert!(
+            only.detail.contains("failed to parse persistent state"),
+            "the parse error must survive in the detail: {}",
+            only.detail
+        );
+        let err = check_verdict(&checks).expect_err("a broken config must fail the verdict");
+        assert!(
+            err.to_string().contains("config-file"),
+            "exit-code error must name the failure: {err}"
+        );
+    }
+
+    /// The healthy arm must keep emitting exactly the two checks doctor
+    /// printed before #211, so an intact setup is byte-identical.
+    #[test]
+    fn a_loaded_saved_config_preserves_the_existing_check_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present.json");
+        fs::write(&present, "{}").unwrap();
+
+        let checks = saved_config_checks(Ok(state::StoredConfig::default()), &present);
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        assert_eq!(checks[0].name, "config-file");
+        assert_eq!(checks[0].detail, present.display().to_string());
+        assert!(matches!(checks[0].status, CheckStatus::Ok));
+        assert_eq!(checks[1].name, "saved-backend");
+
+        let missing = dir.path().join("missing.json");
+        let absent = saved_config_checks(Ok(state::StoredConfig::default()), &missing);
+        assert!(matches!(absent[0].status, CheckStatus::Warn));
+    }
+
+    /// Reduced from the #211 repro: `VERA_LOCAL_EMBEDDING_DIM=notanumber`
+    /// reaches from_env as an error whose text names the variable, and the
+    /// mapping must turn that into a failing model check instead of exit.
+    #[test]
+    fn an_unparsable_embedding_model_variable_is_reported_as_a_failed_check() {
+        let bad_dim = "notanumber".parse::<usize>().unwrap_err();
+        let load_error = anyhow::anyhow!("invalid VERA_LOCAL_EMBEDDING_DIM: notanumber: {bad_dim}");
+
+        let failure = embedding_model_parse_failure_check(load_error);
+
+        assert_eq!(failure.name, "local-embedding-model");
+        assert!(matches!(failure.status, CheckStatus::Fail));
+        for expected in ["VERA_LOCAL_EMBEDDING_DIM", "notanumber", "invalid digit"] {
+            assert!(
+                failure.detail.contains(expected),
+                "detail must name {expected}: {}",
+                failure.detail
+            );
+        }
+        assert!(check_verdict(std::slice::from_ref(&failure)).is_err());
     }
 }
