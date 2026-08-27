@@ -832,17 +832,8 @@ pub fn path_filter_hint(
     let quoted: Vec<String> = unmatched.iter().map(|p| format!("`{p}`")).collect();
     let suggestions: Vec<String> = unmatched
         .iter()
-        // Only directory-shaped patterns. Appending `/**` to a file glob gives
-        // `*.rs/**`, which asks for files beneath a directory named `*.rs`.
-        .filter(|pattern| {
-            pattern.contains('*')
-                && !pattern.ends_with("**")
-                && !pattern
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|segment| segment.contains('.'))
-        })
-        .map(|pattern| format!("`{}/**`", pattern.trim_end_matches('/')))
+        .copied()
+        .filter_map(directory_pattern_suggestion)
         .collect();
 
     let mut hint = format!(
@@ -856,4 +847,63 @@ pub fn path_filter_hint(
         ));
     }
     Some(hint)
+}
+
+/// The `/**` spelling to suggest for an unmatched pattern, if one makes sense.
+///
+/// Only patterns that look like a directory prefix get one. Appending `/**` to
+/// anything else produces a suggestion that cannot match: `*.rs/**` and
+/// `Makefile*/**` both ask for files beneath a directory of that name, and
+/// `src/**/` already ends in `**` once the trailing separator is normalized.
+///
+/// Separate from `path_filter_hint` so the classification can be tested
+/// without an index behind it.
+fn directory_pattern_suggestion(pattern: &str) -> Option<String> {
+    let trimmed = pattern.trim_end_matches(['/', '\\']);
+    let last_segment = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+
+    let looks_like_a_directory_prefix = trimmed.contains('*')
+        && !trimmed.ends_with("**")
+        // A literal directory name: no extension, and not itself a glob.
+        && !last_segment.contains('.')
+        && !last_segment.contains('*');
+
+    looks_like_a_directory_prefix.then(|| format!("`{trimmed}/**`"))
+}
+
+#[cfg(test)]
+mod path_hint_tests {
+    use super::directory_pattern_suggestion;
+
+    #[test]
+    fn only_directory_shaped_patterns_get_a_suggestion() {
+        // The case the hint exists for: a wildcarded directory prefix, which
+        // matches no file on its own.
+        assert_eq!(
+            directory_pattern_suggestion("crates/*/src").as_deref(),
+            Some("`crates/*/src/**`")
+        );
+        // A trailing separator is normalized, not carried into the suggestion.
+        assert_eq!(
+            directory_pattern_suggestion("crates/*/src/").as_deref(),
+            Some("`crates/*/src/**`")
+        );
+
+        // Everything below would produce a suggestion that cannot match.
+        for pattern in [
+            "*.rs",      // extension glob: `*.rs/**` wants files under a dir named `*.rs`
+            "src/*.ts",  // same, with a prefix
+            "Makefile*", // extensionless file glob, still not a directory
+            "src/**",    // already recursive
+            "src/**/",   // already recursive, with a trailing separator
+            "crates/*",  // last segment is itself a glob, not a directory name
+            "src",       // no wildcard: the prefix fallback already covers it
+        ] {
+            assert_eq!(
+                directory_pattern_suggestion(pattern),
+                None,
+                "{pattern} must not get a `/**` suggestion"
+            );
+        }
+    }
 }
