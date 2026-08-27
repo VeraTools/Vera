@@ -92,9 +92,23 @@ fn toctree_entry_re() -> &'static Regex {
 struct IncludeResolutionContext<'a> {
     canonical_repo_root: &'a Path,
     stack: &'a mut Vec<PathBuf>,
-    expansion_cache: &'a mut HashMap<PathBuf, Arc<str>>,
+    expansion_cache: &'a mut HashMap<ExpansionKey, Arc<str>>,
     output_budget: usize,
     max_file_size_bytes: u64,
+}
+
+/// Cache key for one expanded include.
+///
+/// The path alone is not injective. Whether a cycle guard fires inside an
+/// expansion, and whether the depth cap truncates it, are decided by the chain
+/// the file was reached through — so two branches that reach the same file with
+/// different ancestors must not share a cached result. Keying on the chain as
+/// well keeps the memoization that bounds fan-out while making the key describe
+/// everything the value depends on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExpansionKey {
+    path: PathBuf,
+    ancestors: Vec<PathBuf>,
 }
 
 fn resolve_includes_recursive(
@@ -144,11 +158,18 @@ fn resolve_includes_recursive(
                 Some(include_path) => {
                     if context.stack.contains(&include_path) {
                         None
-                    } else if let Some(cached) = context.expansion_cache.get(&include_path) {
+                    } else if let Some(cached) = context.expansion_cache.get(&ExpansionKey {
+                        path: include_path.clone(),
+                        ancestors: context.stack.clone(),
+                    }) {
                         Some(Arc::clone(cached))
                     } else {
                         match read_include_file(&include_path, context.max_file_size_bytes)? {
                             Some(include_text) => {
+                                let key = ExpansionKey {
+                                    path: include_path.clone(),
+                                    ancestors: context.stack.clone(),
+                                };
                                 context.stack.push(include_path.clone());
                                 let resolved = resolve_includes_recursive(
                                     &include_text,
@@ -159,9 +180,7 @@ fn resolve_includes_recursive(
                                 )?;
                                 context.stack.pop();
                                 let resolved: Arc<str> = Arc::from(resolved);
-                                context
-                                    .expansion_cache
-                                    .insert(include_path.clone(), Arc::clone(&resolved));
+                                context.expansion_cache.insert(key, Arc::clone(&resolved));
                                 Some(resolved)
                             }
                             None => None,
@@ -444,6 +463,7 @@ fn strip_wrapping_quotes(input: &str) -> &str {
 mod tests {
     use super::{preprocess_rst, preprocess_rst_with_limit};
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn preprocess_inlines_relative_include() {
@@ -533,6 +553,82 @@ mod tests {
         assert!(processed.contains("child"));
         assert!(processed.contains(".. include:: root.rst"));
         assert!(processed.len() < 128 * 4);
+    }
+
+    /// Build the diamond-with-a-back-edge fixture and expand `a.rst`.
+    ///
+    /// `b` and `c` both include `d`; `d` includes `b`. Whether `d`'s expansion
+    /// suppresses `b` depends on which branch reached it, so `d` is exactly the
+    /// file whose result must not be shared between branches.
+    fn expand_diamond(root: &Path, first: &str, second: &str) -> String {
+        fs::write(root.join("b.rst"), "B-BODY-UNIQUE\n.. include:: d.rst\n").unwrap();
+        fs::write(root.join("c.rst"), "C-BODY\n.. include:: d.rst\n").unwrap();
+        fs::write(root.join("d.rst"), "D-BODY\n.. include:: b.rst\n").unwrap();
+
+        let source = format!("A-BODY\n.. include:: {first}\n.. include:: {second}\n");
+        let source_path = root.join("a.rst");
+        fs::write(&source_path, &source).unwrap();
+        preprocess_rst_with_limit(&source, &source_path, root, 4096).unwrap()
+    }
+
+    #[test]
+    fn diamond_includes_do_not_depend_on_directive_order() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        let b_then_c = expand_diamond(first.path(), "b.rst", "c.rst");
+        let c_then_b = expand_diamond(second.path(), "c.rst", "b.rst");
+
+        // Every branch that can reach b.rst must inline it. Caching d.rst's
+        // expansion under its path alone replayed the branch where b was
+        // suppressed into the branch where it was not, so one of these was 1.
+        assert_eq!(
+            b_then_c.matches("B-BODY-UNIQUE").count(),
+            2,
+            "b.rst is reachable through both branches:\n{b_then_c}"
+        );
+        assert_eq!(
+            c_then_b.matches("B-BODY-UNIQUE").count(),
+            2,
+            "b.rst is reachable through both branches:\n{c_then_b}"
+        );
+
+        // Reordering two directives may reorder the output, but it must not
+        // change what the output contains — that is what reaches content_hash.
+        let sorted = |text: &str| {
+            let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            lines.sort_unstable();
+            lines.join("\n")
+        };
+        assert_eq!(
+            sorted(&b_then_c),
+            sorted(&c_then_b),
+            "same files, same include graph, different directive order:\n--- b,c ---\n{b_then_c}\n--- c,b ---\n{c_then_b}"
+        );
+    }
+
+    #[test]
+    fn a_shared_include_without_a_cycle_is_still_cached() {
+        // The negative half: only expansions whose content depended on the call
+        // path are excluded. A plain shared include has no cycle guard inside
+        // it, so it must still be cached and must still expand everywhere.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("shared.rst"), "SHARED-BODY\n").unwrap();
+        fs::write(root.join("x.rst"), "X-BODY\n.. include:: shared.rst\n").unwrap();
+        fs::write(root.join("y.rst"), "Y-BODY\n.. include:: shared.rst\n").unwrap();
+
+        let source = "TOP\n.. include:: x.rst\n.. include:: y.rst\n";
+        let source_path = root.join("top.rst");
+        fs::write(&source_path, source).unwrap();
+        let processed = preprocess_rst_with_limit(source, &source_path, root, 4096).unwrap();
+
+        assert_eq!(
+            processed.matches("SHARED-BODY").count(),
+            2,
+            "a cycle-free shared include expands on every branch:\n{processed}"
+        );
+        assert!(processed.contains("X-BODY") && processed.contains("Y-BODY"));
     }
 
     #[test]
