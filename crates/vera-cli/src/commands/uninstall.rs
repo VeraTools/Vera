@@ -136,6 +136,12 @@ fn classify_shim(shim: &Path, vera_home: &Path) -> ShimKind {
 /// `sh` uses `#`; batch uses `::`, `rem`, and `@rem`, none of which are
 /// case-sensitive. A comment that happens to name the data directory must not
 /// count as evidence that this launcher runs it.
+///
+/// Belt-and-braces since ownership moved to the program position: a comment
+/// marker is itself the first token on its line, so it is what
+/// `launched_program` returns and it never resolves to a vera executable.
+/// Removing this filter fails no test today — established by removing it — so
+/// it is kept as a second barrier rather than as the load-bearing one.
 fn is_comment_line(line: &str) -> bool {
     let line = line.trim_start();
     if line.starts_with('#') || line.starts_with("::") {
@@ -1005,7 +1011,12 @@ mod tests {
     fn batch_comments_are_comments_too() {
         // `.cmd` shims comment with `rem`, `@rem` and `::`, in any case. A
         // comment naming the data directory is not evidence that the launcher
-        // runs it — the same rule as `#`, which was the only one handled.
+        // runs it.
+        //
+        // Characterization, not regression: since ownership moved to the
+        // program position these cases are also caught there, so removing
+        // `is_comment_line`'s batch arm leaves this green. It pins the
+        // behaviour against a future change to either mechanism.
         let temp = tempdir().unwrap();
         let vera_home = temp.path().join(".vera");
         let launch = format!(
