@@ -68,14 +68,7 @@ pub fn search_callers_through(
         ) {
             Ok(content) => content,
             Err(err) => {
-                // A file dropped from results for being oversized is not an
-                // ordinary read failure: without this the results are simply
-                // missing entries with nothing said.
-                if crate::discovery::is_size_limit_error(&err) {
-                    tracing::warn!("skipping {}: {err}", caller.file_path);
-                } else {
-                    tracing::debug!("skipping {}: {err}", caller.file_path);
-                }
+                crate::retrieval::log_skipped_source_read(&caller.file_path, &err);
                 continue;
             }
         };

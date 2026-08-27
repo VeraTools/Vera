@@ -82,14 +82,7 @@ pub fn search_regex(
         ) {
             Ok(c) => c,
             Err(err) => {
-                // A file dropped from results for being oversized is not an
-                // ordinary read failure: without this the results are simply
-                // missing entries with nothing said.
-                if crate::discovery::is_size_limit_error(&err) {
-                    tracing::warn!("skipping {}: {err}", file_rel);
-                } else {
-                    tracing::debug!("skipping {}: {err}", file_rel);
-                }
+                crate::retrieval::log_skipped_source_read(file_rel, &err);
                 continue;
             }
         };

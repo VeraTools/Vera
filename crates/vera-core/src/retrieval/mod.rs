@@ -135,3 +135,17 @@ pub fn fuse_and_augment_multi_query(
         result_limit,
     )
 }
+
+/// Report a source file skipped because it could not be read.
+///
+/// Shared by every retrieval reader so the four of them cannot disagree about
+/// which failures are worth a warning. A file dropped from results for being
+/// oversized is not an ordinary read failure: the results are simply missing
+/// entries, so it is said out loud, while an unreadable file stays at debug.
+pub(crate) fn log_skipped_source_read(file_path: &str, error: &std::io::Error) {
+    if crate::discovery::is_size_limit_error(error) {
+        tracing::warn!("skipping {file_path}: {error}");
+    } else {
+        tracing::debug!("skipping {file_path}: {error}");
+    }
+}

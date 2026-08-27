@@ -333,17 +333,6 @@ where
     let metadata_store =
         MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
 
-    // Re-stamp the size limit: an incremental update can run with a different
-    // `indexing.max_file_size_bytes` than the full index was built with, and
-    // retrieval reads this value to bound its own reads. Leaving the old stamp
-    // makes retrieval skip files this update just indexed.
-    metadata_store
-        .set_index_meta(
-            crate::storage::metadata::MAX_FILE_SIZE_META_KEY,
-            &config.indexing.max_file_size_bytes.to_string(),
-        )
-        .context("failed to record max_file_size_bytes")?;
-
     let mut stored_dim = config.embedding.max_stored_dim;
 
     // Check for provider mismatch.
@@ -780,6 +769,20 @@ where
         .context("failed to count chunks")?;
     super::freshness::record_index_snapshot(&metadata_store, &config.indexing)
         .context("failed to update index freshness metadata")?;
+    // Re-stamp the size limit: an incremental update can run with a different
+    // `indexing.max_file_size_bytes` than the index was built with, and
+    // retrieval reads this to bound its own reads, so a stale stamp makes it
+    // skip files this update just indexed.
+    //
+    // Written here rather than at the top: the value has to describe the data
+    // that is actually in the index, so an update that fails part way through
+    // must leave the previous limit in place.
+    metadata_store
+        .set_index_meta(
+            crate::storage::metadata::MAX_FILE_SIZE_META_KEY,
+            &config.indexing.max_file_size_bytes.to_string(),
+        )
+        .context("failed to record max_file_size_bytes")?;
     on_progress(UpdateProgress::StorageDone);
 
     let summary = UpdateSummary {
