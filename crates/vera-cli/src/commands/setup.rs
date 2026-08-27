@@ -435,12 +435,64 @@ fn detect_gpu() -> InferenceBackend {
         }
     }
 
-    // Windows: DirectML works with any DirectX 12 GPU
-    if cfg!(target_os = "windows") {
-        return InferenceBackend::OnnxJina(OnnxExecutionProvider::DirectMl);
+    // Windows: DirectML needs a DirectX 12 adapter, so ask whether there is one
+    // rather than assuming it. Every branch above probes for the hardware it
+    // selects; this one asserted the answer, so a machine with no suitable GPU
+    // was auto-assigned a provider that fails at session build time instead of
+    // falling through to the CPU default that works everywhere.
+    if cfg!(target_os = "windows")
+        && let Some(backend) = windows_backend(has_directx12_adapter())
+    {
+        return backend;
     }
 
     InferenceBackend::PotionCode
+}
+
+/// The backend Windows should use given whether an adapter was found.
+///
+/// Split from the probe so the decision is testable on any host: with no
+/// Windows machine and no Windows job in CI, a test that called `detect_gpu`
+/// would pass on macOS or Linux without ever reaching this branch.
+///
+/// `None` means fall through to the CPU default, which is what every other
+/// platform does when its probe finds nothing.
+fn windows_backend(has_adapter: bool) -> Option<InferenceBackend> {
+    has_adapter.then_some(InferenceBackend::OnnxJina(OnnxExecutionProvider::DirectMl))
+}
+
+/// Whether Windows reports a display adapter DirectML could run on.
+///
+/// Deliberately not behind `cfg(target_os = "windows")`: the body is compiled
+/// and type-checked on every platform, and the early return is what makes it
+/// false elsewhere. There is no Windows job in CI and this was written on
+/// macOS, so a `cfg`-gated body would be code nobody had compiled.
+///
+/// A probe that cannot run answers "no", which falls through to the CPU
+/// default. That is the safe direction: the cost of a wrong "no" is a slower
+/// backend, and the cost of a wrong "yes" is a provider that fails when a
+/// session is built.
+fn has_directx12_adapter() -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+
+    // `wmic` is deprecated and absent on current Windows; CIM is the supported
+    // replacement. Any adapter other than the Basic Display Adapter, which is
+    // the software fallback Windows uses when no real driver is present.
+    let probe = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "if (Get-CimInstance Win32_VideoController | \
+              Where-Object { $_.Name -notmatch 'Basic Display Adapter' }) { exit 0 } else { exit 1 }",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    probe.is_ok_and(|status| status.success())
 }
 
 /// Show an interactive backend selection menu. Potion Code is the default.
@@ -796,6 +848,37 @@ fn read_optional_api_env(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_windows_branch_probes_instead_of_asserting() {
+        // Runs on every platform, which is the point: with no Windows host and
+        // no Windows job in CI, a `cfg`-gated test would assert nothing
+        // anywhere it could actually run.
+        //
+        // Off Windows the probe must answer "no" without shelling out, so
+        // `detect_gpu` cannot reach DirectML here and every other platform's
+        // detection is unaffected by this change.
+        assert!(
+            !has_directx12_adapter(),
+            "the probe must be inert off Windows; it is compiled everywhere so \
+             the Windows branch is type-checked, not so it runs"
+        );
+
+        // The decision itself, which is what actually changed. Asserting on
+        // `detect_gpu()` instead would pass on this host no matter what the
+        // Windows branch did, since an earlier branch returns first.
+        assert_eq!(
+            windows_backend(true),
+            Some(InferenceBackend::OnnxJina(OnnxExecutionProvider::DirectMl)),
+            "an adapter is what DirectML needs, so it is still selected when one is found"
+        );
+        assert_eq!(
+            windows_backend(false),
+            None,
+            "with no adapter, Windows must fall through to the CPU default like \
+             every other platform whose probe finds nothing"
+        );
+    }
+
     use super::*;
 
     #[test]
