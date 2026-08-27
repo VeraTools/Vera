@@ -55,12 +55,17 @@ pub(crate) fn preprocess_rst_with_limit(
     let mut context = IncludeResolutionContext {
         canonical_repo_root: &canonical_repo_root,
         stack: &mut stack,
+        stack_ids: FileSet::default(),
+        file_ids: HashMap::new(),
         expansion_cache: &mut expansion_cache,
         output_budget: include_output_budget(max_file_size_bytes),
         max_file_size_bytes,
     };
 
-    let expanded =
+    let root_id = context.file_id(current_file);
+    context.stack_ids.insert(root_id);
+
+    let (expanded, _deps) =
         resolve_includes_recursive(source, current_file, 0, context.output_budget, &mut context)?;
 
     let with_toctree = normalize_toctree_blocks(&expanded);
@@ -92,23 +97,143 @@ fn toctree_entry_re() -> &'static Regex {
 struct IncludeResolutionContext<'a> {
     canonical_repo_root: &'a Path,
     stack: &'a mut Vec<PathBuf>,
-    expansion_cache: &'a mut HashMap<ExpansionKey, Arc<str>>,
+    /// The same ancestors as `stack`, as a bitset, so validity checks are word
+    /// operations rather than repeated path comparisons.
+    stack_ids: FileSet,
+    file_ids: HashMap<PathBuf, usize>,
+    expansion_cache: &'a mut HashMap<PathBuf, CachedExpansion>,
     output_budget: usize,
     max_file_size_bytes: u64,
 }
 
-/// Cache key for one expanded include.
+/// A set of include files, as a bitset over ids interned per preprocess call.
 ///
-/// The path alone is not injective. Whether a cycle guard fires inside an
-/// expansion, and whether the depth cap truncates it, are decided by the chain
-/// the file was reached through — so two branches that reach the same file with
-/// different ancestors must not share a cached result. Keying on the chain as
-/// well keeps the memoization that bounds fan-out while making the key describe
-/// everything the value depends on.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ExpansionKey {
-    path: PathBuf,
-    ancestors: Vec<PathBuf>,
+/// These sets are unioned at every level of the recursion, so representation
+/// dominates: with `HashSet<PathBuf>` the same 16-file cyclic fixture that
+/// takes 88 ms here took 4.1 s, and forcing every cache lookup to hit did not
+/// move that number — the cost was copying and hashing paths, not re-expanding.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct FileSet {
+    words: Vec<u64>,
+}
+
+impl FileSet {
+    fn insert(&mut self, id: usize) {
+        let (word, bit) = (id / 64, id % 64);
+        if self.words.len() <= word {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1 << bit;
+    }
+
+    fn union_with(&mut self, other: &FileSet) {
+        if self.words.len() < other.words.len() {
+            self.words.resize(other.words.len(), 0);
+        }
+        for (slot, word) in self.words.iter_mut().zip(&other.words) {
+            *slot |= word;
+        }
+    }
+
+    fn intersects(&self, other: &FileSet) -> bool {
+        self.words.iter().zip(&other.words).any(|(a, b)| a & b != 0)
+    }
+
+    fn is_subset_of(&self, other: &FileSet) -> bool {
+        self.words
+            .iter()
+            .enumerate()
+            .all(|(i, word)| word & !other.words.get(i).copied().unwrap_or(0) == 0)
+    }
+}
+
+/// A cached expansion, with the conditions under which it may be reused.
+///
+/// The path alone is not injective: whether a cycle guard fires inside an
+/// expansion is decided by the chain the file was reached through, so one
+/// branch's result must not be replayed into a branch with different ancestors.
+///
+/// Keying on the whole chain would fix that and give back the fan-out bound
+/// this cache exists for: a shared include reached through two parents has two
+/// different chains, so a convergent graph re-expands once per distinct path.
+/// Measured on a shared subtree behind 32 parents, that was 18.1 ms against
+/// 4.2 ms with the cache reused.
+///
+/// So the entry records what its content actually depended on:
+///
+/// - `suppressed`: includes left as literal directives because they were on the
+///   stack. The result holds only where those are still ancestors.
+/// - `inlined`: includes expanded within it. The result holds only where none of
+///   them is an ancestor, since there they would have been suppressed instead.
+///
+/// In an acyclic graph `suppressed` is empty and no inlined file can be an
+/// ancestor, so every branch reuses the entry exactly as before.
+struct CachedExpansion {
+    text: Arc<str>,
+    deps: ExpansionDeps,
+    /// The depth this expansion was produced at. Only consulted when the depth
+    /// cap truncated it, where the result describes that depth rather than the
+    /// file. Refusing to cache those outright instead costs an exponential
+    /// re-expansion once a graph is deep enough to reach the cap: on the
+    /// 16-file cyclic fixture that was 5.5 s against 88 ms.
+    built_at_depth: usize,
+}
+
+impl CachedExpansion {
+    fn is_valid_for(&self, stack: &FileSet, depth: usize) -> bool {
+        if self.deps.truncated_by_depth && self.built_at_depth != depth {
+            return false;
+        }
+        self.deps.is_valid_for(stack)
+    }
+}
+
+impl<'a> IncludeResolutionContext<'a> {
+    /// Recompute the ancestor bitset after a pop.
+    ///
+    /// The stack is at most `MAX_INCLUDE_DEPTH` deep, so this is cheaper than
+    /// threading removal through the bitset and cannot drift from `stack`.
+    fn rebuild_stack_ids(&mut self) {
+        let ancestors = self.stack.clone();
+        self.stack_ids = FileSet::default();
+        for ancestor in ancestors {
+            let id = self.file_id(&ancestor);
+            self.stack_ids.insert(id);
+        }
+    }
+
+    fn file_id(&mut self, path: &Path) -> usize {
+        if let Some(id) = self.file_ids.get(path) {
+            return *id;
+        }
+        let id = self.file_ids.len();
+        self.file_ids.insert(path.to_path_buf(), id);
+        id
+    }
+}
+
+/// What one expansion depended on, propagated up so callers can cache safely.
+#[derive(Debug, Default, Clone)]
+struct ExpansionDeps {
+    suppressed: FileSet,
+    inlined: FileSet,
+    /// Truncated by the depth cap. That is a property of how deep this path
+    /// already was rather than of the file, so such a result may only be reused
+    /// at the same depth.
+    truncated_by_depth: bool,
+}
+
+impl ExpansionDeps {
+    fn absorb(&mut self, other: &ExpansionDeps) {
+        self.suppressed.union_with(&other.suppressed);
+        self.inlined.union_with(&other.inlined);
+        self.truncated_by_depth |= other.truncated_by_depth;
+    }
+
+    /// Whether an expansion with these dependencies is valid under `stack`.
+    fn is_valid_for(&self, stack: &FileSet) -> bool {
+        self.suppressed.is_subset_of(stack) && !self.inlined.intersects(stack)
+    }
 }
 
 fn resolve_includes_recursive(
@@ -117,13 +242,15 @@ fn resolve_includes_recursive(
     depth: usize,
     output_budget: usize,
     context: &mut IncludeResolutionContext<'_>,
-) -> Result<String> {
+) -> Result<(String, ExpansionDeps)> {
     let mut remaining_output_bytes = output_budget;
+    let mut deps = ExpansionDeps::default();
 
     if depth >= MAX_INCLUDE_DEPTH {
         let mut output = String::new();
         append_with_budget(&mut output, text, &mut remaining_output_bytes);
-        return Ok(output);
+        deps.truncated_by_depth = true;
+        return Ok((output, deps));
     }
 
     let mut output = String::with_capacity(text.len().min(remaining_output_bytes));
@@ -156,22 +283,24 @@ fn resolve_includes_recursive(
         let replacement =
             match resolve_include_path(include_ref, current_file, context.canonical_repo_root)? {
                 Some(include_path) => {
+                    let include_id = context.file_id(&include_path);
                     if context.stack.contains(&include_path) {
+                        deps.suppressed.insert(include_id);
                         None
-                    } else if let Some(cached) = context.expansion_cache.get(&ExpansionKey {
-                        path: include_path.clone(),
-                        ancestors: context.stack.clone(),
-                    }) {
-                        Some(Arc::clone(cached))
+                    } else if let Some(cached) = context
+                        .expansion_cache
+                        .get(&include_path)
+                        .filter(|cached| cached.is_valid_for(&context.stack_ids, depth + 1))
+                    {
+                        deps.inlined.insert(include_id);
+                        deps.absorb(&cached.deps);
+                        Some(Arc::clone(&cached.text))
                     } else {
                         match read_include_file(&include_path, context.max_file_size_bytes)? {
                             Some(include_text) => {
-                                let key = ExpansionKey {
-                                    path: include_path.clone(),
-                                    ancestors: context.stack.clone(),
-                                };
                                 context.stack.push(include_path.clone());
-                                let resolved = resolve_includes_recursive(
+                                context.stack_ids.insert(include_id);
+                                let (resolved, child_deps) = resolve_includes_recursive(
                                     &include_text,
                                     &include_path,
                                     depth + 1,
@@ -179,8 +308,18 @@ fn resolve_includes_recursive(
                                     context,
                                 )?;
                                 context.stack.pop();
+                                context.rebuild_stack_ids();
                                 let resolved: Arc<str> = Arc::from(resolved);
-                                context.expansion_cache.insert(key, Arc::clone(&resolved));
+                                context.expansion_cache.insert(
+                                    include_path.clone(),
+                                    CachedExpansion {
+                                        text: Arc::clone(&resolved),
+                                        deps: child_deps.clone(),
+                                        built_at_depth: depth + 1,
+                                    },
+                                );
+                                deps.inlined.insert(include_id);
+                                deps.absorb(&child_deps);
                                 Some(resolved)
                             }
                             None => None,
@@ -199,7 +338,7 @@ fn resolve_includes_recursive(
     }
 
     append_with_budget(&mut output, &text[last_end..], &mut remaining_output_bytes);
-    Ok(output)
+    Ok((output, deps))
 }
 
 fn read_include_file(path: &Path, max_file_size_bytes: u64) -> Result<Option<String>> {
