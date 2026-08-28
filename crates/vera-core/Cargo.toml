@@ -106,6 +106,9 @@ ndarray = "0.17.2"
 regex = "1"
 model2vec-rs = { version = "0.1.4", default-features = false, features = ["onig"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 cc = "1.2"
 

@@ -4141,6 +4141,7 @@ dependencies = [
  "flate2",
  "futures",
  "ignore",
+ "libc",
  "memmap2",
  "model2vec-rs",
  "ndarray 0.17.2",

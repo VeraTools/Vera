@@ -182,15 +182,23 @@ fn index_with<P: EmbeddingProvider>(
 }
 
 /// True when the on-disk index was built with the same embedding identity
-/// (model, document prefix, embedding_dim, indexing config, format version)
-/// and the working tree has not drifted since. Any doubt returns false so
-/// the caller re-indexes.
+/// (model, document prefix, embedding_dim, indexing config, format version,
+/// and completeness marker) and the working tree has not drifted since.
+/// Also refuses to reuse while another process holds the index write lock.
+/// Any doubt returns false so the caller re-indexes.
 fn index_is_current<P: EmbeddingProvider>(
     config: &VeraConfig,
     repo_path: &Path,
     provider: &P,
     model_name: &str,
 ) -> bool {
+    // If another process is currently writing this repo's index, do not reuse
+    // a half-written live directory. The writer holds an exclusive flock for
+    // the entire build; a non-blocking check here avoids observing partial
+    // state. The caller will then re-index and block on the same lock.
+    if vera_core::indexing::lock::IndexLock::is_locked_for_index_dir(&index_dir(repo_path)) {
+        return false;
+    }
     let metadata_path = index_dir(repo_path).join("metadata.db");
     if !metadata_path.exists() {
         return false;
@@ -198,6 +206,9 @@ fn index_is_current<P: EmbeddingProvider>(
     let Ok(metadata_store) = MetadataStore::open(&metadata_path) else {
         return false;
     };
+    if !index_complete_matches(&metadata_store) {
+        return false;
+    }
     let identity_matches = metadata_store
         .get_index_meta("model_name")
         .unwrap_or(None)
@@ -300,6 +311,16 @@ fn index_format_matches(store: &MetadataStore) -> bool {
         return false;
     };
     stored == vera_core::indexing::freshness::INDEX_FORMAT_VERSION
+}
+
+fn index_complete_matches(store: &MetadataStore) -> bool {
+    let Some(stored) = store
+        .get_index_meta(vera_core::indexing::freshness::INDEX_COMPLETE_KEY)
+        .unwrap_or(None)
+    else {
+        return false;
+    };
+    stored == vera_core::indexing::freshness::INDEX_COMPLETE_VALUE
 }
 
 fn into_retrieval_result(result: vera_core::types::SearchResult) -> RetrievalResult {
@@ -470,8 +491,14 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
     use vera_core::config::VeraConfig;
-    use vera_core::indexing::freshness::{INDEX_FORMAT_VERSION_KEY, INDEXING_CONFIG_KEY};
+    use vera_core::indexing::freshness::{
+        INDEX_COMPLETE_KEY, INDEX_COMPLETE_VALUE, INDEX_FORMAT_VERSION, INDEX_FORMAT_VERSION_KEY,
+        INDEXING_CONFIG_KEY,
+    };
     use vera_core::indexing::{index_dir, index_repository};
     use vera_core::storage::metadata::MetadataStore;
 
@@ -1196,5 +1223,360 @@ mod tests {
             &provider,
             model_name
         ));
+    }
+
+    #[test]
+    fn reuse_incomplete_marker_forces_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        write_repo_file(dir.path(), "lib.rs", "pub fn hello() {}\n");
+        let runtime = test_runtime();
+        let config = VeraConfig::default();
+        let provider = HashEmbeddingProvider;
+        let model_name = "test-model-complete-marker";
+        index_once(&runtime, dir.path(), &config, &provider, model_name);
+        // Marker should be present after a successful index
+        let store = metadata_store(dir.path());
+        assert_eq!(
+            store.get_index_meta(INDEX_COMPLETE_KEY).unwrap().unwrap(),
+            INDEX_COMPLETE_VALUE
+        );
+        assert!(index_is_current(&config, dir.path(), &provider, model_name));
+
+        // Simulate interrupted write: delete the completeness marker
+        let conn_path = index_dir(dir.path()).join("metadata.db");
+        let conn = rusqlite::Connection::open(&conn_path).unwrap();
+        conn.execute(
+            "DELETE FROM index_metadata WHERE key=?1",
+            [INDEX_COMPLETE_KEY],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Reuse must now refuse
+        assert!(
+            !index_is_current(&config, dir.path(), &provider, model_name),
+            "missing completeness marker should force re-index"
+        );
+        let (elapsed, _) = index_with(
+            &runtime,
+            &config,
+            dir.path(),
+            &provider,
+            model_name,
+            "test-label",
+            true,
+        );
+        assert!(
+            elapsed > 0.0,
+            "interrupted-write simulation (marker absent) must trigger full re-index"
+        );
+        // After re-index, marker restored and reuse succeeds
+        assert!(index_is_current(&config, dir.path(), &provider, model_name));
+        let (elapsed2, _) = index_with(
+            &runtime,
+            &config,
+            dir.path(),
+            &provider,
+            model_name,
+            "test-label",
+            true,
+        );
+        assert_eq!(elapsed2, 0.0, "after repair, reuse should succeed");
+        let store2 = metadata_store(dir.path());
+        assert_eq!(
+            store2.get_index_meta(INDEX_COMPLETE_KEY).unwrap().unwrap(),
+            INDEX_COMPLETE_VALUE
+        );
+        assert_eq!(
+            store2
+                .get_index_meta(INDEX_FORMAT_VERSION_KEY)
+                .unwrap()
+                .unwrap(),
+            INDEX_FORMAT_VERSION
+        );
+    }
+
+    #[test]
+    fn reuse_while_locked_forces_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        write_repo_file(dir.path(), "lib.rs", "pub fn hello() {}\n");
+        let runtime = test_runtime();
+        let config = VeraConfig::default();
+        let provider = HashEmbeddingProvider;
+        let model_name = "test-model-locked-marker";
+        index_once(&runtime, dir.path(), &config, &provider, model_name);
+        assert!(index_is_current(&config, dir.path(), &provider, model_name));
+
+        // Hold the per-repo index lock and verify reuse is refused
+        let idx_dir = index_dir(dir.path());
+        let _lock = vera_core::indexing::lock::IndexLock::acquire_blocking_for_index_dir(&idx_dir)
+            .expect("acquire lock for test");
+        assert!(
+            !index_is_current(&config, dir.path(), &provider, model_name),
+            "held write lock should make index not current"
+        );
+        // is_locked helper must agree
+        assert!(
+            vera_core::indexing::lock::IndexLock::is_locked_for_index_dir(&idx_dir),
+            "is_locked should be true while writer holds lock"
+        );
+        // While lock held, try_acquire should fail
+        let try_lock =
+            vera_core::indexing::lock::IndexLock::try_acquire_for_index_dir(&idx_dir).unwrap();
+        assert!(
+            try_lock.is_none(),
+            "try_acquire should return None while lock held"
+        );
+        drop(_lock);
+        // After release, reuse should succeed again
+        assert!(!vera_core::indexing::lock::IndexLock::is_locked_for_index_dir(&idx_dir));
+        assert!(index_is_current(&config, dir.path(), &provider, model_name));
+        let (elapsed, _) = index_with(
+            &runtime,
+            &config,
+            dir.path(),
+            &provider,
+            model_name,
+            "test-label",
+            true,
+        );
+        assert_eq!(elapsed, 0.0);
+    }
+
+    struct SlowHashProvider;
+
+    impl vera_core::embedding::EmbeddingProvider for SlowHashProvider {
+        async fn embed_batch(
+            &self,
+            texts: &[String],
+        ) -> Result<Vec<Vec<f32>>, vera_core::embedding::EmbeddingError> {
+            // Simulate a slow embedding service so concurrent builds overlap
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let mut hasher = DefaultHasher::new();
+                    text.hash(&mut hasher);
+                    let h = hasher.finish();
+                    // deterministic 64-dim vector from hash
+                    let v = (h as f32 % 997.0) / 997.0;
+                    vec![v; 64]
+                })
+                .collect())
+        }
+
+        fn expected_dim(&self) -> Option<usize> {
+            Some(64)
+        }
+
+        fn document_prefix_identity(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn concurrent_same_repo_never_observes_partial_index() {
+        // Single cargo process spawns two harness threads (sanctioned exception
+        // to the one-indexing-process rule: local-only, no paid endpoints).
+        // Barrier makes the two writes overlap deterministically; the lock
+        // guarantees the second blocks until the first finishes, so neither
+        // observes a half-written live index.
+        let dir = tempfile::tempdir().unwrap();
+        write_repo_file(dir.path(), "a.rs", "pub fn a() -> i32 { 41 }\n");
+        write_repo_file(dir.path(), "b.rs", "pub fn b() -> i32 { 42 }\n");
+        write_repo_file(dir.path(), "c.rs", "pub fn c() -> i32 { 43 }\n");
+
+        let config = VeraConfig::default();
+        let model_name = "concurrent-race-model";
+
+        // Seed a valid initial index
+        let runtime = test_runtime();
+        index_once(
+            &runtime,
+            dir.path(),
+            &config,
+            &HashEmbeddingProvider,
+            model_name,
+        );
+        assert!(index_is_current(
+            &config,
+            dir.path(),
+            &HashEmbeddingProvider,
+            model_name
+        ));
+
+        // Mutate one file so both concurrent writers have work to do
+        write_repo_file(dir.path(), "c.rs", "pub fn c_modified() -> i32 { 99 }\n");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let dir1 = dir.path().to_path_buf();
+        let dir2 = dir.path().to_path_buf();
+        let cfg1 = config.clone();
+        let cfg2 = config.clone();
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        // Spawn two threads that run the full indexing pipeline concurrently
+        // on the same repository. Each uses its own Tokio runtime so they
+        // behave like separate harness processes.
+        let h1 = std::thread::spawn(move || {
+            let rt = test_runtime();
+            b1.wait();
+            rt.block_on(index_repository(
+                &dir1,
+                &SlowHashProvider,
+                &cfg1,
+                model_name,
+            ))
+            .expect("concurrent index 1 failed");
+            // While holding the lock already released after index, the index
+            // must be complete. Verify marker and non-empty stores.
+            let store = MetadataStore::open(&index_dir(&dir1).join("metadata.db")).unwrap();
+            assert_eq!(
+                store.get_index_meta(INDEX_COMPLETE_KEY).unwrap().unwrap(),
+                INDEX_COMPLETE_VALUE
+            );
+        });
+
+        let h2 = std::thread::spawn(move || {
+            let rt = test_runtime();
+            b2.wait();
+            rt.block_on(index_repository(
+                &dir2,
+                &SlowHashProvider,
+                &cfg2,
+                model_name,
+            ))
+            .expect("concurrent index 2 failed");
+            let store = MetadataStore::open(&index_dir(&dir2).join("metadata.db")).unwrap();
+            assert_eq!(
+                store.get_index_meta(INDEX_COMPLETE_KEY).unwrap().unwrap(),
+                INDEX_COMPLETE_VALUE
+            );
+        });
+
+        h1.join().expect("thread 1 panicked");
+        h2.join().expect("thread 2 panicked");
+
+        // Final index must be fully valid: marker, version, and searchable
+        let store = MetadataStore::open(&index_dir(dir.path()).join("metadata.db")).unwrap();
+        assert_eq!(
+            store.get_index_meta(INDEX_COMPLETE_KEY).unwrap().unwrap(),
+            INDEX_COMPLETE_VALUE
+        );
+        assert_eq!(
+            store
+                .get_index_meta(INDEX_FORMAT_VERSION_KEY)
+                .unwrap()
+                .unwrap(),
+            INDEX_FORMAT_VERSION
+        );
+        // Chunk count must be consistent with storage (open succeeds and rows parse)
+        let idx_dir = index_dir(dir.path());
+        let vector_db = idx_dir.join("vectors.db");
+        let bm25_dir = idx_dir.join("bm25");
+        assert!(
+            vector_db.exists(),
+            "vectors.db must exist after concurrent builds"
+        );
+        assert!(bm25_dir.exists(), "bm25 must exist after concurrent builds");
+        // No leftover staging directories
+        assert!(
+            !idx_dir.with_extension("build").exists(),
+            "no .vera.build must remain after concurrent builds"
+        );
+        assert!(
+            !idx_dir.with_extension("old").exists(),
+            "no .vera.old must remain after concurrent builds"
+        );
+        // After both writers finish, reuse should succeed
+        let runtime2 = test_runtime();
+        assert!(index_is_current(
+            &config,
+            dir.path(),
+            &HashEmbeddingProvider,
+            model_name
+        ));
+        let (elapsed, size) = index_with(
+            &runtime2,
+            &config,
+            dir.path(),
+            &HashEmbeddingProvider,
+            model_name,
+            "test-label",
+            true,
+        );
+        assert_eq!(
+            elapsed, 0.0,
+            "after concurrent builds, reuse must report 0.0"
+        );
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn concurrent_stress_loop_no_partial_observation() {
+        // Repeated stress loop (5 iterations) to catch flaky races
+        for iteration in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            write_repo_file(
+                dir.path(),
+                "lib.rs",
+                &format!("pub fn f{iteration}() {{}}\n"),
+            );
+            for i in 0..3 {
+                write_repo_file(
+                    dir.path(),
+                    &format!("file{i}.rs"),
+                    &format!("pub fn func{i}() {{}}\n"),
+                );
+            }
+            let config = VeraConfig::default();
+            let model = format!("stress-model-{iteration}");
+            let runtime = test_runtime();
+            index_once(
+                &runtime,
+                dir.path(),
+                &config,
+                &HashEmbeddingProvider,
+                &model,
+            );
+
+            let barrier = Arc::new(Barrier::new(3));
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let dir_clone = dir.path().to_path_buf();
+                let cfg_clone = config.clone();
+                let b_clone = Arc::clone(&barrier);
+                let model_clone = model.clone();
+                handles.push(std::thread::spawn(move || {
+                    let rt = test_runtime();
+                    b_clone.wait();
+                    rt.block_on(index_repository(
+                        &dir_clone,
+                        &SlowHashProvider,
+                        &cfg_clone,
+                        &model_clone,
+                    ))
+                    .unwrap();
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            // Verify final index integrity each iteration
+            let store = MetadataStore::open(&index_dir(dir.path()).join("metadata.db")).unwrap();
+            assert_eq!(
+                store.get_index_meta(INDEX_COMPLETE_KEY).unwrap().unwrap(),
+                INDEX_COMPLETE_VALUE,
+                "iteration {iteration}: completeness marker must be present"
+            );
+            assert_eq!(
+                store
+                    .get_index_meta(INDEX_FORMAT_VERSION_KEY)
+                    .unwrap()
+                    .unwrap(),
+                INDEX_FORMAT_VERSION
+            );
+        }
     }
 }

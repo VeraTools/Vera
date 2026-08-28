@@ -22,6 +22,11 @@ pub const INDEX_FORMAT_VERSION_KEY: &str = "index_format_version";
 /// Eval harness `reuse_index` gates on this value; a missing or mismatched
 /// version forces a full re-index so stale chunk identity is never reused.
 pub const INDEX_FORMAT_VERSION: &str = "1";
+/// Written last during index publication; its absence means the index was not
+/// fully written (interrupted build). `reuse_index` refuses to reuse an index
+/// lacking this marker.
+pub const INDEX_COMPLETE_KEY: &str = "index_complete";
+pub const INDEX_COMPLETE_VALUE: &str = "1";
 
 /// Summary of drift between the working tree and the current index.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -89,6 +94,12 @@ pub(crate) fn record_index_snapshot(
     metadata_store
         .set_index_meta(INDEX_FORMAT_VERSION_KEY, INDEX_FORMAT_VERSION)
         .context("failed to store index format version")?;
+    // Written last: if this key is absent, the index was interrupted before
+    // publication completed. Must be last so a crash before it leaves a
+    // recognizably incomplete index.
+    metadata_store
+        .set_index_meta(INDEX_COMPLETE_KEY, INDEX_COMPLETE_VALUE)
+        .context("failed to store index completeness marker")?;
     Ok(())
 }
 
