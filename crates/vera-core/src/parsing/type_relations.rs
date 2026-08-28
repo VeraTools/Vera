@@ -145,10 +145,7 @@ fn relation_owner(chunk: &Chunk) -> Option<String> {
     if name.starts_with("impl ") {
         return None;
     }
-    // Split chunks carry a " (part N)" suffix on the symbol name; strip it
-    // so the owner resolves to the original symbol.
-    let base = name.split(" (part ").next().unwrap_or(name);
-    simple_name(base)
+    simple_name(name)
 }
 
 fn relation_header(chunk: &Chunk) -> String {
@@ -684,6 +681,7 @@ mod tests {
             language,
             symbol_type: Some(SymbolType::Class),
             symbol_name: Some(symbol_name.to_string()),
+            part_index: None,
         }
     }
 
@@ -698,6 +696,7 @@ mod tests {
             language: Language::Rust,
             symbol_type: Some(SymbolType::Block),
             symbol_name: Some("impl std::fmt::Display for User".to_string()),
+            part_index: None,
         };
 
         let relations = extract_type_relations(&[chunk]);
@@ -718,6 +717,7 @@ mod tests {
             language: Language::Haskell,
             symbol_type: Some(SymbolType::Block),
             symbol_name: None,
+            part_index: None,
         };
 
         assert!(extract_type_relations(&[chunk]).is_empty());
@@ -812,6 +812,7 @@ mod tests {
             language: Language::Go,
             symbol_type: Some(SymbolType::Interface),
             symbol_name: Some("Repository".to_string()),
+            part_index: None,
         };
 
         assert!(extract_type_relations(&[chunk]).is_empty());
@@ -852,6 +853,7 @@ mod tests {
             language: Language::Kotlin,
             symbol_type: Some(SymbolType::Function),
             symbol_name: Some("load".to_string()),
+            part_index: None,
         };
 
         assert!(extract_type_relations(&[chunk]).is_empty());
@@ -886,6 +888,7 @@ mod tests {
             language: Language::Cpp,
             symbol_type: Some(SymbolType::Method),
             symbol_name: Some("Foo".to_string()),
+            part_index: None,
         };
 
         assert!(extract_type_relations(&[chunk]).is_empty());
@@ -902,6 +905,7 @@ mod tests {
             language: Language::Rust,
             symbol_type: Some(SymbolType::Trait),
             symbol_name: Some("Child".to_string()),
+            part_index: None,
         };
 
         let relations = extract_type_relations(&[chunk]);
@@ -917,11 +921,17 @@ mod tests {
 
     #[test]
     fn split_chunk_part_suffix_resolves_owner() {
-        let chunk = class_chunk(
-            Language::CSharp,
-            "HugeClass (part 1)",
-            "public class HugeClass : Base {\n}\n",
-        );
+        let chunk = Chunk {
+            id: "test:0".to_string(),
+            file_path: "test".to_string(),
+            line_start: 1,
+            line_end: 2,
+            content: "public class HugeClass : Base {\n}\n".to_string(),
+            language: Language::CSharp,
+            symbol_type: Some(SymbolType::Class),
+            symbol_name: Some("HugeClass".to_string()),
+            part_index: Some(1),
+        };
 
         let relations = extract_type_relations(&[chunk]);
         assert_eq!(relations.len(), 1);

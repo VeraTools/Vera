@@ -17,6 +17,7 @@ fn make_result(
         score: 1.0,
         symbol_name: symbol_name.map(ToString::to_string),
         symbol_type,
+        part_index: None,
     }
 }
 
@@ -432,6 +433,7 @@ fn broad_intent_queries_prefer_structural_chunks() {
                 score: 1.0,
                 symbol_name: Some("file_type_def".to_string()),
                 symbol_type: Some(SymbolType::Method),
+                part_index: None,
             },
             SearchResult {
                 file_path: "crates/ignore/src/types.rs".to_string(),
@@ -443,6 +445,7 @@ fn broad_intent_queries_prefer_structural_chunks() {
                 score: 1.0,
                 symbol_name: Some("Types".to_string()),
                 symbol_type: Some(SymbolType::Struct),
+                part_index: None,
             },
         ];
 

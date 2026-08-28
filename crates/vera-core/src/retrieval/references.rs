@@ -97,6 +97,7 @@ pub fn search_callers_through(
             score: 1.0,
             symbol_name,
             symbol_type,
+            part_index: None,
         });
     }
 

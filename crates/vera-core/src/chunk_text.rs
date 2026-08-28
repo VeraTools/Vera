@@ -789,6 +789,7 @@ pub fn authenticate(user: &str, password: &str) -> Result<Token> {\n\
             language: Language::Rust,
             symbol_type: Some(SymbolType::Function),
             symbol_name: Some("authenticate".to_string()),
+            part_index: None,
         }
     }
 
@@ -824,6 +825,7 @@ pub fn authenticate(user: &str, password: &str) -> Result<Token> {\n\
             language: Language::Toml,
             symbol_type: Some(SymbolType::Block),
             symbol_name: Some("Cargo.toml".to_string()),
+            part_index: None,
         };
         let text = build_bm25_text(&chunk);
         assert!(text.contains("Filename: Cargo.toml"));
@@ -875,6 +877,7 @@ pub fn authenticate(user: &str, password: &str) -> Result<Token> {\n\
             language: Language::Rust,
             symbol_type: Some(SymbolType::Block),
             symbol_name: None,
+            part_index: None,
         };
 
         let text = build_embedding_text_bounded(&chunk, 220);
@@ -991,6 +994,7 @@ pub fn authenticate(user: &str, password: &str) -> Result<Token> {\n\
             language: Language::Cpp,
             symbol_type: Some(SymbolType::Variable),
             symbol_name: Some("font".to_string()),
+            part_index: None,
         };
 
         let text = build_embedding_text(&chunk);

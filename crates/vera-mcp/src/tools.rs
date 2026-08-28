@@ -87,6 +87,7 @@ fn compact_results_json(
             content,
             symbol_name: r.symbol_name.as_deref(),
             symbol_type: r.symbol_type.as_ref(),
+            part_index: r.part_index,
         });
     }
     serde_json::to_string(&compact)
@@ -1200,6 +1201,7 @@ mod tests {
             score: 1.0,
             symbol_name: Some(name.to_string()),
             symbol_type: None,
+            part_index: None,
         }
     }
 

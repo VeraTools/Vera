@@ -20,6 +20,7 @@ fn make_result(
         score,
         symbol_name: symbol_name.map(|s| s.to_string()),
         symbol_type: Some(SymbolType::Function),
+        part_index: None,
     }
 }
 

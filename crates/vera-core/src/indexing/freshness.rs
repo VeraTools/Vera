@@ -21,12 +21,20 @@ pub const INDEX_FORMAT_VERSION_KEY: &str = "index_format_version";
 /// Increment this when the on-disk chunk or index format changes incompatibly.
 /// Eval harness `reuse_index` gates on this value; a missing or mismatched
 /// version forces a full re-index so stale chunk identity is never reused.
-pub const INDEX_FORMAT_VERSION: &str = "1";
+pub const INDEX_FORMAT_VERSION: &str = "2";
 /// Written last during index publication; its absence means the index was not
 /// fully written (interrupted build). `reuse_index` refuses to reuse an index
 /// lacking this marker.
 pub const INDEX_COMPLETE_KEY: &str = "index_complete";
 pub const INDEX_COMPLETE_VALUE: &str = "1";
+
+/// Returns true if the stored index format version matches the current binary.
+pub fn index_format_is_current(metadata_store: &MetadataStore) -> bool {
+    matches!(
+        metadata_store.get_index_meta(INDEX_FORMAT_VERSION_KEY),
+        Ok(Some(stored)) if stored == INDEX_FORMAT_VERSION
+    )
+}
 
 /// Summary of drift between the working tree and the current index.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]

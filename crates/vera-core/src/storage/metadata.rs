@@ -126,7 +126,7 @@ pub struct LanguageHealthStat {
 /// back to a full scan with nothing failing.
 const SQL_CHUNKS_BY_SYMBOL_NAME: &str =
     "SELECT id, file_path, line_start, line_end, content, language,
-                        symbol_type, symbol_name
+                        symbol_type, symbol_name, part_index
                  FROM chunks
                  WHERE lower(symbol_name) = lower(?1)
                  ORDER BY file_path, line_start";
@@ -151,7 +151,7 @@ const SQL_FIND_TYPE_RELATIONS: &str = "SELECT file_path, line, owner, target, ki
                  WHERE lower(target) = lower(?1)
                  ORDER BY file_path, line, owner";
 
-const SQL_FIND_DEAD_SYMBOLS: &str = "SELECT c.symbol_name, c.file_path, c.line_start, c.symbol_type
+const SQL_FIND_DEAD_SYMBOLS: &str = "SELECT c.symbol_name, c.file_path, MIN(c.line_start), c.symbol_type
                  FROM chunks c
                  WHERE c.symbol_name IS NOT NULL
                    AND c.symbol_type IN ('function', 'method')
@@ -160,7 +160,8 @@ const SQL_FIND_DEAD_SYMBOLS: &str = "SELECT c.symbol_name, c.file_path, c.line_s
                        SELECT 1 FROM [references] r
                        WHERE lower(r.callee) = lower(c.symbol_name)
                    )
-                 ORDER BY c.file_path, c.line_start";
+                 GROUP BY lower(c.symbol_name), c.file_path
+                 ORDER BY c.file_path, MIN(c.line_start)";
 
 /// Tables every complete index must contain. `open_existing` refuses
 /// half-written or truncated databases instead of serving empty results.
@@ -262,7 +263,8 @@ impl MetadataStore {
                     content TEXT NOT NULL,
                     language TEXT NOT NULL,
                     symbol_type TEXT,
-                    symbol_name TEXT
+                    symbol_name TEXT,
+                    part_index INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_chunks_file_path
                     ON chunks(file_path);
@@ -277,6 +279,17 @@ impl MetadataStore {
                     ON chunks(lower(symbol_name));",
             )
             .context("failed to create chunks table")?;
+
+        if !self.column_exists("chunks", "part_index")? {
+            self.conn
+                .execute_batch("ALTER TABLE chunks ADD COLUMN part_index INTEGER;")
+                .context("failed to add part_index column to chunks table")?;
+        }
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_part_index ON chunks(part_index);",
+            )
+            .context("failed to create part_index index")?;
 
         // File-level content hashing for incremental indexing.
         self.conn
@@ -386,8 +399,8 @@ impl MetadataStore {
                 .conn
                 .prepare_cached(
                     "INSERT OR REPLACE INTO chunks
-                     (id, file_path, line_start, line_end, content, language, symbol_type, symbol_name)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (id, file_path, line_start, line_end, content, language, symbol_type, symbol_name, part_index)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )
                 .context("failed to prepare insert statement")?;
 
@@ -402,6 +415,7 @@ impl MetadataStore {
                     chunk.language.to_string(),
                     sym_type,
                     chunk.symbol_name,
+                    chunk.part_index,
                 ])
                 .with_context(|| format!("failed to insert chunk: {}", chunk.id))?;
             }
@@ -416,7 +430,7 @@ impl MetadataStore {
             .conn
             .prepare_cached(
                 "SELECT id, file_path, line_start, line_end, content, language,
-                        symbol_type, symbol_name
+                        symbol_type, symbol_name, part_index
                  FROM chunks WHERE id = ?1",
             )
             .context("failed to prepare select statement")?;
@@ -448,7 +462,7 @@ impl MetadataStore {
             .join(",");
         let sql = format!(
             "SELECT id, file_path, line_start, line_end, content, language,
-                    symbol_type, symbol_name
+                    symbol_type, symbol_name, part_index
              FROM chunks WHERE id IN ({placeholders})"
         );
         let mut stmt = self
@@ -474,7 +488,7 @@ impl MetadataStore {
             .conn
             .prepare_cached(
                 "SELECT id, file_path, line_start, line_end, content, language,
-                        symbol_type, symbol_name
+                        symbol_type, symbol_name, part_index
                  FROM chunks WHERE file_path = ?1
                  ORDER BY line_start",
             )
@@ -579,7 +593,7 @@ impl MetadataStore {
             .conn
             .prepare_cached(
                 "SELECT id, file_path, line_start, line_end, content, language,
-                        symbol_type, symbol_name
+                        symbol_type, symbol_name, part_index
                  FROM chunks
                  WHERE symbol_name = ?1
                  ORDER BY file_path, line_start",
@@ -1298,6 +1312,7 @@ fn row_to_chunk(row: &rusqlite::Row<'_>) -> Result<Chunk> {
     let language_str: String = row.get(5).context("missing language")?;
     let symbol_type_str: Option<String> = row.get(6).context("missing symbol_type")?;
     let symbol_name: Option<String> = row.get(7).context("missing symbol_name")?;
+    let part_index: Option<u32> = row.get::<_, Option<u32>>(8).unwrap_or(None);
 
     let language = parse_language(&language_str);
     let symbol_type = symbol_type_str.as_deref().map(parse_symbol_type);
@@ -1311,6 +1326,7 @@ fn row_to_chunk(row: &rusqlite::Row<'_>) -> Result<Chunk> {
         language,
         symbol_type,
         symbol_name,
+        part_index,
     })
 }
 
@@ -1409,6 +1425,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("main".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/main.rs:1".to_string(),
@@ -1419,6 +1436,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Struct),
                 symbol_name: Some("Config".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/lib.py:0".to_string(),
@@ -1429,6 +1447,7 @@ mod tests {
                 language: Language::Python,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("hello".to_string()),
+                part_index: None,
             },
         ]
     }
@@ -2016,6 +2035,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: None,
                 symbol_name: None,
+                part_index: None,
             })
             .collect();
         store.insert_chunks(&chunks).unwrap();
@@ -2040,6 +2060,7 @@ mod tests {
             language: Language::Rust,
             symbol_type: None,
             symbol_name: None,
+            part_index: None,
         };
         let chunks = vec![
             chunk("a", "src/main.rs"),
@@ -2075,5 +2096,112 @@ mod tests {
         assert_eq!(parse_symbol_type("block"), SymbolType::Block);
         assert_eq!(parse_symbol_type("type_alias"), SymbolType::TypeAlias);
         assert_eq!(parse_language("rust"), Language::Rust);
+    }
+
+    #[test]
+    fn dead_code_dedup_key_is_symbol_and_file_across_parts() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        // Two split parts of same symbol in same file should count as one dead symbol (grouped)
+        store
+            .insert_chunks(&[
+                Chunk {
+                    id: "src/huge.rs:0:1".to_string(),
+                    file_path: "src/huge.rs".to_string(),
+                    line_start: 1,
+                    line_end: 50,
+                    content: "fn huge() { part1 }".to_string(),
+                    language: Language::Rust,
+                    symbol_type: Some(SymbolType::Function),
+                    symbol_name: Some("huge".to_string()),
+                    part_index: Some(1),
+                },
+                Chunk {
+                    id: "src/huge.rs:0:2".to_string(),
+                    file_path: "src/huge.rs".to_string(),
+                    line_start: 51,
+                    line_end: 100,
+                    content: "fn huge() { part2 }".to_string(),
+                    language: Language::Rust,
+                    symbol_type: Some(SymbolType::Function),
+                    symbol_name: Some("huge".to_string()),
+                    part_index: Some(2),
+                },
+                // Same symbol name but different file should be separate
+                Chunk {
+                    id: "src/other.rs:0".to_string(),
+                    file_path: "src/other.rs".to_string(),
+                    line_start: 1,
+                    line_end: 10,
+                    content: "fn huge() {}".to_string(),
+                    language: Language::Rust,
+                    symbol_type: Some(SymbolType::Function),
+                    symbol_name: Some("huge".to_string()),
+                    part_index: None,
+                },
+            ])
+            .unwrap();
+        let dead = store.find_dead_symbols().unwrap();
+        // Two files with same symbol name -> two dead entries (grouped by file)
+        // But the two parts in src/huge.rs are deduped to one
+        let huge_entries: Vec<_> = dead.iter().filter(|d| d.symbol_name == "huge").collect();
+        assert_eq!(huge_entries.len(), 2);
+        assert!(huge_entries.iter().any(|d| d.file_path == "src/huge.rs"));
+        assert!(huge_entries.iter().any(|d| d.file_path == "src/other.rs"));
+    }
+
+    #[test]
+    fn legacy_index_without_part_column_upgrades_or_requires_reindex() {
+        // Legacy version "1" must not be considered current; current version is "2"
+        let legacy_store = {
+            let s = MetadataStore::open_in_memory().unwrap();
+            s.set_index_meta(crate::indexing::freshness::INDEX_FORMAT_VERSION_KEY, "1")
+                .unwrap();
+            s
+        };
+        assert!(!crate::indexing::freshness::index_format_is_current(
+            &legacy_store
+        ));
+        let current_store = {
+            let s = MetadataStore::open_in_memory().unwrap();
+            s.set_index_meta(
+                crate::indexing::freshness::INDEX_FORMAT_VERSION_KEY,
+                crate::indexing::freshness::INDEX_FORMAT_VERSION,
+            )
+            .unwrap();
+            s
+        };
+        assert!(crate::indexing::freshness::index_format_is_current(
+            &current_store
+        ));
+        // Missing version (pre-format-version DB) is also stale
+        let missing = MetadataStore::open_in_memory().unwrap();
+        assert!(!crate::indexing::freshness::index_format_is_current(
+            &missing
+        ));
+        // New store has part_index column after migration
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("metadata.db");
+        let store = MetadataStore::open(&db_path).unwrap();
+        // Insertion with part_index survives round-trip
+        store
+            .insert_chunks(&[Chunk {
+                id: "src/new.rs:0:1".to_string(),
+                file_path: "src/new.rs".to_string(),
+                line_start: 1,
+                line_end: 10,
+                content: "fn huge() {}".to_string(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("huge".to_string()),
+                part_index: Some(1),
+            }])
+            .unwrap();
+        let fetched = store
+            .get_chunk("src/new.rs:0:1")
+            .unwrap()
+            .expect("chunk should be present");
+        assert_eq!(fetched.symbol_name.as_deref(), Some("huge"));
+        assert_eq!(fetched.part_index, Some(1));
+        assert_eq!(fetched.display_name().as_deref(), Some("huge (part 1)"));
     }
 }

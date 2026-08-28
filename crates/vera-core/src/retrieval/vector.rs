@@ -325,6 +325,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("alloc_page".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/alloc.rs:1".to_string(),
@@ -338,6 +339,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("dealloc_page".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/auth.rs:0".to_string(),
@@ -351,6 +353,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("authenticate".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/db.py:0".to_string(),
@@ -366,6 +369,7 @@ mod tests {
                 language: Language::Python,
                 symbol_type: Some(SymbolType::Class),
                 symbol_name: Some("DatabaseConnection".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/cache.go:0".to_string(),
@@ -381,6 +385,7 @@ mod tests {
                 language: Language::Go,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("NewLRUCache".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/server.ts:0".to_string(),
@@ -395,6 +400,7 @@ mod tests {
                 language: Language::TypeScript,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("handleRequest".to_string()),
+                part_index: None,
             },
         ]
     }
@@ -750,6 +756,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("a".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "b".to_string(),
@@ -760,6 +767,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("b".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "c".to_string(),
@@ -770,6 +778,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("c".to_string()),
+                part_index: None,
             },
         ];
         metadata_store.insert_chunks(&chunks).unwrap();

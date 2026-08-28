@@ -670,6 +670,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("authenticate_user".to_string()),
+                part_index: None,
             }])
             .unwrap();
         store.set_index_meta("model_name", "indexed-model").unwrap();
@@ -734,6 +735,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("authenticate_user".to_string()),
+                part_index: None,
             }])
             .unwrap();
         store.set_index_meta("model_name", "indexed-model").unwrap();
@@ -793,6 +795,7 @@ mod tests {
                 language: Language::Python,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("dependency_injection_work".to_string()),
+                part_index: None,
             });
         }
         chunks.push(Chunk {
@@ -805,6 +808,7 @@ mod tests {
             language: Language::Python,
             symbol_type: Some(SymbolType::Function),
             symbol_name: Some("solve_dependencies".to_string()),
+            part_index: None,
         });
 
         metadata_store.insert_chunks(&chunks).unwrap();
@@ -1031,6 +1035,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Trait),
                 symbol_name: Some("Sink".to_string()),
+                part_index: None,
             }])
             .unwrap();
 
@@ -1066,6 +1071,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Struct),
                     symbol_name: Some("Config".to_string()),
+                    part_index: None,
                 },
                 Chunk {
                     id: "config:1".to_string(),
@@ -1076,6 +1082,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Struct),
                     symbol_name: Some("Config".to_string()),
+                    part_index: None,
                 },
                 Chunk {
                     id: "config:2".to_string(),
@@ -1086,6 +1093,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Struct),
                     symbol_name: Some("Config".to_string()),
+                    part_index: None,
                 },
             ])
             .unwrap();
@@ -1121,6 +1129,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Function),
                     symbol_name: Some("persist_kimi_auth_record".to_string()),
+                    part_index: None,
                 },
                 Chunk {
                     id: "factory:0".to_string(),
@@ -1131,6 +1140,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Function),
                     symbol_name: Some("persist_factory_auth_record".to_string()),
+                    part_index: None,
                 },
                 Chunk {
                     id: "lib:0".to_string(),
@@ -1141,6 +1151,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Module),
                     symbol_name: Some("omnigate_auth".to_string()),
+                    part_index: None,
                 },
             ])
             .unwrap();
@@ -1155,6 +1166,7 @@ mod tests {
                 score: 0.0,
                 symbol_name: Some("omnigate_auth".to_string()),
                 symbol_type: Some(SymbolType::Module),
+                part_index: None,
             },
             SearchResult {
                 file_path: "backend/crates/omnigate-auth/src/factory.rs".to_string(),
@@ -1165,6 +1177,7 @@ mod tests {
                 score: 0.0,
                 symbol_name: Some("persist_factory_auth_record".to_string()),
                 symbol_type: Some(SymbolType::Function),
+                part_index: None,
             },
             SearchResult {
                 file_path: "backend/crates/omnigate-auth/src/kimi.rs".to_string(),
@@ -1175,6 +1188,7 @@ mod tests {
                 score: 0.0,
                 symbol_name: Some("persist_kimi_auth_record".to_string()),
                 symbol_type: Some(SymbolType::Function),
+                part_index: None,
             },
         ];
 
@@ -1217,6 +1231,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("common_fn".to_string()),
+                part_index: None,
             })
             .collect();
         chunks.push(Chunk {
@@ -1228,6 +1243,7 @@ mod tests {
             language: Language::Rust,
             symbol_type: Some(SymbolType::Function),
             symbol_name: Some("rare_fn".to_string()),
+            part_index: None,
         });
         store.insert_chunks(&chunks).unwrap();
 
@@ -1263,6 +1279,7 @@ mod tests {
                     language: Language::Python,
                     symbol_type: Some(SymbolType::Function),
                     symbol_name: Some("handle".to_string()),
+                    part_index: None,
                 },
                 Chunk {
                     id: "shallow:0".to_string(),
@@ -1273,6 +1290,7 @@ mod tests {
                     language: Language::Python,
                     symbol_type: Some(SymbolType::Function),
                     symbol_name: Some("handle".to_string()),
+                    part_index: None,
                 },
             ])
             .unwrap();

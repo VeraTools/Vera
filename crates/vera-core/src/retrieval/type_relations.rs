@@ -123,6 +123,7 @@ pub fn search_explicit_implementations(
             score: 1.0,
             symbol_name: Some(relation.owner),
             symbol_type: final_symbol_type,
+            part_index: None,
         });
     }
 

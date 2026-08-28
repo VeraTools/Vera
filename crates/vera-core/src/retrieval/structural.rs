@@ -386,6 +386,7 @@ fn result_for_match(
             score: 1.0,
             symbol_name: chunk.symbol_name.clone(),
             symbol_type: chunk.symbol_type,
+            part_index: None,
         };
     }
 
@@ -400,6 +401,7 @@ fn result_for_match(
         score: 1.0,
         symbol_name,
         symbol_type,
+        part_index: None,
     }
 }
 

@@ -1904,6 +1904,7 @@ mod tests {
             language: crate::types::Language::Rust,
             symbol_type: None,
             symbol_name: None,
+            part_index: None,
         }];
         let progress_events = AtomicUsize::new(0);
 
@@ -1961,6 +1962,7 @@ mod tests {
             language: crate::types::Language::Rust,
             symbol_type: None,
             symbol_name: None,
+            part_index: None,
         }];
         let provider = RecordingProvider {
             seen: Mutex::new(Vec::new()),
@@ -2012,6 +2014,7 @@ mod tests {
             language: crate::types::Language::Rust,
             symbol_type: None,
             symbol_name: None,
+            part_index: None,
         }];
         let provider = RecordingProvider {
             seen: Mutex::new(Vec::new()),

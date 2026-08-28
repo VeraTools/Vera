@@ -119,6 +119,7 @@ mod tests {
             score: 1.0,
             symbol_name: Some(symbol_name.to_string()),
             symbol_type: None,
+            part_index: None,
         }
     }
 

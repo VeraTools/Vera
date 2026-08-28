@@ -897,6 +897,7 @@ mod shortfall_tests {
             score: 1.0 - index as f64 / 100.0,
             symbol_name: None,
             symbol_type: None,
+            part_index: None,
         }
     }
 
