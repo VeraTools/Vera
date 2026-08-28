@@ -17,6 +17,7 @@ fn sample_chunks(n: usize) -> Vec<Chunk> {
             language: Language::Rust,
             symbol_type: Some(SymbolType::Function),
             symbol_name: Some(format!("func_{i}")),
+            part_index: None,
         })
         .collect()
 }

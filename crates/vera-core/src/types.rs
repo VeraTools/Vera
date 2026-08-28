@@ -355,6 +355,17 @@ impl<'a> GlobMatcher<'a> {
     }
 }
 
+/// Compose the display form of a symbol name, appending ` (part N)` when needed.
+///
+/// This is the single source of truth for part suffix formation. Identity logic
+/// never decomposes a name; display always recomposes via this helper.
+pub fn display_symbol_name(bare: &str, part_index: Option<u32>) -> String {
+    match part_index {
+        Some(idx) => format!("{bare} (part {idx})"),
+        None => bare.to_string(),
+    }
+}
+
 /// A chunk of source code extracted from a parsed file.
 ///
 /// This is the fundamental unit that gets indexed, embedded, and retrieved.
@@ -376,9 +387,18 @@ pub struct Chunk {
     pub symbol_type: Option<SymbolType>,
     /// Name of the symbol (if applicable).
     pub symbol_name: Option<String>,
+    /// 1-based part index for split symbols, `None` for unsplit symbols and gap chunks.
+    pub part_index: Option<u32>,
 }
 
 impl Chunk {
+    /// Display name including part suffix when applicable.
+    pub fn display_name(&self) -> Option<String> {
+        self.symbol_name
+            .as_deref()
+            .map(|bare| display_symbol_name(bare, self.part_index))
+    }
+
     /// Convert the chunk into a search result with the given relevance score.
     pub(crate) fn into_search_result(self, score: f64) -> SearchResult {
         SearchResult {
@@ -390,6 +410,7 @@ impl Chunk {
             score,
             symbol_name: self.symbol_name,
             symbol_type: self.symbol_type,
+            part_index: self.part_index,
         }
     }
 }
@@ -825,6 +846,7 @@ impl std::fmt::Display for SymbolType {
 /// Every field is always present in JSON serialization for schema consistency.
 /// `symbol_name` and `symbol_type` serialize as `null` when not applicable
 /// (e.g., for fallback/block chunks that don't correspond to a named symbol).
+/// `part_index` is `null` for unsplit symbols and a 1-based `u32` for split parts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     /// Repository-relative file path.
@@ -843,6 +865,17 @@ pub struct SearchResult {
     pub symbol_name: Option<String>,
     /// Symbol type (`null` if the result doesn't correspond to a typed symbol).
     pub symbol_type: Option<SymbolType>,
+    /// 1-based part index for split symbols, `null` for unsplit symbols.
+    pub part_index: Option<u32>,
+}
+
+impl SearchResult {
+    /// Display name including part suffix when applicable.
+    pub fn display_name(&self) -> Option<String> {
+        self.symbol_name
+            .as_deref()
+            .map(|bare| display_symbol_name(bare, self.part_index))
+    }
 }
 
 #[cfg(test)]
@@ -1236,6 +1269,7 @@ mod tests {
             language: Language::Rust,
             symbol_type: Some(SymbolType::Function),
             symbol_name: Some("main".to_string()),
+            part_index: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let deserialized: Chunk = serde_json::from_str(&json).unwrap();
@@ -1256,6 +1290,7 @@ mod tests {
             score: 0.95,
             symbol_name: None,
             symbol_type: None,
+            part_index: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         // Null fields must be present (not omitted) for schema consistency.
@@ -1278,6 +1313,7 @@ mod tests {
             score: 0.95,
             symbol_name: Some("example".to_string()),
             symbol_type: Some(SymbolType::Function),
+            part_index: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1296,6 +1332,7 @@ mod tests {
             score: 0.9,
             symbol_name: Some("foo".to_string()),
             symbol_type: Some(SymbolType::Function),
+            part_index: None,
         };
         let without_symbols = SearchResult {
             file_path: "b.rs".to_string(),
@@ -1306,6 +1343,7 @@ mod tests {
             score: 0.5,
             symbol_name: None,
             symbol_type: None,
+            part_index: None,
         };
 
         let json_with: serde_json::Value =
@@ -1341,6 +1379,7 @@ mod tests {
             score: 1.0,
             symbol_name: sym_name.map(|s| s.to_string()),
             symbol_type: sym_type,
+            part_index: None,
         }
     }
 
@@ -1560,6 +1599,7 @@ mod tests {
             score: 1.0,
             symbol_name: None,
             symbol_type: None,
+            part_index: None,
         };
         assert!(!filters.matches(&generated));
     }

@@ -109,9 +109,6 @@ fn select_seed_symbols(pool: &[SearchResult]) -> Vec<String> {
 
 fn base_symbol_name(symbol: &str) -> &str {
     symbol
-        .split_once(" (part ")
-        .map(|(base, _)| base)
-        .unwrap_or(symbol)
 }
 
 fn is_seed_symbol_type(symbol_type: SymbolType) -> bool {
@@ -189,6 +186,7 @@ mod tests {
             score,
             symbol_name: symbol_name.map(str::to_string),
             symbol_type,
+            part_index: None,
         }
     }
 
@@ -272,6 +270,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Function),
                     symbol_name: Some("target".to_string()),
+                    part_index: None,
                 },
                 Chunk {
                     id: "caller:0".to_string(),
@@ -282,6 +281,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Function),
                     symbol_name: Some("caller".to_string()),
+                    part_index: None,
                 },
             ])
             .unwrap();
@@ -391,20 +391,28 @@ mod tests {
     #[test]
     fn normalizes_split_chunk_seed_names() {
         let pool = vec![
-            result(
-                "large.rs",
-                1,
-                1.0,
-                Some("LargeFunction (part 1)"),
-                Some(SymbolType::Function),
-            ),
-            result(
-                "large.rs",
-                20,
-                0.9,
-                Some("LargeFunction (part 2)"),
-                Some(SymbolType::Function),
-            ),
+            SearchResult {
+                file_path: "large.rs".to_string(),
+                line_start: 1,
+                line_end: 3,
+                content: "content".to_string(),
+                language: Language::Rust,
+                score: 1.0,
+                symbol_name: Some("LargeFunction".to_string()),
+                symbol_type: Some(SymbolType::Function),
+                part_index: Some(1),
+            },
+            SearchResult {
+                file_path: "large.rs".to_string(),
+                line_start: 20,
+                line_end: 22,
+                content: "content".to_string(),
+                language: Language::Rust,
+                score: 0.9,
+                symbol_name: Some("LargeFunction".to_string()),
+                symbol_type: Some(SymbolType::Function),
+                part_index: Some(2),
+            },
         ];
 
         assert_eq!(select_seed_symbols(&pool), vec!["LargeFunction"]);

@@ -381,6 +381,7 @@ fn add_document(
             .unwrap_or(crate::types::Language::Unknown),
         symbol_type: None,
         symbol_name: doc_data.symbol_name.map(ToString::to_string),
+        part_index: None,
     };
     let searchable_text = chunk_text::build_bm25_text(&chunk);
     writer
@@ -570,6 +571,7 @@ mod tests {
                         language: d.language.parse().unwrap(),
                         symbol_type: None,
                         symbol_name: d.symbol_name.map(ToString::to_string),
+                        part_index: None,
                     })
                     .collect::<Vec<_>>(),
             )
@@ -587,6 +589,7 @@ mod tests {
                         language: d.language.parse().unwrap(),
                         symbol_type: None,
                         symbol_name: d.symbol_name.map(ToString::to_string),
+                        part_index: None,
                     })
                     .collect::<Vec<_>>(),
             )

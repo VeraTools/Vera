@@ -87,6 +87,7 @@ mod tests {
             symbol_name: None,
             symbol_type: None,
             language: Language::Rust,
+            part_index: None,
         };
         assert_eq!(result_key(&r), "src/main.rs:10:20");
     }

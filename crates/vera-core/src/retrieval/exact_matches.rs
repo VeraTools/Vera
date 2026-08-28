@@ -574,6 +574,7 @@ mod tests {
             language: crate::types::Language::Rust,
             symbol_type: Some(symbol_type),
             symbol_name: Some(symbol_name.to_string()),
+            part_index: None,
         }
     }
 

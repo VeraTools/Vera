@@ -834,7 +834,7 @@ async fn result_json_serialization_complete() {
     let arr = parsed.as_array().unwrap();
     assert!(!arr.is_empty());
 
-    // Context capsule schema: every result must have all 8 fields.
+    // Context capsule schema: every result must have all 9 fields (including part_index).
     let expected_keys: std::collections::BTreeSet<&str> = [
         "file_path",
         "line_start",
@@ -844,6 +844,7 @@ async fn result_json_serialization_complete() {
         "score",
         "symbol_name",
         "symbol_type",
+        "part_index",
     ]
     .into_iter()
     .collect();
@@ -1144,6 +1145,7 @@ async fn context_capsule_schema_consistency_across_queries() {
         "score",
         "symbol_name",
         "symbol_type",
+        "part_index",
     ]
     .into_iter()
     .collect();

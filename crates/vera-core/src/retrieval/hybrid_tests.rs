@@ -38,6 +38,7 @@ fn make_result(
         score,
         symbol_name: symbol_name.map(|s| s.to_string()),
         symbol_type: Some(SymbolType::Function),
+        part_index: None,
     }
 }
 
@@ -1152,6 +1153,7 @@ mod indexed_files_cache_tests {
             language: Language::Rust,
             symbol_type: Some(SymbolType::Function),
             symbol_name: Some("f".to_string()),
+            part_index: None,
         }
     }
 

@@ -17,6 +17,8 @@ pub struct CompactResult<'a> {
     pub symbol_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_type: Option<&'a SymbolType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part_index: Option<u32>,
 }
 
 impl<'a> CompactResult<'a> {
@@ -28,6 +30,7 @@ impl<'a> CompactResult<'a> {
             content: Cow::Borrowed(r.content.as_str()),
             symbol_name: r.symbol_name.as_deref(),
             symbol_type: r.symbol_type.as_ref(),
+            part_index: r.part_index,
         }
     }
 }

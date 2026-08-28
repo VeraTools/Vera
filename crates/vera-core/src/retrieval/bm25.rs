@@ -230,6 +230,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("authenticate".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/auth.rs:1".to_string(),
@@ -243,6 +244,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("verify_credentials".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/config.py:0".to_string(),
@@ -258,6 +260,7 @@ mod tests {
                 language: Language::Python,
                 symbol_type: Some(SymbolType::Class),
                 symbol_name: Some("DatabaseConfig".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/server.ts:0".to_string(),
@@ -272,6 +275,7 @@ mod tests {
                 language: Language::TypeScript,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("handleRequest".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/utils.rs:0".to_string(),
@@ -284,6 +288,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("format_output".to_string()),
+                part_index: None,
             },
             Chunk {
                 id: "src/db.go:0".to_string(),
@@ -297,6 +302,7 @@ mod tests {
                 language: Language::Go,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("ConnectDatabase".to_string()),
+                part_index: None,
             },
         ]
     }
@@ -512,6 +518,7 @@ mod tests {
                 language: Language::Python,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("dependency_injection_work".to_string()),
+                part_index: None,
             });
         }
         chunks.push(Chunk {
@@ -524,6 +531,7 @@ mod tests {
             language: Language::Python,
             symbol_type: Some(SymbolType::Function),
             symbol_name: Some("solve_dependencies".to_string()),
+            part_index: None,
         });
 
         metadata_store.insert_chunks(&chunks).unwrap();
@@ -579,6 +587,7 @@ mod tests {
                 language: Language::Python,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("paged_hydration_marker".to_string()),
+                part_index: None,
             });
         }
         for i in 0..matching_count {
@@ -593,6 +602,7 @@ mod tests {
                 language: Language::Rust,
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some(format!("match_{i}")),
+                part_index: None,
             });
         }
 

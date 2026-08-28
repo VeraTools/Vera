@@ -336,6 +336,18 @@ where
     let metadata_store =
         MetadataStore::open(&metadata_path).context("failed to open metadata store")?;
 
+    // Index format version must match: legacy suffixed rows (v1) are never silently reused.
+    if !crate::indexing::freshness::index_format_is_current(&metadata_store) {
+        bail!(
+            "Index format version mismatch (expected {}, found {:?}). Run `vera index {}` to rebuild the index.",
+            crate::indexing::freshness::INDEX_FORMAT_VERSION,
+            metadata_store
+                .get_index_meta(crate::indexing::freshness::INDEX_FORMAT_VERSION_KEY)
+                .unwrap_or(None),
+            repo_root.display()
+        );
+    }
+
     let mut stored_dim = config.embedding.max_stored_dim;
 
     // Check for provider mismatch.
@@ -1011,5 +1023,69 @@ mod regression_tests {
 
         let freshness = detect_staleness(dir.path(), &config.indexing).unwrap();
         assert_eq!(freshness.files_modified, 1);
+    }
+
+    #[tokio::test]
+    async fn update_with_shifted_split_boundaries_leaves_no_orphan_rows() {
+        let dir = tempdir().unwrap();
+        // Create a large function with 500 lines (splits into 3 parts with max 200)
+        let large: String = {
+            let mut s = String::from("fn huge() {\n");
+            for i in 0..498 {
+                s.push_str(&format!("    let x{i} = {i};\n"));
+            }
+            s.push_str("}\n");
+            s
+        };
+        std::fs::write(dir.path().join("huge.rs"), &large).unwrap();
+        let provider = MockProvider::new(8);
+        let config = VeraConfig::default();
+        index_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+        let idx = index_dir(&dir.path().canonicalize().unwrap());
+        let meta_path = idx.join("metadata.db");
+        let store = crate::storage::metadata::MetadataStore::open(&meta_path).unwrap();
+        let before: Vec<_> = store.get_chunks_by_file("huge.rs").unwrap();
+        assert!(
+            before.len() > 2,
+            "should split into >2 parts, got {}",
+            before.len()
+        );
+        for c in &before {
+            assert_eq!(c.symbol_name.as_deref(), Some("huge"));
+            assert!(c.part_index.is_some());
+        }
+
+        // Modify to 250 lines (splits into 2 parts)
+        let smaller: String = {
+            let mut s = String::from("fn huge() {\n");
+            for i in 0..248 {
+                s.push_str(&format!("    let x{i} = {i};\n"));
+            }
+            s.push_str("}\n");
+            s
+        };
+        std::fs::write(dir.path().join("huge.rs"), &smaller).unwrap();
+        update_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+        let store = crate::storage::metadata::MetadataStore::open(&meta_path).unwrap();
+        let after: Vec<_> = store.get_chunks_by_file("huge.rs").unwrap();
+        assert!(!after.is_empty() && after.len() < before.len());
+        // No orphan: all remaining chunks have part_index sequential 1..k and same bare name
+        for (idx, c) in after.iter().enumerate() {
+            assert_eq!(c.symbol_name.as_deref(), Some("huge"));
+            assert_eq!(c.part_index, Some((idx as u32) + 1));
+        }
+        // Ensure no leftover IDs with higher part numbers
+        let ids: Vec<_> = after.iter().map(|c| c.id.as_str()).collect();
+        for id in &ids {
+            assert!(
+                !id.ends_with(":3") || after.len() >= 3,
+                "orphan part 3 should not remain when now only {} parts",
+                after.len()
+            );
+        }
     }
 }

@@ -131,6 +131,7 @@ pub fn search_regex(
                 symbol_name,
                 symbol_type,
                 language,
+                part_index: None,
             };
 
             if !filters.matches_symbol_type(symbol_type) {
@@ -174,6 +175,7 @@ fn collect_minified_matches(
             symbol_name,
             symbol_type,
             language,
+            part_index: None,
         };
 
         if !filters.matches_symbol_type(symbol_type) {
@@ -234,6 +236,7 @@ mod tests {
                     language: Language::TypeScript,
                     symbol_type: None,
                     symbol_name: None,
+                    part_index: None,
                 },
                 Chunk {
                     id: "docs:0".to_string(),
@@ -244,6 +247,7 @@ mod tests {
                     language: Language::Markdown,
                     symbol_type: None,
                     symbol_name: None,
+                    part_index: None,
                 },
             ])
             .unwrap();
@@ -287,6 +291,7 @@ mod tests {
                 language: Language::JavaScript,
                 symbol_type: None,
                 symbol_name: None,
+                part_index: None,
             }])
             .unwrap();
 
@@ -329,6 +334,7 @@ mod tests {
                 language: Language::JavaScript,
                 symbol_type: None,
                 symbol_name: None,
+                part_index: None,
             }])
             .unwrap();
 
@@ -379,6 +385,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: None,
                     symbol_name: None,
+                    part_index: None,
                 },
                 Chunk {
                     id: "tests:0".to_string(),
@@ -389,6 +396,7 @@ mod tests {
                     language: Language::Python,
                     symbol_type: None,
                     symbol_name: None,
+                    part_index: None,
                 },
             ])
             .unwrap();
@@ -435,6 +443,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Struct),
                     symbol_name: Some("TokenConfig".to_string()),
+                    part_index: None,
                 },
                 Chunk {
                     id: "fn:0".to_string(),
@@ -445,6 +454,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: Some(SymbolType::Function),
                     symbol_name: Some("build_token".to_string()),
+                    part_index: None,
                 },
             ])
             .unwrap();
@@ -506,6 +516,7 @@ mod tests {
                     language: Language::Rust,
                     symbol_type: None,
                     symbol_name: None,
+                    part_index: None,
                 },
                 Chunk {
                     id: "absolute:0".to_string(),
@@ -516,6 +527,7 @@ mod tests {
                     language: Language::Unknown,
                     symbol_type: None,
                     symbol_name: None,
+                    part_index: None,
                 },
                 Chunk {
                     id: "traversal:0".to_string(),
@@ -526,6 +538,7 @@ mod tests {
                     language: Language::Unknown,
                     symbol_type: None,
                     symbol_name: None,
+                    part_index: None,
                 },
             ])
             .unwrap();

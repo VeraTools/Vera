@@ -172,6 +172,23 @@ pub fn prepare_indexed_repo(
     if !index_dir.exists() {
         anyhow::bail!(MISSING_INDEX_MESSAGE);
     }
+    // Index format version must match: legacy suffixed rows would be silently wrong.
+    {
+        let metadata_path = index_dir.join("metadata.db");
+        if metadata_path.is_file()
+            && let Ok(store) = vera_core::storage::metadata::MetadataStore::open(&metadata_path)
+            && !vera_core::indexing::freshness::index_format_is_current(&store)
+        {
+            anyhow::bail!(
+                "Index format version mismatch (expected {}, found {:?}). Run `vera index {}` to rebuild the index.",
+                vera_core::indexing::freshness::INDEX_FORMAT_VERSION,
+                store
+                    .get_index_meta(vera_core::indexing::freshness::INDEX_FORMAT_VERSION_KEY)
+                    .unwrap_or(None),
+                cwd.display()
+            );
+        }
+    }
     warn_if_index_stale(&cwd, indexing_config);
     Ok((cwd, index_dir))
 }
@@ -390,7 +407,7 @@ pub fn output_results(
 
 fn result_info_line(r: &vera_core::types::SearchResult) -> String {
     let mut info = format!("{}:{}-{}", r.file_path, r.line_start, r.line_end);
-    if let (Some(stype), Some(name)) = (&r.symbol_type, &r.symbol_name) {
+    if let (Some(stype), Some(name)) = (&r.symbol_type, r.display_name()) {
         info.push_str(&format!(" {stype}:{name}"));
     }
     info
@@ -476,7 +493,7 @@ fn format_raw_results(
             result.line_end,
             result.language,
         ));
-        if let Some(ref name) = result.symbol_name {
+        if let Some(name) = result.display_name() {
             match &result.symbol_type {
                 Some(stype) => out.push_str(&format!("   {stype} {name}\n")),
                 None => out.push_str(&format!("   {name}\n")),
@@ -597,6 +614,7 @@ mod tests {
                 score: 0.9,
                 symbol_name: Some("a".to_string()),
                 symbol_type: None,
+                part_index: None,
             },
             vera_core::types::SearchResult {
                 file_path: "src/b.rs".to_string(),
@@ -607,6 +625,7 @@ mod tests {
                 score: 0.5,
                 symbol_name: None,
                 symbol_type: None,
+                part_index: None,
             },
         ]
     }

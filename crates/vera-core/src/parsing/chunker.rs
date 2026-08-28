@@ -120,6 +120,7 @@ pub fn chunks_from_symbols(
                     language,
                     symbol_type: Some(SymbolType::Block),
                     symbol_name: None,
+                    part_index: None,
                 });
                 chunk_index += 1;
             }
@@ -148,6 +149,7 @@ pub fn chunks_from_symbols(
                 language,
                 symbol_type: Some(symbol.symbol_type),
                 symbol_name: symbol.name.clone(),
+                part_index: None,
             });
             chunk_index += 1;
         }
@@ -173,6 +175,7 @@ pub fn chunks_from_symbols(
                 language,
                 symbol_type: Some(SymbolType::Block),
                 symbol_name: None,
+                part_index: None,
             });
         }
     }
@@ -198,6 +201,7 @@ pub fn whole_file_chunk(source: &str, file_path: &str, language: Language) -> Ve
         language,
         symbol_type: Some(SymbolType::Block),
         symbol_name: Some(file_name(file_path).to_string()),
+        part_index: None,
     }]
 }
 
@@ -229,8 +233,6 @@ fn split_large_symbol(
             find_split_boundary(lines, current, ideal_end, max_lines)
         };
         let content = join_lines(lines, current, chunk_end);
-        let sub_name = symbol.name.as_ref().map(|n| format!("{n} (part {part})"));
-
         chunks.push(Chunk {
             id: format!("{file_path}:{}", *chunk_index),
             file_path: file_path.to_string(),
@@ -239,7 +241,8 @@ fn split_large_symbol(
             content,
             language,
             symbol_type: Some(symbol.symbol_type),
-            symbol_name: sub_name,
+            symbol_name: symbol.name.clone(),
+            part_index: Some(part),
         });
 
         *chunk_index += 1;
@@ -376,6 +379,7 @@ pub fn markdown_section_chunks(source: &str, file_path: &str) -> Vec<Chunk> {
                         language: Language::Markdown,
                         symbol_type: Some(SymbolType::Block),
                         symbol_name: Some(name),
+                        part_index: None,
                     });
                     chunk_index += 1;
                 }
@@ -399,6 +403,7 @@ pub fn markdown_section_chunks(source: &str, file_path: &str) -> Vec<Chunk> {
             language: Language::Markdown,
             symbol_type: Some(SymbolType::Block),
             symbol_name: Some(name),
+            part_index: None,
         });
     }
 
@@ -462,6 +467,7 @@ pub fn rst_section_chunks(source: &str, file_path: &str, headings: &[(u32, Strin
                 language: Language::Rst,
                 symbol_type: Some(SymbolType::Block),
                 symbol_name: Some(file_name(file_path).to_string()),
+                part_index: None,
             });
             chunk_index += 1;
         }
@@ -492,6 +498,7 @@ pub fn rst_section_chunks(source: &str, file_path: &str, headings: &[(u32, Strin
             language: Language::Rst,
             symbol_type: Some(SymbolType::Block),
             symbol_name: Some(title.clone()),
+            part_index: None,
         });
         chunk_index += 1;
     }
@@ -534,6 +541,7 @@ pub fn tier0_line_chunks(source: &str, file_path: &str, language: Language) -> V
                 language,
                 symbol_type: Some(SymbolType::Block),
                 symbol_name: None,
+                part_index: None,
             });
             chunk_index += 1;
         }
@@ -590,24 +598,29 @@ pub fn split_oversized_chunks(chunks: Vec<Chunk>, max_bytes: usize) -> Vec<Chunk
             // Ensure at least one line per sub-chunk.
             let end = lo.max(current);
             let sub_content = lines[current as usize..=end as usize].join("\n");
-            let sub_name = chunk
-                .symbol_name
-                .as_ref()
-                .map(|n| format!("{n} (part {part})"));
+            let bare_name = chunk.symbol_name.clone();
+            let is_single = part == 1 && end + 1 >= total;
+            let part_index = if bare_name.is_none() || is_single {
+                None
+            } else {
+                Some(part)
+            };
+            let id = if is_single {
+                chunk.id.clone()
+            } else {
+                format!("{}:{part}", chunk.id)
+            };
 
             result.push(Chunk {
-                id: format!("{}:{part}", chunk.id),
+                id,
                 file_path: chunk.file_path.clone(),
                 line_start: chunk.line_start + current,
                 line_end: chunk.line_start + end,
                 content: sub_content,
                 language: chunk.language,
                 symbol_type: chunk.symbol_type,
-                symbol_name: if part == 1 && end + 1 >= total {
-                    chunk.symbol_name.clone()
-                } else {
-                    sub_name
-                },
+                symbol_name: bare_name,
+                part_index,
             });
 
             part += 1;
@@ -907,10 +920,21 @@ mod tests {
                 all_content.push('\n');
             }
             all_content.push_str(&chunk.content);
-            // Sub-chunks should have part numbers in name
-            assert!(
-                chunk.symbol_name.as_ref().unwrap().contains("part"),
-                "sub-chunk should have part number"
+            // Sub-chunks store bare name plus part_index
+            assert_eq!(
+                chunk.symbol_name.as_deref(),
+                Some("big"),
+                "sub-chunk should store bare name"
+            );
+            assert_eq!(
+                chunk.part_index,
+                Some((i as u32) + 1),
+                "sub-chunk part_index should be 1-based"
+            );
+            assert_eq!(
+                chunk.display_name(),
+                Some(format!("big (part {})", i + 1)),
+                "display name should compose suffix"
             );
         }
         assert_eq!(all_content, source);
@@ -1067,5 +1091,131 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].symbol_name.as_deref(), Some("Title"));
         assert!(chunks[0].content.contains("## not a heading"));
+    }
+
+    #[test]
+    fn line_count_split_stores_bare_name_and_part_index() {
+        let mut lines = vec!["fn big() {".to_string()];
+        for i in 0..8 {
+            lines.push(format!("    let x{i} = {i};"));
+        }
+        lines.push("}".to_string());
+        let source = lines.join("\n");
+        let symbols = vec![RawSymbol {
+            name: Some("big".to_string()),
+            symbol_type: SymbolType::Function,
+            start_byte: 0,
+            end_byte: source.len(),
+            start_row: 0,
+            end_row: 9,
+        }];
+        let config = IndexingConfig {
+            max_chunk_lines: 3,
+            ..Default::default()
+        };
+        let chunks = chunks_from_symbols(&symbols, &source, "test.rs", Language::Rust, &config);
+        assert!(chunks.len() > 1);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.symbol_name.as_deref(), Some("big"));
+            assert_eq!(chunk.part_index, Some((idx as u32) + 1));
+            assert_eq!(
+                chunk.display_name(),
+                Some(format!("big (part {})", idx + 1))
+            );
+        }
+    }
+
+    #[test]
+    fn byte_budget_single_part_stays_bare() {
+        let content = "fn tiny() { let x = 1; }".to_string();
+        let chunk = Chunk {
+            id: "src/lib.rs:0".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: content.clone(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("tiny".to_string()),
+            part_index: None,
+        };
+        let result = split_oversized_chunks(vec![chunk.clone()], 10_000);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, chunk.id);
+        assert_eq!(result[0].symbol_name.as_deref(), Some("tiny"));
+        assert_eq!(result[0].part_index, None);
+        assert_eq!(result[0].display_name().as_deref(), Some("tiny"));
+    }
+
+    #[test]
+    fn byte_budget_split_stores_bare_and_part_index() {
+        let lines: Vec<String> = (0..30).map(|i| format!("line {i} content")).collect();
+        let content = lines.join("\n");
+        let chunk = Chunk {
+            id: "src/large.rs:0".to_string(),
+            file_path: "src/large.rs".to_string(),
+            line_start: 1,
+            line_end: 30,
+            content,
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("LargeFn".to_string()),
+            part_index: None,
+        };
+        // Force split with tiny max_bytes
+        let result = split_oversized_chunks(vec![chunk], 50);
+        assert!(result.len() > 1);
+        for (idx, c) in result.iter().enumerate() {
+            assert_eq!(c.symbol_name.as_deref(), Some("LargeFn"));
+            assert_eq!(c.part_index, Some((idx as u32) + 1));
+            assert_eq!(
+                c.display_name(),
+                Some(format!("LargeFn (part {})", idx + 1))
+            );
+            assert_eq!(c.id, format!("src/large.rs:0:{}", idx + 1));
+        }
+    }
+
+    #[test]
+    fn literal_part_suffix_is_verbatim() {
+        // Symbol legitimately named "foo (part 2)" should not be decomposed
+        let source = "fn foo() {}\n";
+        let symbols = vec![RawSymbol {
+            name: Some("foo (part 2)".to_string()),
+            symbol_type: SymbolType::Function,
+            start_byte: 0,
+            end_byte: source.len(),
+            start_row: 0,
+            end_row: 0,
+        }];
+        let chunks = chunks_from_symbols(
+            &symbols,
+            source,
+            "test.rs",
+            Language::Rust,
+            &default_config(),
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].symbol_name.as_deref(), Some("foo (part 2)"));
+        assert_eq!(chunks[0].part_index, None);
+        assert_eq!(chunks[0].display_name().as_deref(), Some("foo (part 2)"));
+    }
+
+    #[test]
+    fn display_helper_is_single_source() {
+        // Compose is the single source; decompose never used for identity
+        assert_eq!(
+            crate::types::display_symbol_name("myfn", Some(2)),
+            "myfn (part 2)"
+        );
+        assert_eq!(crate::types::display_symbol_name("myfn", None), "myfn");
+        assert_eq!(
+            crate::types::display_symbol_name("foo (part 2)", None),
+            "foo (part 2)"
+        );
+        assert_eq!(
+            crate::types::display_symbol_name("foo (part 2)", Some(1)),
+            "foo (part 2) (part 1)"
+        );
     }
 }
