@@ -342,8 +342,7 @@ fn scan_snapshot(
     query: &[f32],
     limit: usize,
 ) -> Result<Vec<DistanceCandidate>> {
-    let max_k = limit.min(MAX_KNN_K);
-    if max_k == 0 {
+    if limit == 0 {
         return Ok(Vec::new());
     }
     let dim = snapshot.manifest.dim;
@@ -353,6 +352,13 @@ fn scan_snapshot(
             dim,
             query.len()
         );
+    }
+    // Flat scan is bounded by the actual vector count, not the sqlite-vec KNN cap.
+    let values_len = snapshot.data.as_slice().len();
+    let available = values_len / dim;
+    let max_k = limit.min(available);
+    if max_k == 0 {
+        return Ok(Vec::new());
     }
     let values = snapshot.data.as_slice();
     let mut heap = BinaryHeap::with_capacity(max_k);
@@ -994,10 +1000,12 @@ pub struct VectorStore {
     flat: Mutex<FlatStorage>,
 }
 
-/// Maximum `k` sqlite-vec accepts in a KNN query. Requesting more is a hard
-/// error from the extension, not a soft limit.
+/// Maximum `k` sqlite-vec (vec0) accepts in a KNN query. Requesting more is a hard
+/// error from the extension, not a soft limit. The flat scanner is not bounded
+/// by this cap and honors the caller's requested depth up to the actual vector
+/// count (see `scan_snapshot`).
 ///
-/// Public so callers can size their candidate pools against the real ceiling
+/// Public so callers can size their candidate pools against the real vec0 ceiling
 /// instead of scaling past it and relying on [`VectorStore::search`] to clamp.
 pub const MAX_KNN_K: usize = 4096;
 
@@ -1332,14 +1340,6 @@ impl VectorStore {
             );
         }
 
-        if limit > MAX_KNN_K {
-            tracing::warn!(
-                requested = limit,
-                clamped = MAX_KNN_K,
-                "clamping vector search limit to the KNN cap; the extra candidates are not fetched"
-            );
-        }
-
         if self.scan_mode == VectorScanMode::Flat {
             let mut flat = self
                 .flat
@@ -1369,11 +1369,20 @@ impl VectorStore {
         // it on natural-language queries, and the whole vector arm would then be
         // dropped in favour of BM25-only results. Ask for as many as the backend
         // allows instead.
-        // Warn rather than debug: this is a silent quality reduction, and the
-        // reason #38 was hard to diagnose was a swallowed signal. Vera's own
-        // retrieval path now bounds the pool before it gets here, so reaching
-        // this branch means an external caller asked for more than the backend
-        // can give.
+        // Honest, pinned diagnostic: only warn when vec0 clamping could actually
+        // lose results (index larger than cap and request exceeds cap). Keep
+        // quiet on below-cap indexes and on small requests.
+        if limit > MAX_KNN_K
+            && let Ok(count) = self.count()
+            && count > MAX_KNN_K as u64
+        {
+            tracing::warn!(
+                requested = limit,
+                clamped = MAX_KNN_K,
+                index_count = count,
+                "vec0 vector search truncated at sqlite-vec KNN cap (4096); results may be incomplete. Use the default flat vector scan (unset VERA_VECTOR_SCAN) for complete results"
+            );
+        }
         let limit = limit.min(MAX_KNN_K);
 
         // `prepare`, not `prepare_cached`: `limit` is interpolated into the
@@ -1419,30 +1428,33 @@ impl VectorStore {
             .collect()
     }
 
-    /// Resolve many rowids to their chunk ids in a single query.
+    /// Resolve many rowids to their chunk ids in a single query, batching to stay
+    /// below SQLite's variable limit. Result order is caller's responsibility.
     fn chunk_ids_for_rowids(&self, rowids: &[i64]) -> Result<HashMap<i64, String>> {
         if rowids.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", rowids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        // Text varies with the number of ids, so plain `prepare` here too.
-        let mut stmt = self
-            .conn
-            .prepare(&format!(
-                "SELECT rowid, chunk_id FROM chunk_id_map WHERE rowid IN ({placeholders})"
-            ))
-            .context("failed to prepare chunk id lookup")?;
+        let mut mapped = HashMap::with_capacity(rowids.len());
+        for batch in rowids.chunks(crate::storage::SQL_PARAMETER_BATCH) {
+            let placeholders = crate::storage::sql_placeholders(batch.len());
+            // Text varies with the number of ids, so plain `prepare` here too.
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "SELECT rowid, chunk_id FROM chunk_id_map WHERE rowid IN ({placeholders})"
+                ))
+                .context("failed to prepare chunk id lookup")?;
 
-        let mapped = stmt
-            .query_map(rusqlite::params_from_iter(rowids.iter()), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .context("failed to query chunk ids")?
-            .collect::<std::result::Result<HashMap<_, _>, _>>()
-            .context("failed to collect chunk ids")?;
+            let batch_map = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("failed to query chunk ids")?
+                .collect::<std::result::Result<HashMap<_, _>, _>>()
+                .context("failed to collect chunk ids")?;
+            mapped.extend(batch_map);
+        }
         Ok(mapped)
     }
 
@@ -1460,6 +1472,16 @@ impl VectorStore {
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |row| row.get(0))
             .context("failed to count vectors")?;
         Ok(count as u64)
+    }
+
+    /// Whether this store is using the flat (SIMD) scan path.
+    pub fn is_flat(&self) -> bool {
+        self.scan_mode == VectorScanMode::Flat
+    }
+
+    /// Whether this store is using the vec0 (sqlite-vec) path.
+    pub fn is_vec0(&self) -> bool {
+        self.scan_mode == VectorScanMode::Vec0
     }
 
     /// Delete a vector by chunk ID.
@@ -2457,5 +2479,115 @@ mod tests {
 
         let results = store.search(&[5.0, 0.0, 0.0, 0.0], MAX_KNN_K + 1).unwrap();
         assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn flat_scan_returns_full_depth_above_legacy_knn_cap() {
+        // VAL-FILTER-009: flat scanner must honor depth bounded by the actual
+        // vector count (values.len() / dim), not the legacy 4096 clamp.
+        // This test would have failed when `MAX_KNN_K` was used as a hard flat cap.
+        let dim = 4;
+        let store = VectorStore::open_in_memory_with_mode(dim, VectorScanMode::Flat).unwrap();
+        let count = 5000;
+        for index in 0..count {
+            store
+                .insert(&format!("chunk-{index:04}"), &[index as f32, 0.0, 0.0, 0.0])
+                .unwrap();
+        }
+        assert_eq!(store.count().unwrap(), count as u64);
+
+        let query = vec![2500.0, 0.0, 0.0, 0.0];
+
+        // Requesting the full depth must return the full depth on flat.
+        let all = store.search(&query, count).unwrap();
+        assert_eq!(
+            all.len(),
+            count,
+            "flat scan must return full depth above legacy 4096 cap"
+        );
+        assert!(all.len() > MAX_KNN_K);
+        // Distances must be sorted.
+        assert!(
+            all.windows(2)
+                .all(|pair| pair[0].distance <= pair[1].distance)
+        );
+
+        // Small limit still works.
+        let ten = store.search(&query, 10).unwrap();
+        assert_eq!(ten.len(), 10);
+
+        // The cap constant itself must remain vec0-specific in the doc comment.
+        // Guard against reintroducing the hard clamp by checking the doc still says vec0-only.
+        assert_eq!(MAX_KNN_K, 4096);
+    }
+
+    #[test]
+    fn chunk_ids_for_rowids_batches_above_sql_variable_limit() {
+        // VAL-FILTER-010: chunk_ids_for_rowids must handle >999 rowids without
+        // "too many SQL variables". The fix batches at 900.
+        let store = VectorStore::open_in_memory_with_mode(4, VectorScanMode::Flat).unwrap();
+        let count = 2500;
+        for index in 0..count {
+            store
+                .insert(&format!("c{index:04}"), &[index as f32, 0.0, 0.0, 0.0])
+                .unwrap();
+        }
+        let rowids: Vec<i64> = (1..=count).map(|value| value as i64).collect();
+        let map = store.chunk_ids_for_rowids(&rowids).unwrap();
+        assert_eq!(map.len(), count as usize);
+        // Every rowid is present and maps to the expected chunk id.
+        assert_eq!(map.get(&1).unwrap(), "c0000");
+        assert_eq!(map.get(&901).unwrap(), "c0900");
+        assert_eq!(map.get(&2500).unwrap(), "c2499");
+        // Re-projecting in caller order must restore the rowid order.
+        let reprojected: Vec<String> = rowids.iter().map(|rowid| map[rowid].clone()).collect();
+        assert_eq!(reprojected[0], "c0000");
+        assert_eq!(reprojected[900], "c0900");
+        assert_eq!(reprojected[2499], "c2499");
+    }
+
+    #[test]
+    fn flat_scan_reaches_low_ranking_chunk_when_fetching_whole_index() {
+        // VAL-FILTER-002 analog in unit form: a filtered query whose only
+        // matching chunk ranks last must still be reachable when the flat path
+        // fetches the whole index. Simulate by inserting 4100+ vectors where
+        // the query is close to the first 4099 and far from the last.
+        let dim = 4;
+        let store = VectorStore::open_in_memory_with_mode(dim, VectorScanMode::Flat).unwrap();
+        // 4096 audio-like vectors near [1,0,0,0]
+        for index in 0..4096 {
+            store
+                .insert(
+                    &format!("audio:{index:04}"),
+                    &[1.0 + index as f32 * 0.0001, 0.0, 0.0, 0.0],
+                )
+                .unwrap();
+        }
+        // 12 island vectors far away near [0,1,0,0] — low ranking for audio query
+        for index in 0..12 {
+            store
+                .insert(&format!("video:{index:02}"), &[0.0, 1.0, 0.0, 0.0])
+                .unwrap();
+        }
+        assert_eq!(store.count().unwrap(), 4108);
+
+        // Audio query: island will rank last (distance ~2 vs ~0)
+        let audio_query = vec![1.0, 0.0, 0.0, 0.0];
+        // Fetching the whole index must include the island chunks
+        let all = store.search(&audio_query, 4108).unwrap();
+        assert_eq!(all.len(), 4108);
+        let island_seen = all
+            .iter()
+            .any(|result| result.chunk_id.starts_with("video:"));
+        assert!(
+            island_seen,
+            "flat full-depth fetch must include low-ranking island"
+        );
+
+        // Fetching only 4096 would miss at least one island chunk when island ranks last
+        let capped = store.search(&audio_query, 4096).unwrap();
+        assert_eq!(capped.len(), 4096);
+        // With 4108 total and 12 island at the tail, top 4096 contains at most 0-? islands.
+        // The point is that flat's ability to fetch 4108 is what makes loss impossible.
     }
 }

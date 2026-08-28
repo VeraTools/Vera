@@ -174,9 +174,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "type_relations",
 ];
 
-/// Stay below SQLite's lowest plausible host-parameter limit so a single
-/// `IN (...)` batch never fails on large file sets.
-const SQL_PARAMETER_BATCH: usize = 900;
+use crate::storage::{SQL_PARAMETER_BATCH, sql_placeholders};
 
 /// SQLite-backed metadata store for chunk attributes.
 pub struct MetadataStore {
@@ -457,29 +455,33 @@ impl MetadataStore {
             return Ok(HashMap::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT id, file_path, line_start, line_end, content, language,
-                    symbol_type, symbol_name, part_index
-             FROM chunks WHERE id IN ({placeholders})"
-        );
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .context("failed to prepare batch chunk query")?;
+        let mut map = HashMap::with_capacity(ids.len());
+        for batch in ids.chunks(SQL_PARAMETER_BATCH) {
+            let placeholders = sql_placeholders(batch.len());
+            let sql = format!(
+                "SELECT id, file_path, line_start, line_end, content, language,
+                        symbol_type, symbol_name, part_index
+                 FROM chunks WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("failed to prepare batch chunk query")?;
 
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-                Ok(row_to_chunk(row))
-            })
-            .context("failed to query chunks by id batch")?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok(row_to_chunk(row))
+                })
+                .context("failed to query chunks by id batch")?;
 
-        let chunks: Vec<Chunk> = collect_rows(rows)?
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        Ok(chunks.into_iter().map(|c| (c.id.clone(), c)).collect())
+            let chunks: Vec<Chunk> = collect_rows(rows)?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            for chunk in chunks {
+                map.insert(chunk.id.clone(), chunk);
+            }
+        }
+        Ok(map)
     }
 
     /// Get all chunks for a given file path.
@@ -511,9 +513,7 @@ impl MetadataStore {
     ) -> Result<HashMap<String, FileChunkSummary>> {
         let mut summaries = HashMap::with_capacity(file_paths.len());
         for batch in file_paths.chunks(SQL_PARAMETER_BATCH) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = sql_placeholders(batch.len());
             let sql = format!(
                 "SELECT file_path, COUNT(*), MAX(line_end), MIN(language)
                  FROM chunks WHERE file_path IN ({placeholders})
@@ -546,9 +546,7 @@ impl MetadataStore {
     pub fn symbol_type_counts(&self, file_paths: &[String]) -> Result<Vec<(String, u64)>> {
         let mut totals: HashMap<String, u64> = HashMap::new();
         for batch in file_paths.chunks(SQL_PARAMETER_BATCH) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = sql_placeholders(batch.len());
             let sql = format!(
                 "SELECT symbol_type, COUNT(*) FROM chunks
                  WHERE file_path IN ({placeholders}) AND symbol_type IS NOT NULL
@@ -614,6 +612,78 @@ impl MetadataStore {
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .context("failed to count chunks")?;
         Ok(count as u64)
+    }
+
+    /// Whether any chunk matches the given filters (cheap existence check for true-negative suppression).
+    ///
+    /// Used to distinguish a filtered query that legitimately matches zero chunks index-wide
+    /// (true negative, no diagnostic) from one that was truncated and then filtered to fewer than requested
+    /// (possible loss, diagnostic required). The check is performed in Rust using the same `SearchFilters`
+    /// matcher as the post-filter step so semantics stay identical.
+    pub fn has_filter_matches(&self, filters: &crate::types::SearchFilters) -> Result<bool> {
+        if filters.is_empty() {
+            return Ok(false);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, language, symbol_type FROM chunks")
+            .context("failed to prepare filter match check")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .context("failed to query filter match check")?;
+        for row in rows {
+            let (file_path, lang_str, sym_str) = row.context("failed to read filter match row")?;
+            let language = parse_language(&lang_str);
+            if !filters.matches_file(&file_path, language) {
+                continue;
+            }
+            let sym_type = sym_str.as_deref().map(parse_symbol_type);
+            if !filters.matches_symbol_type(sym_type) {
+                continue;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Count how many chunks match the given filters (0 for empty filters).
+    pub fn count_filter_matches(&self, filters: &crate::types::SearchFilters) -> Result<usize> {
+        if filters.is_empty() {
+            return Ok(0);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, language, symbol_type FROM chunks")
+            .context("failed to prepare filter match count")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .context("failed to query filter match count")?;
+        let mut count = 0usize;
+        for row in rows {
+            let (file_path, lang_str, sym_str) = row.context("failed to read filter match row")?;
+            let language = parse_language(&lang_str);
+            if !filters.matches_file(&file_path, language) {
+                continue;
+            }
+            let sym_type = sym_str.as_deref().map(parse_symbol_type);
+            if !filters.matches_symbol_type(sym_type) {
+                continue;
+            }
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Delete all chunks associated with a file path.
@@ -2046,6 +2116,89 @@ mod tests {
         assert!(summaries.values().all(|summary| summary.chunk_count == 1));
         // No chunk set a symbol type, so the totals are empty rather than wrong.
         assert!(store.symbol_type_counts(&files).unwrap().is_empty());
+    }
+
+    #[test]
+    fn hydration_batches_in_clauses_preserve_order_above_999_params() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let total = 2500;
+        let chunks: Vec<Chunk> = (0..total)
+            .map(|index| Chunk {
+                id: format!("id{index:04}"),
+                file_path: format!("f{index:04}.rs"),
+                line_start: 1,
+                line_end: 3,
+                content: String::new(),
+                language: Language::Rust,
+                symbol_type: None,
+                symbol_name: None,
+                part_index: None,
+            })
+            .collect();
+        store.insert_chunks(&chunks).unwrap();
+        let ids: Vec<String> = (0..total).map(|index| format!("id{index:04}")).collect();
+        let map = store.get_chunks_by_ids(&ids).unwrap();
+        assert_eq!(map.len(), total);
+        // Every id is present and maps to itself.
+        for id in &ids {
+            assert!(map.contains_key(id), "missing {id}");
+            assert_eq!(&map[id].id, id);
+        }
+        // Re-projecting in caller order must restore the requested order.
+        let reprojected: Vec<String> = ids.iter().map(|id| map[id].id.clone()).collect();
+        assert_eq!(reprojected, ids);
+        assert_eq!(reprojected[900], "id0900");
+        // 901 ids just over the 900 batch boundary.
+        let ids901: Vec<String> = (0..901).map(|index| format!("id{index:04}")).collect();
+        let map901 = store.get_chunks_by_ids(&ids901).unwrap();
+        assert_eq!(map901.len(), 901);
+        assert_eq!(map901["id0900"].id, "id0900");
+    }
+
+    #[test]
+    fn has_filter_matches_distinguishes_true_negatives() {
+        use crate::types::SearchFilters;
+        let store = MetadataStore::open_in_memory().unwrap();
+        store
+            .insert_chunks(&[
+                Chunk {
+                    id: "a:0".to_string(),
+                    file_path: "src/video/scaler00.ts".to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    content: String::new(),
+                    language: Language::TypeScript,
+                    symbol_type: Some(SymbolType::Function),
+                    symbol_name: Some("scale".to_string()),
+                    part_index: None,
+                },
+                Chunk {
+                    id: "b:0".to_string(),
+                    file_path: "src/audio/filter0000.ts".to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    content: String::new(),
+                    language: Language::TypeScript,
+                    symbol_type: Some(SymbolType::Function),
+                    symbol_name: Some("filter".to_string()),
+                    part_index: None,
+                },
+            ])
+            .unwrap();
+        let filters = SearchFilters {
+            path_glob: vec!["src/video/*".to_string()],
+            ..Default::default()
+        };
+        assert!(store.has_filter_matches(&filters).unwrap());
+        assert_eq!(store.count_filter_matches(&filters).unwrap(), 1);
+        let miss = SearchFilters {
+            path_glob: vec!["src/does-not-exist/*".to_string()],
+            ..Default::default()
+        };
+        assert!(!store.has_filter_matches(&miss).unwrap());
+        assert_eq!(store.count_filter_matches(&miss).unwrap(), 0);
+        let empty = SearchFilters::default();
+        assert!(!store.has_filter_matches(&empty).unwrap());
     }
 
     #[test]

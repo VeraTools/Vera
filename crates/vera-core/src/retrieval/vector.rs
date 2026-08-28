@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::storage::metadata::MetadataStore;
@@ -145,18 +145,19 @@ fn search_vector_from_embedding(
     query_embedding: &[f32],
 ) -> Result<Vec<SearchResult>, VectorSearchError> {
     // 1. Search the vector store for nearest neighbors.
-    let (requested, candidates) = candidate_pool(limit);
-    if requested > candidates {
-        // Deliberately without the query text: the surrounding `debug!` calls
-        // carry it, but this one is on by default, and a search query is user
-        // content that should not be raised into default-visible logs.
-        warn!(
-            requested,
-            fetched = candidates,
-            "candidate pool exceeds the sqlite-vec KNN cap; the filter and \
-             metadata over-fetch are inert above it"
-        );
-    }
+    // Clamp the requested pool to the real index size before deciding whether
+    // to warn. This keeps below-cap indexes quiet even when the over-fetch
+    // arithmetic would otherwise exceed 4,096, and ensures the flat path can
+    // request the whole index.
+    let index_count = vector_store.count().unwrap_or(usize::MAX as u64) as usize;
+    let is_flat = vector_store.is_flat();
+    let (requested, candidates) = candidate_pool(limit, index_count, is_flat);
+
+    // The storage layer now owns the vec0 truncation diagnostic (honest, pinned,
+    // actionable, and quiet on below-cap/true-negatives). No generic warning
+    // is emitted here; callers that need filter-aware diagnostics (hybrid) do
+    // so with the full filter context.
+    let _ = requested; // used only for debugging if needed
 
     let vector_results = vector_store
         .search(query_embedding, candidates)
@@ -210,23 +211,30 @@ fn search_vector_from_embedding(
     Ok(results)
 }
 
-/// Size the KNN request for a caller-selected pool, bounded by the backend cap.
+/// Size the KNN request for a caller-selected pool, bounded by the backend cap
+/// and the real index size.
 ///
 /// Returns `(requested, fetched)`. Extra candidates are fetched to absorb chunks
 /// whose metadata has gone missing, without doubling an already-large pool.
+/// The requested pool is first clamped to the actual index size so below-cap
+/// indexes never appear to exceed the cap. The fetched pool is bounded by
+/// `MAX_KNN_K` only on the vec0 path; flat honors the full requested depth.
 ///
-/// The two values differ once the compounded over-fetch runs past
-/// [`MAX_KNN_K`]. Callers stack several multipliers before reaching here (query
-/// type, then a filter over-fetch, then this one), so a natural-language query
-/// with an active filter can ask for more than sqlite-vec will serve. Bounding
-/// it here rather than letting the storage layer clamp keeps the ceiling
-/// visible to the one place that can report it; the same `k` reaches sqlite-vec
-/// either way, so ranking is unchanged.
-fn candidate_pool(limit: usize) -> (usize, usize) {
+/// The two values differ once the compounded over-fetch runs past the backend
+/// cap. Callers stack several multipliers before reaching here (query type, then
+/// a filter over-fetch, then this one), so a natural-language query with an
+/// active filter can ask for more than sqlite-vec will serve on the vec0 path.
+fn candidate_pool(limit: usize, index_count: usize, is_flat: bool) -> (usize, usize) {
     let requested = limit
         .saturating_add(limit / 2)
         .max(limit.saturating_add(10));
-    (requested, requested.min(MAX_KNN_K))
+    let clamped_requested = requested.min(index_count);
+    let fetched = if is_flat {
+        clamped_requested
+    } else {
+        clamped_requested.min(MAX_KNN_K)
+    };
+    (clamped_requested, fetched)
 }
 
 /// Generate a query embedding, truncating to match stored dimensionality.
@@ -292,22 +300,34 @@ mod tests {
 
     /// The pool must never ask sqlite-vec for more than it will serve, and must
     /// report the shortfall so a degraded pool is diagnosable rather than silent.
+    /// The pool is also clamped to the real index size, so below-cap indexes stay quiet.
     #[test]
     fn candidate_pool_is_bounded_by_the_knn_cap() {
-        // Below the cap the metadata over-fetch is untouched.
-        assert_eq!(candidate_pool(10), (20, 20));
-        assert_eq!(candidate_pool(100), (150, 150));
+        let large = 20_000;
+        // Below the cap the metadata over-fetch is untouched (vec0 path).
+        assert_eq!(candidate_pool(10, large, false), (20, 20));
+        assert_eq!(candidate_pool(100, large, false), (150, 150));
 
-        // At and above it, the request is reported but not made.
-        let (requested, fetched) = candidate_pool(MAX_KNN_K);
+        // At and above it, the request is reported but not made on vec0.
+        let (requested, fetched) = candidate_pool(MAX_KNN_K, large, false);
         assert!(
             requested > MAX_KNN_K,
             "over-fetch should exceed the cap here"
         );
         assert_eq!(fetched, MAX_KNN_K);
 
-        // No caller can push the fetch past the cap, and none can overflow it.
-        assert_eq!(candidate_pool(usize::MAX).1, MAX_KNN_K);
+        // No caller can push the fetch past the cap on vec0, and none can overflow it.
+        assert_eq!(candidate_pool(usize::MAX, large, false).1, MAX_KNN_K);
+
+        // Flat path is not bounded by the cap, only by the index size.
+        let (req_flat, fetch_flat) = candidate_pool(MAX_KNN_K, large, true);
+        assert_eq!(req_flat, 6_144);
+        assert_eq!(fetch_flat, 6_144);
+
+        // Pool never exceeds the real index size, regardless of backend.
+        assert_eq!(candidate_pool(100, 50, false), (50, 50));
+        assert_eq!(candidate_pool(100, 50, true), (50, 50));
+        assert_eq!(candidate_pool(10, 10, false), (10, 10));
     }
 
     /// Create sample chunks with semantic variety for testing.

@@ -28,8 +28,41 @@ use crate::retrieval::vector::{
 };
 use crate::storage::bm25::Bm25Index;
 use crate::storage::metadata::MetadataStore;
-use crate::storage::vector::VectorStore;
+use crate::storage::vector::{MAX_KNN_K, VectorStore};
 use crate::types::{SearchFilters, SearchResult};
+
+/// Whether a vec0 truncation warning should be emitted.
+///
+/// Pinned decision matrix (VAL-FILTER-008):
+/// - Only vec0 (flat never warns)
+/// - Only when index > cap and the request was actually clamped at the cap
+/// - For filtered queries, only when the filter matches at least one chunk index-wide
+///   (true negatives stay quiet)
+/// - For unfiltered queries, the truncated case indicates plausible loss (deep limit)
+/// - Below-cap indexes never warn (pool clamped to index size first)
+pub(crate) fn should_emit_vec0_truncation_warning(
+    is_flat: bool,
+    index_count: usize,
+    clamped_requested: usize,
+    fetched: usize,
+    filters_empty: bool,
+    filter_has_matches: bool,
+) -> bool {
+    if is_flat {
+        return false;
+    }
+    if index_count <= MAX_KNN_K {
+        return false;
+    }
+    let truncated = clamped_requested > MAX_KNN_K && fetched == MAX_KNN_K;
+    if !truncated {
+        return false;
+    }
+    if filters_empty {
+        return true;
+    }
+    filter_has_matches
+}
 
 /// Open search stores reused for the active index directory.
 pub(crate) struct SearchStores {
@@ -373,15 +406,58 @@ async fn search_hybrid_inner(
     });
 
     // Run vector search concurrently on the async runtime.
-    // Filters are applied after the kNN fetch, so a selective filter can
-    // discard every hit in the default window. Over-fetch when filters are
-    // active so filtered chunks beyond the window can still reach fusion.
-    let vector_fetch = if filters.is_empty() {
-        vector_candidates
-    } else {
-        vector_candidates.saturating_mul(4).max(200)
-    };
+    // Flat vs vec0 handling: flat honors the requested depth up to the real index size,
+    // vec0 is bounded by MAX_KNN_K. For filtered queries on the flat path we fetch the
+    // entire index so a low-ranking island is reachable independent of rank position.
+    // The pool sizing never requests more candidates than the index holds, keeping
+    // below-cap indexes quiet and preventing spurious truncation warnings.
     let vector_start = Instant::now();
+
+    // Determine backend and index size before sizing the fetch. This is used both
+    // to clamp the pool and to decide whether a vec0 truncation diagnostic is honest.
+    let (is_flat, index_count) = match &stores {
+        Some(s) => match s.vector_store(stored_dim) {
+            Ok(vs) => {
+                let guard = vs.lock().ok();
+                guard
+                    .map(|g| (g.is_flat(), g.count().unwrap_or(0) as usize))
+                    .unwrap_or((true, usize::MAX))
+            }
+            Err(_) => (true, usize::MAX),
+        },
+        None => match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
+            Ok(vs) => (vs.is_flat(), vs.count().unwrap_or(0) as usize),
+            Err(_) => (true, usize::MAX),
+        },
+    };
+
+    let vector_fetch = if filters.is_empty() {
+        // Unfiltered: use the query-type-aware candidate count, clamped to the index.
+        let base = vector_candidates.min(index_count);
+        if is_flat { base } else { base.min(MAX_KNN_K) }
+    } else if is_flat {
+        // Flat filtered: fetch the whole index so post-filtering can reach any chunk.
+        index_count
+    } else {
+        // vec0 filtered: fetch as many as the backend allows (cap) to maximize recall.
+        index_count.min(MAX_KNN_K)
+    };
+
+    // Determine whether this vec0 fetch was truncated at the cap (honest diagnostic condition).
+    // Recompute the candidate-pool over-fetch as the vector layer does, to know if we hit the cap.
+    let (clamped_requested, fetched_for_diag) = {
+        let req = vector_fetch
+            .saturating_add(vector_fetch / 2)
+            .max(vector_fetch.saturating_add(10));
+        let clamped = req.min(index_count);
+        let fetched = if is_flat {
+            clamped
+        } else {
+            clamped.min(MAX_KNN_K)
+        };
+        (clamped, fetched)
+    };
+
     let vector_outcome = match stores {
         Some(stores) => match stores.vector_store(stored_dim) {
             Ok(vector_store) => {
@@ -397,6 +473,42 @@ async fn search_hybrid_inner(
                     Ok((mut results, embed_elapsed)) => {
                         if !filters.is_empty() {
                             results.retain(|result| filters.matches(result));
+                        }
+                        let has_matches = if filters.is_empty() {
+                            false
+                        } else {
+                            stores
+                                .vector_metadata
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.has_filter_matches(filters).ok())
+                                .unwrap_or(false)
+                        };
+                        if should_emit_vec0_truncation_warning(
+                            is_flat,
+                            index_count,
+                            clamped_requested,
+                            fetched_for_diag,
+                            filters.is_empty(),
+                            has_matches,
+                        ) {
+                            if filters.is_empty() {
+                                warn!(
+                                    backend = "vec0",
+                                    index_count = index_count,
+                                    requested = clamped_requested,
+                                    cap = MAX_KNN_K,
+                                    "vec0 vector search truncated at sqlite-vec KNN cap (4096); results may be incomplete. Use the default flat vector scan (unset VERA_VECTOR_SCAN) for complete results"
+                                );
+                            } else {
+                                warn!(
+                                    backend = "vec0",
+                                    index_count = index_count,
+                                    requested = clamped_requested,
+                                    cap = MAX_KNN_K,
+                                    "vec0 vector search truncated at sqlite-vec KNN cap (4096) with active filters; results may be incomplete. Use the default flat vector scan (unset VERA_VECTOR_SCAN) for complete results"
+                                );
+                            }
                         }
                         Ok((results, embed_elapsed))
                     }
@@ -423,6 +535,37 @@ async fn search_hybrid_inner(
                             Ok((mut results, embed_elapsed)) => {
                                 if !filters.is_empty() {
                                     results.retain(|result| filters.matches(result));
+                                }
+                                let has_matches = if filters.is_empty() {
+                                    false
+                                } else {
+                                    vector_metadata.has_filter_matches(filters).unwrap_or(false)
+                                };
+                                if should_emit_vec0_truncation_warning(
+                                    is_flat,
+                                    index_count,
+                                    clamped_requested,
+                                    fetched_for_diag,
+                                    filters.is_empty(),
+                                    has_matches,
+                                ) {
+                                    if filters.is_empty() {
+                                        warn!(
+                                            backend = "vec0",
+                                            index_count = index_count,
+                                            requested = clamped_requested,
+                                            cap = MAX_KNN_K,
+                                            "vec0 vector search truncated at sqlite-vec KNN cap (4096); results may be incomplete. Use the default flat vector scan (unset VERA_VECTOR_SCAN) for complete results"
+                                        );
+                                    } else {
+                                        warn!(
+                                            backend = "vec0",
+                                            index_count = index_count,
+                                            requested = clamped_requested,
+                                            cap = MAX_KNN_K,
+                                            "vec0 vector search truncated at sqlite-vec KNN cap (4096) with active filters; results may be incomplete. Use the default flat vector scan (unset VERA_VECTOR_SCAN) for complete results"
+                                        );
+                                    }
                                 }
                                 Ok((results, embed_elapsed))
                             }
