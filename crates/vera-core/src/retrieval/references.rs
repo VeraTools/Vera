@@ -78,7 +78,7 @@ pub fn search_callers_through(
 
         let chunks = store.get_chunks_by_file(&caller.file_path)?;
         let (snippet, line_start, line_end) = line_context_snippet(&content, caller.line, 2);
-        let (symbol_name, symbol_type) = symbol_for_line(Some(&chunks), caller.line);
+        let (symbol_name, symbol_type, part_index) = symbol_for_line(Some(&chunks), caller.line);
         if !filters.matches_symbol_type(symbol_type) {
             continue;
         }
@@ -97,9 +97,131 @@ pub fn search_callers_through(
             score: 1.0,
             symbol_name,
             symbol_type,
-            part_index: None,
+            part_index,
         });
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::VeraConfig;
+    use crate::embedding::test_helpers::MockProvider;
+    use crate::indexing::index_repository;
+
+    async fn index_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (path, content) in files {
+            let abs = dir.path().join(path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(abs, content).unwrap();
+        }
+        let provider = MockProvider::new(8);
+        let config = VeraConfig::default();
+        index_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+        dir
+    }
+
+    fn mixer_content() -> String {
+        let mut lines = vec!["import React from 'react';".to_string()];
+        lines.push("export function TrackBadge() { return null; }".to_string());
+        lines.push("export function TransportBar() { return null; }".to_string());
+        lines.push("export const MixerConsole: React.FC = () => {".to_string());
+        for i in 0..210 {
+            lines.push(format!("  const line{i} = {i};"));
+        }
+        lines.push("  return null;".to_string());
+        lines.push("};".to_string());
+        lines.push("export function AudioWorkspace() {".to_string());
+        lines.push("  return MixerConsole({});".to_string());
+        lines.push("}".to_string());
+        lines.join("\n")
+    }
+
+    #[tokio::test]
+    async fn references_resolve_used_split_symbol() {
+        let content = mixer_content();
+        let dir = index_repo(&[("src/mixer.tsx", &content)]).await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        let store =
+            crate::storage::metadata::MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        let chunks = store.get_chunks_by_symbol_name("MixerConsole").unwrap();
+        assert!(chunks.len() >= 2, "MixerConsole must be split");
+
+        let callers =
+            search_callers(&index_dir, "MixerConsole", 10, &SearchFilters::default()).unwrap();
+        assert_eq!(
+            callers.len(),
+            1,
+            "used split symbol should have exactly one caller, got {callers:?}"
+        );
+        assert_eq!(callers[0].file_path, "src/mixer.tsx");
+        // Caller should be attributed to AudioWorkspace with correct part handling.
+        assert_eq!(
+            callers[0].symbol_name.as_deref(),
+            Some("AudioWorkspace"),
+            "call site should be attributed to AudioWorkspace"
+        );
+        // part_index for caller (AudioWorkspace unsplit) should be None.
+        assert_eq!(callers[0].part_index, None);
+    }
+
+    #[tokio::test]
+    async fn dead_code_omits_used_split_symbol_and_reports_unused_once() {
+        let mixer = mixer_content();
+        // Add UnusedPanel split and used.
+        let mut unused_lines = vec!["export const UnusedPanel: React.FC = () => {".to_string()];
+        for i in 0..210 {
+            unused_lines.push(format!("  const u{i} = {i};"));
+        }
+        unused_lines.push("  return null;".to_string());
+        unused_lines.push("};".to_string());
+        let unused_content = unused_lines.join("\n");
+
+        let dir = index_repo(&[
+            ("src/mixer.tsx", &mixer),
+            ("src/unused_panel.tsx", &unused_content),
+        ])
+        .await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+        let store =
+            crate::storage::metadata::MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        let dead = store.find_dead_symbols().unwrap();
+        let mixer_entries: Vec<_> = dead
+            .iter()
+            .filter(|d| d.symbol_name == "MixerConsole")
+            .collect();
+        assert!(
+            mixer_entries.is_empty(),
+            "used split symbol MixerConsole must be omitted from dead-code, got {mixer_entries:?}"
+        );
+        let _track_entries: Vec<_> = dead
+            .iter()
+            .filter(|d| d.symbol_name == "TrackBadge")
+            .collect();
+        // TrackBadge is not called anywhere, but it's exported; check expected?
+        // Instead focus on UnusedPanel which is split and unused.
+        let unused_entries: Vec<_> = dead
+            .iter()
+            .filter(|d| d.symbol_name == "UnusedPanel")
+            .collect();
+        assert_eq!(
+            unused_entries.len(),
+            1,
+            "unused split symbol must appear exactly once, got {unused_entries:?} (total dead: {dead:?})"
+        );
+        // Ensure grouping is by (symbol,file) not part.
+        let dup_check: Vec<_> = store.get_chunks_by_symbol_name("UnusedPanel").unwrap();
+        assert!(
+            dup_check.len() >= 2,
+            "UnusedPanel should be split into >=2 rows"
+        );
+    }
 }

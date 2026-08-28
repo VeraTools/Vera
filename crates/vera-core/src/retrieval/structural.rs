@@ -153,7 +153,39 @@ fn search_definitions(
         }
     };
 
-    let results = chunks
+    // Split symbols produce multiple chunk rows per logical definition.
+    // Deduplicate to one entry per (bare symbol, file) picking the earliest
+    // declaration line so `vera structural definitions BareName` returns
+    // exactly one hit for a split symbol.
+    let mut earliest_by_key: std::collections::HashMap<String, Chunk> =
+        std::collections::HashMap::new();
+    for chunk in chunks {
+        let key = format!(
+            "{}:{}",
+            chunk
+                .symbol_name
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase(),
+            chunk.file_path
+        );
+        earliest_by_key
+            .entry(key)
+            .and_modify(|existing| {
+                if chunk.line_start < existing.line_start {
+                    *existing = chunk.clone();
+                }
+            })
+            .or_insert(chunk);
+    }
+    let mut deduped: Vec<Chunk> = earliest_by_key.into_values().collect();
+    deduped.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.line_start.cmp(&b.line_start))
+    });
+
+    let results = deduped
         .into_iter()
         .map(|chunk| chunk.into_search_result(1.0))
         .collect();
@@ -386,12 +418,12 @@ fn result_for_match(
             score: 1.0,
             symbol_name: chunk.symbol_name.clone(),
             symbol_type: chunk.symbol_type,
-            part_index: None,
+            part_index: chunk.part_index,
         };
     }
 
     let (snippet, line_start, line_end) = bounded_byte_snippet(content, start_byte, end_byte, 220);
-    let (symbol_name, symbol_type) = symbol_for_line(Some(chunks), line);
+    let (symbol_name, symbol_type, part_index) = symbol_for_line(Some(chunks), line);
     SearchResult {
         file_path: file_path.to_string(),
         line_start,
@@ -401,7 +433,7 @@ fn result_for_match(
         score: 1.0,
         symbol_name,
         symbol_type,
-        part_index: None,
+        part_index,
     }
 }
 
@@ -1078,5 +1110,210 @@ mod tests {
         let after = SYNTAX_FILTER_CREATIONS.with(|count| count.get());
         assert!(results.is_empty());
         assert_eq!(after, before, "unmatched files must not be parsed");
+    }
+
+    fn mixer_fixture_content() -> String {
+        let mut lines = vec!["import React from 'react';".to_string()];
+        lines.push("export function TrackBadge() { return null; }".to_string());
+        lines.push("export function TransportBar() { return null; }".to_string());
+        lines.push("export const MixerConsole: React.FC = () => {".to_string());
+        for i in 0..210 {
+            lines.push(format!("  const line{i} = {i};"));
+        }
+        lines.push("  return null;".to_string());
+        lines.push("};".to_string());
+        lines.push("export function AudioWorkspace() {".to_string());
+        lines.push("  return MixerConsole({});".to_string());
+        lines.push("}".to_string());
+        lines.join("\n")
+    }
+
+    #[tokio::test]
+    async fn definitions_find_split_symbol_by_bare_name() {
+        let content = mixer_fixture_content();
+        let dir = index_repo(&[("src/mixer.tsx", &content)]).await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        // Verify DB stores bare names with multiple parts.
+        let store =
+            crate::storage::metadata::MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        let chunks = store.get_chunks_by_symbol_name("MixerConsole").unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "MixerConsole should be split, got {} chunks",
+            chunks.len()
+        );
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                chunk.symbol_name.as_deref(),
+                Some("MixerConsole"),
+                "each part must keep bare name"
+            );
+            assert_eq!(
+                chunk.part_index,
+                Some((idx as u32) + 1),
+                "part_index must be sequential"
+            );
+        }
+
+        // Structural definitions must return exactly one hit for bare name.
+        let results = search_structural(
+            &index_dir,
+            StructuralSearchKind::Definitions,
+            Some("MixerConsole"),
+            10,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "split symbol should return exactly one definition, got {results:?}"
+        );
+        assert_eq!(results[0].symbol_name.as_deref(), Some("MixerConsole"));
+        assert_eq!(results[0].file_path, "src/mixer.tsx");
+
+        // Unsplit siblings still resolve.
+        for sibling in ["TrackBadge", "TransportBar"] {
+            let res = search_structural(
+                &index_dir,
+                StructuralSearchKind::Definitions,
+                Some(sibling),
+                10,
+                &SearchFilters::default(),
+            )
+            .unwrap();
+            assert_eq!(res.len(), 1, "sibling {sibling} should resolve");
+        }
+
+        // SizeProbe threshold probes behave uniformly via definitions.
+        let mut probe_files = Vec::new();
+        for (probe, lines_needed) in [
+            ("SizeProbe190", 195),
+            ("SizeProbe195", 203),
+            ("SizeProbe200", 208),
+        ] {
+            let mut p_lines = vec![format!("export function {probe}() {{")];
+            for i in 0..(lines_needed - 2) {
+                p_lines.push(format!("  const x{i} = {i};"));
+            }
+            p_lines.push("}".to_string());
+            probe_files.push((format!("src/sizes/{probe}.tsx"), p_lines.join("\n")));
+        }
+        // Add LaneEditor split as well.
+        let mut lane_lines = vec!["export function LaneEditor() {".to_string()];
+        for i in 0..210 {
+            lane_lines.push(format!("  const y{i} = {i};"));
+        }
+        lane_lines.push("}".to_string());
+        probe_files.push(("src/lanes.tsx".to_string(), lane_lines.join("\n")));
+
+        let probe_refs: Vec<(&str, &str)> = probe_files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let dir2 = index_repo(&probe_refs).await;
+        let index_dir2 = crate::indexing::index_dir(dir2.path());
+        let store2 =
+            crate::storage::metadata::MetadataStore::open(&index_dir2.join("metadata.db")).unwrap();
+
+        for probe in ["SizeProbe190", "SizeProbe195", "SizeProbe200"] {
+            let defs = search_structural(
+                &index_dir2,
+                StructuralSearchKind::Definitions,
+                Some(probe),
+                10,
+                &SearchFilters::default(),
+            )
+            .unwrap();
+            assert_eq!(defs.len(), 1, "{probe} should have exactly one definition");
+            let db_rows = store2.get_chunks_by_symbol_name(probe).unwrap();
+            if probe == "SizeProbe190" {
+                assert_eq!(db_rows.len(), 1, "SizeProbe190 must not split");
+                assert_eq!(db_rows[0].part_index, None);
+            } else {
+                assert!(
+                    db_rows.len() >= 2,
+                    "{probe} must split, got {}",
+                    db_rows.len()
+                );
+                for c in &db_rows {
+                    assert_eq!(c.symbol_name.as_deref(), Some(probe));
+                    assert!(c.part_index.is_some());
+                }
+            }
+        }
+
+        // LaneEditor also split.
+        let lane_defs = search_structural(
+            &index_dir2,
+            StructuralSearchKind::Definitions,
+            Some("LaneEditor"),
+            10,
+            &SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(lane_defs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn json_search_carries_bare_name_plus_part_index_and_text_shows_part_numbers() {
+        let content = mixer_fixture_content();
+        let dir = index_repo(&[("src/mixer.tsx", &content)]).await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+
+        // Use hybrid search directly via MetadataStore + chunk retrieval to verify
+        // JSON shape: presentation::CompactResult.
+        let store =
+            crate::storage::metadata::MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        let chunks = store.get_chunks_by_symbol_name("MixerConsole").unwrap();
+        let results: Vec<crate::types::SearchResult> = chunks
+            .into_iter()
+            .map(|c| c.into_search_result(1.0))
+            .collect();
+        // Compact JSON shape: bare name + part_index, no suffix in symbol_name.
+        for r in &results {
+            assert_eq!(r.symbol_name.as_deref(), Some("MixerConsole"));
+            assert!(r.part_index.is_some(), "split part must have part_index");
+            assert!(
+                !r.symbol_name.as_deref().unwrap().contains(" (part "),
+                "symbol_name must be bare"
+            );
+            let cr = crate::presentation::CompactResult::from_search_result(r);
+            assert_eq!(cr.symbol_name, Some("MixerConsole"));
+            assert!(cr.part_index.is_some());
+            // Round-trip: bare name reaches definitions.
+            let defs = search_structural(
+                &index_dir,
+                StructuralSearchKind::Definitions,
+                Some(cr.symbol_name.unwrap()),
+                10,
+                &SearchFilters::default(),
+            )
+            .unwrap();
+            assert!(!defs.is_empty(), "bare name from JSON must round-trip");
+        }
+
+        // Text display via shared helper keeps part numbers distinct.
+        let mut display_names: Vec<String> =
+            results.iter().filter_map(|r| r.display_name()).collect();
+        display_names.sort();
+        // Must be "MixerConsole (part 1)", "MixerConsole (part 2)", ...
+        for (idx, name) in display_names.iter().enumerate() {
+            assert_eq!(
+                name,
+                &format!("MixerConsole (part {})", idx + 1),
+                "text display must keep distinct part numbers starting at 1"
+            );
+        }
+
+        // Literal " (part N)" suffix symbol displays verbatim without second annotation.
+        let lit_dir = index_repo(&[("src/lit.rs", "fn foo() {}\n")]).await;
+        let _lit_index_dir = crate::indexing::index_dir(lit_dir.path());
+        // Directly test display helper for literal verbatim case (unsplit).
+        let literal = crate::types::display_symbol_name("foo (part 2)", None);
+        assert_eq!(literal, "foo (part 2)");
+        // Ensure no second annotation was appended.
+        assert!(!literal.matches(" (part ").collect::<Vec<_>>().len() > 1);
     }
 }

@@ -72,6 +72,7 @@ pub fn search_explicit_implementations(
         let mut line_end = line;
         let mut snippet = None;
         let mut symbol_type = None;
+        let mut enclosing_part_index: Option<u32> = None;
 
         if let Some(chunk) = smallest_symbol_chunk_for_line(&chunks, line) {
             line_start = chunk.line_start;
@@ -85,6 +86,7 @@ pub fn search_explicit_implementations(
                 Some(SymbolType::Block) | None => None,
                 other => other,
             };
+            enclosing_part_index = chunk.part_index;
         }
 
         let content = snippet.unwrap_or_else(|| {
@@ -105,7 +107,11 @@ pub fn search_explicit_implementations(
             continue;
         }
 
-        let fallback_symbol = symbol_for_line(Some(&chunks), line).1;
+        let fallback_info = symbol_for_line(Some(&chunks), line);
+        let fallback_symbol = fallback_info.1;
+        if enclosing_part_index.is_none() {
+            enclosing_part_index = fallback_info.2;
+        }
         let final_symbol_type = symbol_type.or(match fallback_symbol {
             Some(SymbolType::Block) | None => None,
             other => other,
@@ -123,9 +129,87 @@ pub fn search_explicit_implementations(
             score: 1.0,
             symbol_name: Some(relation.owner),
             symbol_type: final_symbol_type,
-            part_index: None,
+            part_index: enclosing_part_index,
         });
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::VeraConfig;
+    use crate::embedding::test_helpers::MockProvider;
+    use crate::indexing::index_repository;
+
+    async fn index_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (path, content) in files {
+            let abs = dir.path().join(path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(abs, content).unwrap();
+        }
+        let provider = MockProvider::new(8);
+        let config = VeraConfig::default();
+        index_repository(dir.path(), &provider, &config, "mock-model")
+            .await
+            .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn explicit_implementations_keep_working_for_split_symbols() {
+        // Loader target is normal, but owner Repo is large enough to split.
+        let mut repo_lines = vec![
+            "pub trait Loader {}".to_string(),
+            "pub struct Repo {".to_string(),
+        ];
+        for i in 0..210 {
+            repo_lines.push(format!("  field{i}: i32,"));
+        }
+        repo_lines.push("}".to_string());
+        repo_lines.push("impl Loader for Repo {".to_string());
+        repo_lines.push("  fn load(&self) {}".to_string());
+        repo_lines.push("}".to_string());
+        let repo_content = repo_lines.join("\n");
+
+        let dir = index_repo(&[("src/repo.rs", &repo_content)]).await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+        let store =
+            crate::storage::metadata::MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        let repo_chunks = store.get_chunks_by_symbol_name("Repo").unwrap();
+        // Repo should be split if large; but impl chunk may be associated
+        // with Repo's enclosing chunk after indexing.
+        assert!(!repo_chunks.is_empty());
+
+        let results =
+            search_explicit_implementations(&index_dir, "Loader", 10, &SearchFilters::default())
+                .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.symbol_name.as_deref() == Some("Repo")),
+            "impl owner Repo should be found via bare name, got {results:?}"
+        );
+        // Ensure no per-part duplication for same impl line.
+        let repo_impls: Vec<_> = results
+            .iter()
+            .filter(|r| r.symbol_name.as_deref() == Some("Repo"))
+            .collect();
+        assert_eq!(
+            repo_impls.len(),
+            1,
+            "split owner should not duplicate impl entries"
+        );
+        assert!(
+            !repo_impls[0]
+                .symbol_name
+                .as_deref()
+                .unwrap()
+                .contains(" (part ")
+        );
+    }
 }

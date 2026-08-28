@@ -119,7 +119,7 @@ pub fn search_regex(
             let ctx_start = i.saturating_sub(context_lines);
             let ctx_end = (i + context_lines + 1).min(lines.len());
             let snippet = lines[ctx_start..ctx_end].join("\n");
-            let (symbol_name, symbol_type) =
+            let (symbol_name, symbol_type, part_index) =
                 symbol_for_line(file_chunks.as_deref(), (i + 1) as u32);
 
             let result = SearchResult {
@@ -131,7 +131,7 @@ pub fn search_regex(
                 symbol_name,
                 symbol_type,
                 language,
-                part_index: None,
+                part_index,
             };
 
             if !filters.matches_symbol_type(symbol_type) {
@@ -165,7 +165,7 @@ fn collect_minified_matches(
         }
         let (snippet, line_start, line_end) =
             bounded_byte_snippet(content, found.start(), found.end(), 220);
-        let (symbol_name, symbol_type) = symbol_for_line(file_chunks, line_start);
+        let (symbol_name, symbol_type, part_index) = symbol_for_line(file_chunks, line_start);
         let result = SearchResult {
             file_path: file_rel.to_string(),
             line_start,
@@ -175,7 +175,7 @@ fn collect_minified_matches(
             symbol_name,
             symbol_type,
             language,
-            part_index: None,
+            part_index,
         };
 
         if !filters.matches_symbol_type(symbol_type) {

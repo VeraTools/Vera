@@ -1381,4 +1381,48 @@ mod tests {
         // Should mention no index found or similar.
         assert!(!result.content[0].text.is_empty());
     }
+
+    #[test]
+    fn compact_results_json_carries_bare_plus_part_index_round_trips() {
+        let results = vec![
+            vera_core::types::SearchResult {
+                file_path: "src/mixer.tsx".to_string(),
+                line_start: 1,
+                line_end: 50,
+                content: "export const MixerConsole: React.FC = () => { part1 }".to_string(),
+                language: vera_core::types::Language::TypeScript,
+                score: 1.0,
+                symbol_name: Some("MixerConsole".to_string()),
+                symbol_type: Some(vera_core::types::SymbolType::Function),
+                part_index: Some(1),
+            },
+            vera_core::types::SearchResult {
+                file_path: "src/mixer.tsx".to_string(),
+                line_start: 51,
+                line_end: 100,
+                content: "part 2".to_string(),
+                language: vera_core::types::Language::TypeScript,
+                score: 0.9,
+                symbol_name: Some("MixerConsole".to_string()),
+                symbol_type: Some(vera_core::types::SymbolType::Function),
+                part_index: Some(2),
+            },
+        ];
+        let json = compact_results_json(&results, 10_000, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        for (idx, val) in arr.iter().enumerate() {
+            assert_eq!(val["symbol_name"], "MixerConsole");
+            assert_eq!(val["part_index"], (idx as u64) + 1);
+            // Bare name must round-trip through compact output: feeding it back
+            // to a definitions lookup would succeed if an index existed.
+            assert!(!val["symbol_name"].as_str().unwrap().contains(" (part "));
+        }
+        // Text display via same SearchResult keeps part numbers.
+        for r in &results {
+            let display = r.display_name().unwrap();
+            assert!(display.starts_with("MixerConsole (part "));
+        }
+    }
 }
