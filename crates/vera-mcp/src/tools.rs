@@ -1303,6 +1303,70 @@ mod tests {
     }
 
     #[test]
+    fn search_code_filters_path_or_semantics_match_both_islands() {
+        // VAL-FILTER-017/018: multiple --path / MCP path array OR semantics.
+        let filters = search_code_filters(
+            &serde_json::json!({
+                "path": ["src/video", "src/videoplayer/b.ts"],
+            }),
+            None,
+        );
+        assert_eq!(
+            filters.path_glob,
+            vec!["src/video".to_string(), "src/videoplayer/b.ts".to_string()]
+        );
+        // Verify predicate OR: each pattern matches its own file, not the bulk.
+        let video = vera_core::types::SearchResult {
+            file_path: "src/video/a.ts".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "x".to_string(),
+            language: vera_core::types::Language::TypeScript,
+            score: 1.0,
+            symbol_name: None,
+            symbol_type: None,
+            part_index: None,
+        };
+        let videoplayer = vera_core::types::SearchResult {
+            file_path: "src/videoplayer/b.ts".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "x".to_string(),
+            language: vera_core::types::Language::TypeScript,
+            score: 1.0,
+            symbol_name: None,
+            symbol_type: None,
+            part_index: None,
+        };
+        let audio = vera_core::types::SearchResult {
+            file_path: "src/audio/c.ts".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "x".to_string(),
+            language: vera_core::types::Language::TypeScript,
+            score: 1.0,
+            symbol_name: None,
+            symbol_type: None,
+            part_index: None,
+        };
+        assert!(filters.matches(&video));
+        assert!(filters.matches(&videoplayer));
+        assert!(!filters.matches(&audio));
+        // Single-string form also works (CLI --path single value).
+        let single = search_code_filters(&serde_json::json!({"path": "src/video"}), None);
+        assert!(single.matches(&video));
+        assert!(!single.matches(&audio));
+    }
+
+    #[test]
+    fn search_code_filters_path_string_vs_array_parity() {
+        // Ensure string and single-element array produce identical filters.
+        let from_string = search_code_filters(&serde_json::json!({"path": "src/video"}), None);
+        let from_array = search_code_filters(&serde_json::json!({"path": ["src/video"]}), None);
+        assert_eq!(from_string.path_glob, from_array.path_glob);
+    }
+
+    #[test]
     fn regex_search_schema_stays_minimal() {
         let tools = tool_definitions();
         let regex_search = tools

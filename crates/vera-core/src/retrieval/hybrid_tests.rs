@@ -1302,3 +1302,438 @@ mod indexed_files_cache_tests {
         assert!(!Arc::ptr_eq(&first, &third));
     }
 }
+
+// ── Filtered-vector edge cases (VAL-FILTER-012/013/016/017/019/021) ──
+
+// VAL-FILTER-012: deterministic ordering across repeated runs.
+// The fused output must be a pure function of its inputs, so two identical
+// runs produce byte-identical ordering (no HashMap iteration randomness).
+#[test]
+fn fused_results_are_deterministic_across_repeated_runs() {
+    let bm25 = vec![
+        make_result("a.rs", 1, 10, 5.0, None),
+        make_result("b.rs", 1, 10, 4.0, None),
+        make_result("c.rs", 1, 10, 3.0, None),
+    ];
+    let vector = vec![
+        make_result("b.rs", 1, 10, 0.9, None),
+        make_result("a.rs", 1, 10, 0.8, None),
+        make_result("c.rs", 1, 10, 0.7, None),
+    ];
+
+    let first = fuse_rrf(&bm25, &vector, 60.0, 10);
+    let second = fuse_rrf(&bm25, &vector, 60.0, 10);
+
+    // Byte-identical ordering (and scores) across runs.
+    assert_eq!(
+        first.len(),
+        second.len(),
+        "both runs must return same count"
+    );
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.file_path, b.file_path);
+        assert_eq!(a.line_start, b.line_start);
+        assert_eq!(a.line_end, b.line_end);
+        assert!(
+            (a.score - b.score).abs() < 1e-12,
+            "scores must be identical: {} vs {}",
+            a.score,
+            b.score
+        );
+    }
+
+    let json_first = serde_json::to_string(&first).unwrap();
+    let json_second = serde_json::to_string(&second).unwrap();
+    assert_eq!(
+        json_first, json_second,
+        "JSON serializations must be byte-identical"
+    );
+}
+
+// VAL-FILTER-013: extreme --limit is clamped to the index size, bounded memory.
+// The vector candidate pool must never exceed the real index count, even for
+// limits like 20000, so a flat backend never truncates and never allocates
+// proportional to the requested limit.
+#[test]
+fn candidate_pool_is_clamped_to_index_for_extreme_limits() {
+    use crate::retrieval::vector::candidate_pool;
+
+    // Simulate an over-cap index with 4427 chunks (flat backend).
+    let index_count = 4427;
+
+    for limit in [10, 20_000, 100_000] {
+        let (requested, fetched) = candidate_pool(limit, index_count, true);
+        assert!(
+            requested <= index_count,
+            "requested {requested} for limit {limit} must not exceed index {index_count}"
+        );
+        assert!(
+            fetched <= index_count,
+            "fetched {fetched} for limit {limit} must not exceed index {index_count}"
+        );
+    }
+
+    // Extreme limit on flat must still fetch the whole index.
+    let (req_flat, fetch_flat) = candidate_pool(20_000, index_count, true);
+    assert_eq!(req_flat, index_count, "flat requested must clamp to index");
+    assert_eq!(
+        fetch_flat, index_count,
+        "flat extreme limit must clamp to index size, not to 20000"
+    );
+
+    // Same extreme limit on vec0 must cap fetched at 4096 but requested is clamped to index.
+    let (req_vec0, fetch_vec0) = candidate_pool(20_000, index_count, false);
+    assert_eq!(req_vec0, index_count);
+    assert_eq!(
+        fetch_vec0,
+        crate::storage::vector::MAX_KNN_K,
+        "vec0 extreme limit must cap fetched at MAX_KNN_K"
+    );
+
+    // Small limit retains normal over-fetch semantics (limit + half, but still capped).
+    let (req_small, fetch_small) = candidate_pool(10, 4427, true);
+    assert_eq!(req_small, 20);
+    assert_eq!(fetch_small, 20);
+}
+
+// VAL-FILTER-016: exact_paths-style restrictions reach the island above the cap.
+// The whole-index fetch for flat filtered queries must be driven by index_count,
+// not by the post-filter count, so an island file at the tail is reachable.
+#[tokio::test]
+async fn exact_paths_filter_reaches_island_above_cap() {
+    use crate::embedding::test_helpers::MockProvider;
+    use crate::storage::metadata::MetadataStore;
+    use crate::storage::vector::VectorStore;
+    use crate::types::{Chunk, SearchFilters};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let index_dir = tmp.path().join("idx");
+    std::fs::create_dir_all(&index_dir).unwrap();
+
+    // Build a tiny index where the island file is the last inserted vector,
+    // so a shallow vec0 fetch would miss it.
+    let dim = 4;
+    let provider = MockProvider::new(dim);
+    let mut chunks = Vec::new();
+    for i in 0..20 {
+        chunks.push(Chunk {
+            id: format!("bulk:{i}"),
+            file_path: format!("src/audio/filter{i:04}.ts"),
+            line_start: 1,
+            line_end: 5,
+            content: format!("audio content {i}"),
+            language: Language::TypeScript,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some(format!("filter{i:04}")),
+            part_index: None,
+        });
+    }
+    chunks.push(Chunk {
+        id: "island:0".to_string(),
+        file_path: "src/video/island.ts".to_string(),
+        line_start: 1,
+        line_end: 5,
+        content: "island video handler apply envelope".to_string(),
+        language: Language::TypeScript,
+        symbol_type: Some(SymbolType::Function),
+        symbol_name: Some("island".to_string()),
+        part_index: None,
+    });
+
+    let metadata_store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+    metadata_store.insert_chunks(&chunks).unwrap();
+    let vector_store = VectorStore::open(&index_dir.join("vectors.db"), dim).unwrap();
+    crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &chunks)
+        .await;
+    let bm25 = crate::storage::bm25::Bm25Index::open(&index_dir.join("bm25")).unwrap();
+    bm25.insert_chunks(&chunks).unwrap();
+
+    let mut exact = HashSet::new();
+    exact.insert("src/video/island.ts".to_string());
+    let filters = SearchFilters {
+        exact_paths: Some(Arc::new(exact)),
+        ..Default::default()
+    };
+
+    let (results, _) = search_hybrid(
+        &index_dir,
+        &provider,
+        "apply envelope to buffer samples",
+        "apply envelope to buffer samples",
+        &filters,
+        10,
+        60.0,
+        dim,
+        50,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        results.iter().any(|r| r.file_path == "src/video/island.ts"),
+        "exact_paths filter must reach island, got {:?}",
+        results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+}
+
+// VAL-FILTER-017: multiple --path values work above the cap (OR semantics).
+#[tokio::test]
+async fn multiple_path_filters_use_or_semantics() {
+    use crate::embedding::test_helpers::MockProvider;
+    use crate::storage::metadata::MetadataStore;
+    use crate::storage::vector::VectorStore;
+    use crate::types::{Chunk, SearchFilters};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let index_dir = tmp.path().join("idx");
+    std::fs::create_dir_all(&index_dir).unwrap();
+
+    let dim = 4;
+    let provider = MockProvider::new(dim);
+    let chunks = vec![
+        Chunk {
+            id: "a:0".to_string(),
+            file_path: "src/video/a.ts".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "video content a apply envelope".to_string(),
+            language: Language::TypeScript,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("a".to_string()),
+            part_index: None,
+        },
+        Chunk {
+            id: "b:0".to_string(),
+            file_path: "src/videoplayer/b.ts".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "videoplayer content b apply envelope".to_string(),
+            language: Language::TypeScript,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("b".to_string()),
+            part_index: None,
+        },
+        Chunk {
+            id: "c:0".to_string(),
+            file_path: "src/audio/c.ts".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "audio content c apply envelope".to_string(),
+            language: Language::TypeScript,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("c".to_string()),
+            part_index: None,
+        },
+    ];
+
+    let metadata_store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+    metadata_store.insert_chunks(&chunks).unwrap();
+    let vector_store = VectorStore::open(&index_dir.join("vectors.db"), dim).unwrap();
+    crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &chunks)
+        .await;
+    let bm25 = crate::storage::bm25::Bm25Index::open(&index_dir.join("bm25")).unwrap();
+    bm25.insert_chunks(&chunks).unwrap();
+
+    let filters = SearchFilters {
+        path_glob: vec!["src/video".to_string(), "src/videoplayer/b.ts".to_string()],
+        ..Default::default()
+    };
+
+    let (results, _) = search_hybrid(
+        &index_dir,
+        &provider,
+        "apply envelope",
+        "apply envelope",
+        &filters,
+        10,
+        60.0,
+        dim,
+        50,
+    )
+    .await
+    .unwrap();
+
+    let paths: std::collections::HashSet<&str> =
+        results.iter().map(|r| r.file_path.as_str()).collect();
+    assert!(
+        paths.contains("src/video/a.ts"),
+        "must contain src/video, got {paths:?}"
+    );
+    assert!(
+        paths.contains("src/videoplayer/b.ts"),
+        "must contain src/videoplayer/b.ts, got {paths:?}"
+    );
+    assert!(
+        !paths.contains("src/audio/c.ts"),
+        "must exclude audio bulk, got {paths:?}"
+    );
+}
+
+// VAL-FILTER-019: filter match semantics unchanged — sibling prefix not matched,
+// and near-miss hint still fires for truly unmatched globs.
+#[test]
+fn video_filter_does_not_match_videoplayer_and_near_miss_hint_preserved() {
+    use crate::types::{SearchFilters, directory_prefix_near_misses};
+
+    let filters = SearchFilters {
+        path_glob: vec!["src/video".to_string()],
+        ..Default::default()
+    };
+    let video = make_result("src/video/a.ts", 1, 5, 1.0, None);
+    let videoplayer = make_result("src/videoplayer/b.ts", 1, 5, 1.0, None);
+    let sibling = make_result("src/videoplayer-extra/c.ts", 1, 5, 1.0, None);
+
+    assert!(
+        filters.matches(&video),
+        "src/video must match src/video/a.ts"
+    );
+    assert!(
+        !filters.matches(&videoplayer),
+        "src/video must NOT match src/videoplayer/b.ts (prefix guard)"
+    );
+    assert!(
+        !filters.matches(&sibling),
+        "src/video must NOT match src/videoplayer-extra/c.ts"
+    );
+
+    // Near-miss hint: a pattern like "crates/*/src" that matches no file
+    // directly but matches a directory ancestor should be reported.
+    let paths = vec![
+        "crates/vera-core/src/lib.rs".to_string(),
+        "crates/vera-cli/src/main.rs".to_string(),
+    ];
+    let patterns = vec!["crates/*/src".to_string()];
+    let near_misses = directory_prefix_near_misses(&patterns, &paths);
+    assert_eq!(
+        near_misses,
+        vec!["crates/*/src".to_string()],
+        "must report directory-prefix near miss for crates/*/src"
+    );
+
+    // A truly matched pattern does not produce a hint.
+    let no_miss = directory_prefix_near_misses(&["src/**/*.rs".to_string()], &paths);
+    assert!(
+        no_miss.is_empty(),
+        "matched pattern must not produce near-miss hint"
+    );
+}
+
+// VAL-FILTER-021: filtered above-cap results survive reranking (no re-clamping),
+// and graceful degradation on reranker failure preserves the filtered set.
+#[tokio::test]
+async fn filtered_results_survive_reranking_and_graceful_degradation() {
+    use crate::embedding::test_helpers::MockProvider;
+    use crate::retrieval::reranker::RerankerError;
+    use crate::retrieval::reranker::test_helpers::MockReranker;
+    use crate::storage::metadata::MetadataStore;
+    use crate::storage::vector::VectorStore;
+    use crate::types::{Chunk, SearchFilters};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let index_dir = tmp.path().join("idx");
+    std::fs::create_dir_all(&index_dir).unwrap();
+
+    let dim = 4;
+    let provider = MockProvider::new(dim);
+    let chunks = vec![
+        Chunk {
+            id: "island:0".to_string(),
+            file_path: "src/video/island.ts".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "apply envelope to buffer samples island".to_string(),
+            language: Language::TypeScript,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("island".to_string()),
+            part_index: None,
+        },
+        Chunk {
+            id: "bulk:0".to_string(),
+            file_path: "src/audio/bulk.ts".to_string(),
+            line_start: 1,
+            line_end: 5,
+            content: "apply envelope to buffer samples bulk".to_string(),
+            language: Language::TypeScript,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("bulk".to_string()),
+            part_index: None,
+        },
+    ];
+
+    let metadata_store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+    metadata_store.insert_chunks(&chunks).unwrap();
+    let vector_store = VectorStore::open(&index_dir.join("vectors.db"), dim).unwrap();
+    crate::embedding::test_helpers::embed_and_insert_vectors(&vector_store, &provider, &chunks)
+        .await;
+    let bm25 = crate::storage::bm25::Bm25Index::open(&index_dir.join("bm25")).unwrap();
+    bm25.insert_chunks(&chunks).unwrap();
+
+    let filters = SearchFilters {
+        path_glob: vec!["src/video".to_string()],
+        ..Default::default()
+    };
+
+    // Successful reranking must keep the filtered island.
+    let reranker = MockReranker::new();
+    let (reranked, _) = search_hybrid_reranked(
+        &index_dir,
+        &provider,
+        &reranker,
+        "apply envelope to buffer samples",
+        "apply envelope to buffer samples",
+        &filters,
+        10,
+        10,
+        60.0,
+        dim,
+        10,
+        50,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        reranked
+            .iter()
+            .any(|r| r.file_path == "src/video/island.ts"),
+        "reranked filtered set must retain island, got {:?}",
+        reranked.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    assert!(
+        reranked
+            .iter()
+            .all(|r| r.file_path.starts_with("src/video")),
+        "reranked must not reintroduce bulk files"
+    );
+
+    // Failing reranker must degrade gracefully and still return the filtered island.
+    let failing = MockReranker::failing(RerankerError::ConnectionError {
+        message: "reranker down".to_string(),
+    });
+    let (degraded, _) = search_hybrid_reranked(
+        &index_dir,
+        &provider,
+        &failing,
+        "apply envelope to buffer samples",
+        "apply envelope to buffer samples",
+        &filters,
+        10,
+        1,
+        60.0,
+        dim,
+        10,
+        50,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        degraded
+            .iter()
+            .any(|r| r.file_path == "src/video/island.ts"),
+        "graceful degradation must preserve filtered island, got {:?}",
+        degraded.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+}
