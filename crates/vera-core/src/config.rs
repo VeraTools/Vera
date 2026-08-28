@@ -125,7 +125,7 @@ pub struct RetrievalConfig {
 }
 
 fn default_max_output_chars() -> usize {
-    12_000
+    env_usize("VERA_MAX_OUTPUT_CHARS", 0)
 }
 
 fn default_max_rerank_batch() -> usize {
@@ -140,7 +140,7 @@ impl Default for RetrievalConfig {
             rerank_candidates: 50,
             reranking_enabled: false,
             max_rerank_batch: default_max_rerank_batch(),
-            max_output_chars: 12_000,
+            max_output_chars: default_max_output_chars(),
         }
     }
 }
