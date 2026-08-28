@@ -88,4 +88,69 @@ mod tests {
         let result = truncate_to_budget("a long line", 5);
         assert!(result.len() <= 5);
     }
+
+    #[test]
+    fn json_carries_bare_name_plus_part_index_and_display_shows_parts() {
+        use crate::types::{Language, SearchResult, SymbolType, display_symbol_name};
+        let bare = "MixerConsole";
+        for part in 1..=3 {
+            let r = SearchResult {
+                file_path: "src/mixer.tsx".to_string(),
+                line_start: part * 10,
+                line_end: part * 10 + 5,
+                content: "content".to_string(),
+                language: Language::TypeScript,
+                score: 1.0,
+                symbol_name: Some(bare.to_string()),
+                symbol_type: Some(SymbolType::Function),
+                part_index: Some(part),
+            };
+            let cr = CompactResult::from_search_result(&r);
+            assert_eq!(cr.symbol_name, Some(bare));
+            assert_eq!(cr.part_index, Some(part));
+            let json = serde_json::to_string(&cr).unwrap();
+            assert!(json.contains("\"symbol_name\":\"MixerConsole\""));
+            assert!(json.contains(&format!("\"part_index\":{part}")));
+            assert!(!json.contains(" (part "));
+
+            let display = r.display_name().unwrap();
+            assert_eq!(display, display_symbol_name(bare, Some(part)));
+            assert!(display.contains(&format!("(part {part})")));
+        }
+        // Unsplit stays bare with no part_index.
+        let unsplit = SearchResult {
+            file_path: "src/small.rs".to_string(),
+            line_start: 1,
+            line_end: 2,
+            content: "content".to_string(),
+            language: Language::Rust,
+            score: 1.0,
+            symbol_name: Some("SmallFn".to_string()),
+            symbol_type: Some(SymbolType::Function),
+            part_index: None,
+        };
+        let cr = CompactResult::from_search_result(&unsplit);
+        assert_eq!(cr.symbol_name, Some("SmallFn"));
+        assert_eq!(cr.part_index, None);
+        let json = serde_json::to_string(&cr).unwrap();
+        assert!(!json.contains("part_index"));
+        assert_eq!(unsplit.display_name().as_deref(), Some("SmallFn"));
+
+        // Literal " (part N)" verbatim unsplit case.
+        let lit = SearchResult {
+            file_path: "src/lit.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "content".to_string(),
+            language: Language::Rust,
+            score: 1.0,
+            symbol_name: Some("foo (part 2)".to_string()),
+            symbol_type: Some(SymbolType::Function),
+            part_index: None,
+        };
+        assert_eq!(lit.display_name().as_deref(), Some("foo (part 2)"));
+        let cr = CompactResult::from_search_result(&lit);
+        assert_eq!(cr.symbol_name, Some("foo (part 2)"));
+        assert_eq!(cr.part_index, None);
+    }
 }

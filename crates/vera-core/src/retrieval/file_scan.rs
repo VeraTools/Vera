@@ -92,13 +92,18 @@ pub(crate) fn smallest_symbol_chunk_for_line(chunks: &[Chunk], line: u32) -> Opt
 pub(crate) fn symbol_for_line(
     chunks: Option<&[Chunk]>,
     line: u32,
-) -> (Option<String>, Option<SymbolType>) {
+) -> (Option<String>, Option<SymbolType>, Option<u32>) {
     chunks
         .and_then(|chunks| {
-            smallest_symbol_chunk_for_line(chunks, line)
-                .map(|chunk| (chunk.symbol_name.clone(), chunk.symbol_type))
+            smallest_symbol_chunk_for_line(chunks, line).map(|chunk| {
+                (
+                    chunk.symbol_name.clone(),
+                    chunk.symbol_type,
+                    chunk.part_index,
+                )
+            })
         })
-        .unwrap_or((None, None))
+        .unwrap_or((None, None, None))
 }
 
 pub(crate) fn bounded_byte_snippet(

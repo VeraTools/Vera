@@ -1218,4 +1218,95 @@ mod tests {
             "foo (part 2) (part 1)"
         );
     }
+
+    #[test]
+    fn split_threshold_probes_are_uniform_across_sites() {
+        // SizeProbe190 (≈198 lines, below threshold) must remain single-part
+        // and SizeProbe195/200 (>200 lines) must split, all storing bare names.
+        // This exercises the line-count split site uniformly.
+        for (probe, expected_parts) in [
+            ("SizeProbe190", 1),
+            ("SizeProbe195", 2),
+            ("SizeProbe200", 2),
+        ] {
+            let line_count = match probe {
+                "SizeProbe190" => 198,
+                "SizeProbe195" => 203,
+                _ => 208,
+            };
+            let mut lines = vec![format!("export function {probe}() {{")];
+            for i in 0..(line_count - 2) {
+                lines.push(format!("  const line{i} = {i};"));
+            }
+            lines.push("}".to_string());
+            let source = lines.join("\n");
+            let symbols = vec![RawSymbol {
+                name: Some(probe.to_string()),
+                symbol_type: SymbolType::Function,
+                start_byte: 0,
+                end_byte: source.len(),
+                start_row: 0,
+                end_row: line_count - 1,
+            }];
+            let chunks = chunks_from_symbols(
+                &symbols,
+                &source,
+                &format!("src/sizes/{probe}.tsx"),
+                Language::TypeScript,
+                &default_config(),
+            );
+            let probe_chunks: Vec<_> = chunks
+                .iter()
+                .filter(|c| c.symbol_name.as_deref() == Some(probe))
+                .collect();
+            if expected_parts == 1 {
+                assert_eq!(
+                    probe_chunks.len(),
+                    1,
+                    "{probe} should not split: got {} chunks",
+                    probe_chunks.len()
+                );
+                assert_eq!(probe_chunks[0].part_index, None);
+            } else {
+                assert!(
+                    probe_chunks.len() >= 2,
+                    "{probe} should split: got {} chunks",
+                    probe_chunks.len()
+                );
+                for (idx, chunk) in probe_chunks.iter().enumerate() {
+                    assert_eq!(
+                        chunk.symbol_name.as_deref(),
+                        Some(probe),
+                        "split parts must keep bare name"
+                    );
+                    assert_eq!(chunk.part_index, Some((idx as u32) + 1));
+                }
+            }
+        }
+
+        // Byte-budget site must produce the same bare + part_index shape.
+        let content = "line content\n".repeat(50);
+        let chunk = Chunk {
+            id: "src/large.rs:0".to_string(),
+            file_path: "src/large.rs".to_string(),
+            line_start: 1,
+            line_end: 50,
+            content: content.clone(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("ByteProbe".to_string()),
+            part_index: None,
+        };
+        let unsplit = split_oversized_chunks(vec![chunk.clone()], 10_000);
+        assert_eq!(unsplit.len(), 1);
+        assert_eq!(unsplit[0].symbol_name.as_deref(), Some("ByteProbe"));
+        assert_eq!(unsplit[0].part_index, None);
+
+        let split = split_oversized_chunks(vec![chunk], 200);
+        assert!(split.len() >= 2);
+        for (idx, c) in split.iter().enumerate() {
+            assert_eq!(c.symbol_name.as_deref(), Some("ByteProbe"));
+            assert_eq!(c.part_index, Some((idx as u32) + 1));
+        }
+    }
 }

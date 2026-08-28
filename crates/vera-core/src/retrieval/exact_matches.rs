@@ -607,4 +607,54 @@ mod tests {
 
         assert!(results.is_empty());
     }
+
+    #[tokio::test]
+    async fn exact_name_augmentation_reaches_split_symbol() {
+        use crate::config::VeraConfig;
+        use crate::embedding::test_helpers::MockProvider;
+        use crate::indexing::index_repository;
+
+        async fn index_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+            let dir = tempfile::TempDir::new().unwrap();
+            for (path, content) in files {
+                let abs = dir.path().join(path);
+                if let Some(parent) = abs.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(abs, content).unwrap();
+            }
+            let provider = MockProvider::new(8);
+            let config = VeraConfig::default();
+            index_repository(dir.path(), &provider, &config, "mock-model")
+                .await
+                .unwrap();
+            dir
+        }
+
+        let mut lines = vec!["export const MixerConsole: React.FC = () => {".to_string()];
+        for i in 0..210 {
+            lines.push(format!("  const line{i} = {i};"));
+        }
+        lines.push("  return null;".to_string());
+        lines.push("};".to_string());
+        let content = lines.join("\n");
+        let dir = index_repo(&[("src/mixer.tsx", &content)]).await;
+        let index_dir = crate::indexing::index_dir(dir.path());
+        let store = MetadataStore::open(&index_dir.join("metadata.db")).unwrap();
+        let files = store.indexed_files().unwrap();
+        let results = collect_exact_match_candidates(&store, &files, "MixerConsole", 0).unwrap();
+        assert!(
+            !results.is_empty(),
+            "exact-name augmentation must reach split symbol"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| r.symbol_name.as_deref() == Some("MixerConsole"))
+        );
+        // Top results include split parts.
+        let top = &results[0];
+        assert!(top.part_index.is_some(), "split part must carry part_index");
+        assert_eq!(top.symbol_name.as_deref(), Some("MixerConsole"));
+    }
 }
