@@ -258,6 +258,13 @@ where
     info!(path = %repo_root.display(), "starting indexing");
 
     let idx_dir = index_dir(&repo_root);
+    // Serialize concurrent writers for this repo. The lock is held for the
+    // entire build so a concurrent `reuse_index` check sees a held lock and
+    // refuses to reuse a half-written live index. `flock` releases
+    // automatically on process exit, so a crashed writer cannot leave a stale
+    // lock that blocks forever (unlike a plain `.lock` file).
+    let _index_lock = crate::indexing::lock::IndexLock::acquire_blocking_for_index_dir(&idx_dir)
+        .context("failed to acquire index lock")?;
     recover_index_directories(&idx_dir).context("failed to recover index directories")?;
 
     // ── 2. Discover files ────────────────────────────────────────

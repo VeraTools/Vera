@@ -7,6 +7,7 @@
 //! - Incremental update logic (detect changed files, re-index only those)
 
 pub mod freshness;
+pub mod lock;
 pub mod pipeline;
 pub mod update;
 

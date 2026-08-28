@@ -318,6 +318,9 @@ where
         );
     }
 
+    let _index_lock = crate::indexing::lock::IndexLock::acquire_blocking_for_index_dir(&idx_dir)
+        .context("failed to acquire index lock")?;
+
     info!(path = %repo_root.display(), "starting incremental update");
 
     // ── 2. Discover current files on disk ────────────────────────
