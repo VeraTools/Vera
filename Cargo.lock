@@ -4230,6 +4230,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

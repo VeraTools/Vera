@@ -105,6 +105,12 @@ pub struct LaneSpec {
     /// Optional embedding max-retries override (API lanes).
     #[serde(default)]
     pub max_retries: Option<u32>,
+    /// Skip indexing for repos whose on-disk index matches the lane's
+    /// embedding identity and whose working tree has not drifted. Reports
+    /// then show near-zero index time; use for query-phase reruns on a
+    /// pinned corpus, never for cold-index measurements.
+    #[serde(default)]
+    pub reuse_index: Option<bool>,
     /// Additional environment overrides, useful for API endpoints and keys.
     /// Secret values are redacted in report provenance.
     #[serde(default, alias = "env")]
@@ -317,6 +323,9 @@ impl ResolvedLane {
         if let Some(max_retries) = self.spec.max_retries {
             config.insert("lane.max_retries".to_string(), max_retries.to_string());
         }
+        if let Some(reuse_index) = self.spec.reuse_index {
+            config.insert("lane.reuse_index".to_string(), reuse_index.to_string());
+        }
         config
     }
 }
@@ -488,6 +497,7 @@ pub fn preset(name: &str) -> Option<LaneSpec> {
         max_concurrent_requests: None,
         timeout_secs: None,
         max_retries: None,
+        reuse_index: None,
         environment: BTreeMap::new(),
     })
 }
@@ -960,5 +970,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_file(&toml_path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lane_reuse_index_provenance_present_when_set() {
+        let lane_true = resolve(LaneSpec {
+            reuse_index: Some(true),
+            ..preset("vera-cpu").unwrap()
+        })
+        .unwrap();
+        let prov = lane_true.provenance().unwrap();
+        let map = lane_true.config_map(&prov);
+        assert_eq!(map.get("lane.reuse_index"), Some(&"true".to_string()));
+
+        let lane_false = resolve(LaneSpec {
+            reuse_index: Some(false),
+            ..preset("vera-cpu").unwrap()
+        })
+        .unwrap();
+        let prov2 = lane_false.provenance().unwrap();
+        let map2 = lane_false.config_map(&prov2);
+        assert_eq!(map2.get("lane.reuse_index"), Some(&"false".to_string()));
+    }
+
+    #[test]
+    fn lane_reuse_index_provenance_absent_when_unset() {
+        let lane = resolve(preset("vera-cpu").unwrap()).unwrap();
+        let prov = lane.provenance().unwrap();
+        let map = lane.config_map(&prov);
+        assert!(
+            !map.contains_key("lane.reuse_index"),
+            "absent flag should not create provenance key"
+        );
+    }
+
+    #[test]
+    fn bm25_lane_records_reuse_index_provenance_but_adapter_never_reuses() {
+        // Provenance must still record the spec value even though the adapter hard-codes never-reuse.
+        let lane = resolve(LaneSpec {
+            reuse_index: Some(true),
+            ..preset("vera-bm25").unwrap()
+        })
+        .unwrap();
+        let prov = lane.provenance().unwrap();
+        let map = lane.config_map(&prov);
+        assert_eq!(map.get("lane.reuse_index"), Some(&"true".to_string()));
+        // BM25 lane is identified as bm25 (backend None) and should never reuse; the adapter's
+        // hard-coded false is verified in vera_adapter tests.
+        assert!(lane.is_bm25());
     }
 }

@@ -15,8 +15,13 @@ use crate::storage::metadata::MetadataStore;
 use super::index_dir;
 use super::update::{detect_language_for_path, hash_for_indexing_source};
 
-pub(crate) const INDEXING_CONFIG_KEY: &str = "indexing_config";
+pub const INDEXING_CONFIG_KEY: &str = "indexing_config";
 const INDEX_REFRESHED_AT_KEY: &str = "index_refreshed_at_unix_ms";
+pub const INDEX_FORMAT_VERSION_KEY: &str = "index_format_version";
+/// Increment this when the on-disk chunk or index format changes incompatibly.
+/// Eval harness `reuse_index` gates on this value; a missing or mismatched
+/// version forces a full re-index so stale chunk identity is never reused.
+pub const INDEX_FORMAT_VERSION: &str = "1";
 
 /// Summary of drift between the working tree and the current index.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -81,6 +86,9 @@ pub(crate) fn record_index_snapshot(
                 .to_string(),
         )
         .context("failed to store index refresh timestamp")?;
+    metadata_store
+        .set_index_meta(INDEX_FORMAT_VERSION_KEY, INDEX_FORMAT_VERSION)
+        .context("failed to store index format version")?;
     Ok(())
 }
 
