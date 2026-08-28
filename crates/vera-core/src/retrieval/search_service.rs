@@ -391,7 +391,8 @@ impl SearchContext {
         timings.augmentation = Some(aug_start.elapsed());
 
         timings.total = Some(total_start.elapsed());
-        Ok((apply_filters(results, filters, result_limit), timings))
+        let final_results = apply_filters(results, filters, result_limit);
+        Ok((final_results, timings))
     }
 }
 

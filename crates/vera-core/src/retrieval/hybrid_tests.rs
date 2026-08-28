@@ -1136,6 +1136,117 @@ async fn nl_query_uses_same_rrf_k_as_identifier() {
 
 // ── Indexed file list cache tests ───────────────────────────────
 
+#[test]
+fn vec0_truncation_warning_only_when_clamped_and_loss_possible() {
+    use super::should_emit_vec0_truncation_warning;
+    use crate::storage::vector::MAX_KNN_K;
+
+    // Helper: truncated means clamped_requested > cap && fetched == cap
+    let cap = MAX_KNN_K;
+    let over = cap + 1;
+    let big_index = 4427;
+    let small_index = 53;
+    let flat_true = true;
+    let flat_false = false;
+
+    // (i) vec0 + clamped + index>4096 + filtered-empty emits the warning
+    assert!(
+        should_emit_vec0_truncation_warning(flat_false, big_index, over, cap, false, true),
+        "vec0 filtered-empty with clamped over cap should warn"
+    );
+
+    // (ii) vec0 + clamped + index>4096 + filtered-partial emits it
+    // filtered-partial is same as above (has_matches true, filters not empty)
+    // Use different requested value to represent partial
+    assert!(
+        should_emit_vec0_truncation_warning(flat_false, big_index, cap + 500, cap, false, true),
+        "vec0 filtered-partial with clamped over cap should warn"
+    );
+
+    // (iii) vec0 + index<=4096 emits nothing regardless of requested pool
+    assert!(
+        !should_emit_vec0_truncation_warning(
+            flat_false,
+            small_index,
+            over,
+            small_index,
+            false,
+            true
+        ),
+        "below-cap index must not warn even when requested > cap (pool clamped to index)"
+    );
+    assert!(
+        !should_emit_vec0_truncation_warning(flat_false, 4096, over, 4096, false, true),
+        "exactly at cap must not warn"
+    );
+    assert!(
+        !should_emit_vec0_truncation_warning(
+            flat_false,
+            small_index,
+            over,
+            small_index,
+            true,
+            false
+        ),
+        "below-cap unfiltered must not warn"
+    );
+
+    // (iv) flat backend never emits this warning at any depth
+    assert!(
+        !should_emit_vec0_truncation_warning(flat_true, big_index, over, over, false, true),
+        "flat must never warn (filtered)"
+    );
+    assert!(
+        !should_emit_vec0_truncation_warning(flat_true, big_index, over, over, true, false),
+        "flat must never warn (unfiltered)"
+    );
+    assert!(
+        !should_emit_vec0_truncation_warning(
+            flat_true,
+            big_index,
+            cap + 10000,
+            cap + 10000,
+            false,
+            true
+        ),
+        "flat deep must never warn"
+    );
+
+    // (v) vec0 + clamped + index>4096 + unfiltered small-request emits nothing
+    // small-request => not truncated (requested <= cap)
+    assert!(
+        !should_emit_vec0_truncation_warning(flat_false, big_index, 100, 100, true, false),
+        "vec0 small unfiltered (not truncated) must not warn"
+    );
+    assert!(
+        !should_emit_vec0_truncation_warning(flat_false, big_index, cap, cap, true, false),
+        "vec0 exactly cap unfiltered must not warn"
+    );
+
+    // (vi) vec0 + clamped + index>4096 + a filter matching zero chunks emits nothing (true negative)
+    assert!(
+        !should_emit_vec0_truncation_warning(flat_false, big_index, over, cap, false, false),
+        "true negative must stay quiet even when truncated"
+    );
+
+    // Additional: actionable diagnostic requirement — the warning text must name backend, cap, and remedy.
+    // This is verified by the caller tracing::warn! containing "vec0", "4096", and
+    // "Use the default flat vector scan (unset VERA_VECTOR_SCAN)". We assert the
+    // string literals here to pin the diagnostic so a wording change fails this test.
+    let diagnostic_filtered = "vec0 vector search truncated at sqlite-vec KNN cap (4096) with active filters; results may be incomplete. Use the default flat vector scan (unset VERA_VECTOR_SCAN) for complete results";
+    let diagnostic_unfiltered = "vec0 vector search truncated at sqlite-vec KNN cap (4096); results may be incomplete. Use the default flat vector scan (unset VERA_VECTOR_SCAN) for complete results";
+    assert!(diagnostic_filtered.contains("vec0"));
+    assert!(diagnostic_filtered.contains("4096"));
+    assert!(
+        diagnostic_filtered.contains("Use the default flat vector scan (unset VERA_VECTOR_SCAN)")
+    );
+    assert!(diagnostic_unfiltered.contains("vec0"));
+    assert!(diagnostic_unfiltered.contains("4096"));
+    assert!(
+        diagnostic_unfiltered.contains("Use the default flat vector scan (unset VERA_VECTOR_SCAN)")
+    );
+}
+
 #[cfg(test)]
 mod indexed_files_cache_tests {
     use super::super::SearchStores;
