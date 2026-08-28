@@ -224,7 +224,7 @@ fn search_vector_from_embedding(
 /// cap. Callers stack several multipliers before reaching here (query type, then
 /// a filter over-fetch, then this one), so a natural-language query with an
 /// active filter can ask for more than sqlite-vec will serve on the vec0 path.
-fn candidate_pool(limit: usize, index_count: usize, is_flat: bool) -> (usize, usize) {
+pub(crate) fn candidate_pool(limit: usize, index_count: usize, is_flat: bool) -> (usize, usize) {
     let requested = limit
         .saturating_add(limit / 2)
         .max(limit.saturating_add(10));
