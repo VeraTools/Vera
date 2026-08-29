@@ -658,29 +658,6 @@ mod protocol_wire_tests {
 
     #[tokio::test]
     async fn voyage_auto_detection_sends_top_k_and_accepts_data() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _addr = listener.local_addr().unwrap();
-        let captured = Arc::new(Mutex::new(serde_json::Value::Null));
-        let cap = Arc::clone(&captured);
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let (_first, body) = read_http_request(&mut stream).await;
-            *cap.lock().unwrap() = body;
-            let resp =
-                r#"{"data":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.1}]}"#;
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        resp.len(),
-                        resp
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-        });
-        // Use Voyage hostname with no explicit protocol -> should auto-detect Voyage
         let base = "https://api.voyageai.com/v1".to_string();
         // We need to point at our mock listener but still trigger Voyage detection.
         // To do that, we test detection via explicit voyage URL logic: use voyage hostname directly
@@ -699,11 +676,10 @@ mod protocol_wire_tests {
             "voyage hostname should auto-detect Voyage"
         );
         // For wire capture we need a mock that actually receives top_k; use explicit Voyage on loopback
+        let captured = Arc::new(Mutex::new(serde_json::Value::Null));
         let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let cap2 = Arc::clone(&captured);
-        // Reset captured
-        *cap2.lock().unwrap() = serde_json::Value::Null;
         tokio::spawn(async move {
             let (mut stream, _) = listener2.accept().await.unwrap();
             let (_first, body) = read_http_request(&mut stream).await;

@@ -1,7 +1,7 @@
 # Reranker server-side batching decision
 
 **Date:** 2026-08-29
-**Status:** Declined — no separate capability field
+**Status:** Declined. No separate capability field
 
 ## Investigated protocols
 
@@ -16,7 +16,7 @@ No investigated provider documents a distinct “server-side batching preference
 
 ## Decision
 
-Do not add a separate `reranker_server_batching` capability field. The existing `retrieval.max_rerank_batch` (and its alias `retrieval.reranker_max_doc_chars` family) already represents the client-vs-server choice:
+Do not add a separate `reranker_server_batching` capability field. The existing `retrieval.max_rerank_batch` already represents the client-vs-server choice (separate from `retrieval.reranker_max_doc_chars`, which is the per-document character budget):
 
 - `20` (default) = client-side batching, each batch ≤ 20 docs, scores merged with global index remapping.
 - `0` = single unbatched request, letting the server batch internally.

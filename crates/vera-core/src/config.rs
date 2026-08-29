@@ -189,8 +189,13 @@ pub struct RetrievalConfig {
     pub reranker_max_retries: u32,
     /// Cap on 429 rate-limit wait in seconds. `None` (default) keeps the
     /// short generic backoff; `Some(n)` sleeps until the quota window reset
-    /// clamped to `n` seconds.
-    #[serde(default = "default_reranker_rate_limit_wait_secs")]
+    /// clamped to `n` seconds. `0` is treated as `None` (CLI `0` maps to
+    /// `null`, file `0` likewise means no cap) so the three layers share one
+    /// contract.
+    #[serde(
+        default = "default_reranker_rate_limit_wait_secs",
+        deserialize_with = "deserialize_reranker_rate_limit_wait_secs"
+    )]
     pub reranker_rate_limit_wait_secs: Option<u64>,
     /// How `return_documents` is sent. `None` omits the field (per-protocol
     /// default is `Some(false)` for current providers). `Some(v)` sends that
@@ -220,10 +225,45 @@ fn default_reranker_max_retries() -> u32 {
 }
 
 fn default_reranker_rate_limit_wait_secs() -> Option<u64> {
-    std::env::var("VERA_RERANK_RATE_LIMIT_WAIT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
+    match std::env::var("VERA_RERANK_RATE_LIMIT_WAIT_SECS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(parsed) => {
+                if parsed == 0 {
+                    None
+                } else {
+                    Some(parsed)
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    key = "VERA_RERANK_RATE_LIMIT_WAIT_SECS",
+                    value = %value,
+                    error = %error,
+                    "invalid numeric environment override; using default"
+                );
+                None
+            }
+        },
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            tracing::warn!(
+                key = "VERA_RERANK_RATE_LIMIT_WAIT_SECS",
+                error = %error,
+                "could not read numeric environment override; using default"
+            );
+            None
+        }
+    }
+}
+
+fn deserialize_reranker_rate_limit_wait_secs<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<u64>::deserialize(deserializer)?;
+    Ok(opt.filter(|v| *v != 0))
 }
 
 fn default_reranker_return_documents() -> Option<bool> {

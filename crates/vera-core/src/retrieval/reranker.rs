@@ -286,9 +286,15 @@ impl ApiReranker {
     fn endpoint_url(&self) -> String {
         if let Some(path) = &self.endpoint_path {
             let base = self.config.base_url.trim_end_matches('/');
-            // Configured path is used verbatim (leading `/` required);
-            // no extra `/rerank` is appended.
-            return format!("{base}{path}");
+            // Configured path is used verbatim (leading `/` required).
+            // If a hand-edited config omits the `/`, normalize defensively
+            // so the URL does not become `{base}v1/rerank`.
+            let normalized = if path.starts_with('/') {
+                path.clone()
+            } else {
+                format!("/{path}")
+            };
+            return format!("{base}{normalized}");
         }
         let base = self.config.base_url.trim_end_matches('/');
         format!("{base}/rerank")

@@ -379,6 +379,21 @@ fn set_config_value(
         | "retrieval.rerank_task_field"
         | "retrieval.task_field" => {
             config.retrieval.reranker_task_field = parse_optional_string(key, value)?;
+            if let Some(field) = &config.retrieval.reranker_task_field {
+                const RESERVED: &[&str] = &[
+                    "model",
+                    "query",
+                    "documents",
+                    "top_n",
+                    "top_k",
+                    "return_documents",
+                ];
+                if RESERVED.contains(&field.as_str()) {
+                    bail!(
+                        "{key} must not be a reserved reranker field (model/query/documents/top_n/top_k/return_documents)"
+                    );
+                }
+            }
         }
         "retrieval.reranker_max_doc_chars"
         | "retrieval.rerank_max_doc_chars"
