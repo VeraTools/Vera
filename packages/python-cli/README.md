@@ -19,7 +19,7 @@ vera-ai setup --potion-code --index .
 vera-ai search "authentication logic"
 ```
 
-`vera-ai setup` with no flags runs an interactive wizard and offers to index the current project, defaulting to yes. An interactive search also offers to create a missing index. `vera-ai setup --api` prompts for an OpenAI-compatible endpoint and key; use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera-ai agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
+`vera-ai setup` with no flags runs an interactive wizard and offers to index the current project, defaulting to yes. An interactive search also offers to create a missing index. `vera-ai setup --api` prompts for an OpenAI-compatible endpoint and key; the wizard offers presets for OpenAI, Jina, Voyage, and Qwen via OpenRouter, with the Qwen preset needing only one shared key (`qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1`). Use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera-ai agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
 
 ## Common Tasks
 

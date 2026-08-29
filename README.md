@@ -51,6 +51,7 @@ vera setup --onnx-jina-rocm --index .       # AMD GPU (ROCm, Linux)
 vera setup --onnx-jina-openvino --index .   # Intel GPU (OpenVINO, Linux)
 vera setup --onnx-jina-directml --index .   # DirectX 12 GPU (Windows)
 ```
+The interactive `vera setup` wizard offers presets for OpenAI, Jina, Voyage, and Qwen via OpenRouter; the Qwen preset uses `qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` with a single shared key and generic reranker protocol.
 
 **3. Search**
 ```bash
@@ -86,7 +87,7 @@ Vera itself is always local: the index lives in `.vera/` per project, config and
 
 Pick the `vera setup` flag that matches your hardware from the quick start above. The full hardware-to-command matrix, step-by-step instructions, API provider options, Docker, and building from source live in the [Installation Guide](docs/installation.md).
 
-API mode works with any OpenAI-compatible endpoint and needs no local compute. Use `vera setup --api --yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. Jina ONNX and CodeRankEmbed are opt-in alternatives. Reranking is opt-in and disabled by default. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
+API mode works with any OpenAI-compatible endpoint and needs no local compute. Use `vera setup --api --yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. The Qwen preset (`qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1`) needs only one shared key and configures the generic reranker protocol automatically. Jina ONNX and CodeRankEmbed are opt-in alternatives. Reranking is opt-in and disabled by default. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
 
 <details>
 <summary>MCP server</summary>

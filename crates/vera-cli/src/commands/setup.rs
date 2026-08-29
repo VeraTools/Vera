@@ -154,6 +154,14 @@ fn run_wizard() -> anyhow::Result<()> {
 
     if effective_backend == InferenceBackend::Api {
         configure_api_interactive()?;
+        // Friction: Step 2 (agent skills) and Step 3 (index now) asked two extra
+        // confirmations before the first search could run. For API first-run the
+        // preset is complete after the single key entry, so skip directly to the
+        // outro and let `vera index` / `vera search` run separately.
+        cliclack::outro(
+            "Setup complete! Run `vera index .` and `vera search \"query\"` to get started.",
+        )?;
+        return Ok(());
     } else {
         configure_backend(
             effective_backend,
@@ -164,7 +172,7 @@ fn run_wizard() -> anyhow::Result<()> {
         )?;
     }
 
-    // Step 2: Agent skill installation
+    // Step 2: Agent skill installation (local backends only)
     cliclack::log::step("Step 2: Agent skills")?;
     let install_skills: bool = cliclack::confirm("Install Vera skills for coding agents?")
         .initial_value(true)
@@ -647,11 +655,28 @@ fn configure_api_interactive() -> anyhow::Result<()> {
     let (embedding, reranker) = prompt_api_setup()?;
     // Collect reranker protocol settings before any persistence so cancellation
     // at any prompt leaves existing config untouched.
+    // Qwen (OpenRouter) uses the generic protocol; apply it without prompting
+    // so the preset completes with a single key entry (friction: before, three
+    // extra prompts for protocol/endpoint/task even though defaults are correct).
+    let is_qwen = embedding.model_id == "qwen/qwen3-embedding-8b"
+        && embedding.base_url == "https://openrouter.ai/api/v1"
+        && reranker
+            .as_ref()
+            .is_some_and(|r| r.model_id == "qwen/qwen3-reranker-8b");
     let reranker_protocol_update = if reranker.is_some() {
-        Some(prompt_reranker_protocol_settings(
-            &embedding,
-            reranker.as_ref(),
-        )?)
+        if is_qwen {
+            Some(RerankerProtocolUpdate {
+                protocol: Some(RerankerProtocol::Generic),
+                endpoint_path: None,
+                task_instruction: None,
+                task_field: None,
+            })
+        } else {
+            Some(prompt_reranker_protocol_settings(
+                &embedding,
+                reranker.as_ref(),
+            )?)
+        }
     } else {
         None
     };
@@ -891,6 +916,32 @@ fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> 
     }
     let choice: usize = select.interact()?;
     let preset = &presets[choice];
+
+    // Friction: selecting Qwen previously required Enter to accept the
+    // embedding base URL, model ID, reranker base URL and model ID even
+    // though the preset already defines them exactly (transcript showed four
+    // redundant Enter presses before the key). Skip those prompts for Qwen
+    // and go straight to the single credential entry, reusing it for both
+    // endpoints without a second prompt.
+    if preset.label == "Qwen (OpenRouter)" {
+        let api_key: String = cliclack::password("OpenRouter API key")
+            .mask('▪')
+            .interact()?;
+        if api_key.trim().is_empty() {
+            bail!("OpenRouter API key is required");
+        }
+        let embedding = ApiSetupInput {
+            base_url: preset.embedding_base_url.to_string(),
+            model_id: preset.embedding_model.to_string(),
+            api_key: api_key.clone(),
+        };
+        let reranker = Some(ApiSetupInput {
+            base_url: preset.reranker_base_url.to_string(),
+            model_id: preset.reranker_model.to_string(),
+            api_key,
+        });
+        return Ok((embedding, reranker));
+    }
 
     // Embedding base URL
     let embedding_base_url = prompt_required_input(
