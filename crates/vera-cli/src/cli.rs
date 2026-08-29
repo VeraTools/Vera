@@ -624,7 +624,7 @@ pub enum Commands {
                       retrieval.rrf_k                RRF fusion constant (default: 60)\n  \
                       retrieval.rerank_candidates    Reranker candidate count (default: 50)\n  \
                       retrieval.reranking_enabled    Enable reranking (default: false)\n  \
-                      retrieval.max_output_chars     Total output char budget (default: 12000)\n  \
+                      retrieval.max_output_chars     Total output char budget (default: 0 = unlimited)\n  \
                       embedding.batch_size           Embedding batch size (default: 128)\n  \
                       embedding.max_concurrent_requests  Concurrent API requests (default: 8)\n  \
                       embedding.timeout_secs         API timeout (default: 60)\n  \
