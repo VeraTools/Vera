@@ -158,6 +158,12 @@ pub fn run(json_output: bool, probe: bool) -> anyhow::Result<()> {
                     "RERANKER_MODEL_API_KEY",
                 ],
             ));
+            // Persisted reranker protocol settings: valid Qwen config reports
+            // endpoint/model/protocol healthy; broken values name the specific
+            // problem. Failures here count toward the verdict.
+            if let Ok(stored) = state::load_saved_config() {
+                checks.extend(reranker_protocol_checks(&stored));
+            }
             if probe {
                 checks.push(skipped_check(
                     "probe",
@@ -283,7 +289,38 @@ fn check_env_group(name: &'static str, keys: &[&'static str]) -> DoctorCheck {
         .iter()
         .map(|key| std::env::var_os(key).and_then(|value| value.into_string().ok()))
         .collect::<Vec<_>>();
-    check_env_values(name, keys.len(), &values)
+    // For partial groups, name which variables are missing so a broken
+    // `endpoint without key` is actionable without guessing.
+    let present_details = values
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            v.as_ref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|_| keys[i])
+                .or(None)
+        })
+        .collect::<Vec<_>>();
+    let missing: Vec<_> = keys
+        .iter()
+        .filter(|k| !present_details.contains(k))
+        .copied()
+        .collect();
+    let check = check_env_values(name, keys.len(), &values);
+    if matches!(check.status, CheckStatus::Fail) && !missing.is_empty() {
+        let mut detail = check.detail;
+        detail.push_str(&format!(" (missing: {})", missing.join(", ")));
+        // Add a human hint for the classic endpoint-without-key case.
+        if name == "reranker-api" && missing == ["RERANKER_MODEL_API_KEY"] {
+            detail.push_str(" — reranker endpoint without api key");
+        }
+        return DoctorCheck {
+            name: check.name,
+            status: check.status,
+            detail,
+        };
+    }
+    check
 }
 
 /// A value counts as present only when it is usable: unset, non-UTF-8, and
@@ -334,6 +371,73 @@ fn saved_backend_check(config: &state::StoredConfig) -> DoctorCheck {
             },
         },
     }
+}
+
+fn reranker_protocol_checks(stored: &state::StoredConfig) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+    let retrieval = stored
+        .core_config
+        .as_ref()
+        .map(|c| c.retrieval.clone())
+        .unwrap_or_else(|| vera_core::config::VeraConfig::default().retrieval);
+
+    // Validate endpoint path: must start with '/' when present.
+    if let Some(path) = &retrieval.reranker_endpoint_path
+        && !path.starts_with('/')
+    {
+        checks.push(DoctorCheck {
+            name: "reranker-protocol",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "reranker_endpoint_path must start with '/' but got '{}' (unknown protocol key or invalid endpoint_path)",
+                path
+            ),
+        });
+        return checks;
+    }
+
+    // When a reranker endpoint is stored, report its model/protocol health.
+    if let Some(reranker) = &stored.reranker_api {
+        let protocol_detail = match retrieval.reranker_protocol {
+            Some(p) => p.to_string(),
+            None => "auto (generic for openrouter, voyage for voyageai.com)".to_string(),
+        };
+        let endpoint_path_detail = retrieval
+            .reranker_endpoint_path
+            .as_deref()
+            .unwrap_or("{base}/rerank");
+        let mut detail = format!(
+            "endpoint={}, model={}, protocol={}, endpoint_path={}",
+            reranker.base_url, reranker.model_id, protocol_detail, endpoint_path_detail
+        );
+        if let Some(instr) = &retrieval.reranker_task_instruction {
+            detail.push_str(&format!(", task_instruction='{}'", instr));
+        }
+        if let Some(field) = &retrieval.reranker_task_field {
+            detail.push_str(&format!(", task_field='{}'", field));
+        }
+        checks.push(DoctorCheck {
+            name: "reranker-protocol",
+            status: CheckStatus::Ok,
+            detail,
+        });
+        // Also validate unknown protocol explicitly via re-parse of raw file?
+        // Serde already covers unknown variant, which surfaces as config-file fail.
+        // For completeness, if protocol was somehow parsed as valid but unknown,
+        // the detail above would be ok; the unknown case is handled upstream.
+    } else if retrieval.reranker_protocol.is_some()
+        || retrieval.reranker_endpoint_path.is_some()
+        || retrieval.reranker_task_instruction.is_some()
+        || retrieval.reranker_task_field.is_some()
+    {
+        checks.push(DoctorCheck {
+            name: "reranker-protocol",
+            status: CheckStatus::Warn,
+            detail: "reranker protocol configured but no reranker endpoint stored".to_string(),
+        });
+    }
+
+    checks
 }
 
 fn local_model_assets_check(

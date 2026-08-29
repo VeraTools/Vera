@@ -62,6 +62,7 @@ Many providers offer free tiers or generous trial credits. Any OpenAI-compatible
 | [Jina AI](https://jina.ai/) | Yes (1M tokens free) | Remote embedding and reranking endpoints |
 | [OpenAI](https://platform.openai.com/) | Trial credits | `text-embedding-3-small` or `text-embedding-3-large` |
 | [Voyage AI](https://www.voyageai.com/) | Free tier available | Code-optimized models (`voyage-code-3`, `rerank-2`) |
+| [Qwen via OpenRouter](https://openrouter.ai/) | Paid usage | `qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` (preset in `vera setup`) |
 | [Cohere](https://cohere.com/) | Trial key | `embed-english-v3.0` |
 
 For non-interactive setup, set the environment variables directly and add `--yes`:
@@ -81,10 +82,21 @@ export RERANKER_MODEL_API_KEY=your-key
 # export RERANKER_MODEL_ID=rerank-2
 # export RERANKER_MODEL_API_KEY=your-key
 
+# Or for Qwen via OpenRouter (paid usage, generic protocol):
+# export EMBEDDING_MODEL_BASE_URL=https://openrouter.ai/api/v1
+# export EMBEDDING_MODEL_ID=qwen/qwen3-embedding-8b
+# export EMBEDDING_MODEL_API_KEY=your-openrouter-key
+# export RERANKER_MODEL_BASE_URL=https://openrouter.ai/api/v1
+# export RERANKER_MODEL_ID=qwen/qwen3-reranker-8b
+# export RERANKER_MODEL_API_KEY=your-openrouter-key
+
 vera setup --api --yes
+# Optional reranker protocol overrides (without a TTY)
+# vera config set retrieval.reranker_protocol generic
+# vera config set retrieval.reranker_endpoint_path "/rerank"
 ```
 
-Vera automatically handles Voyage AI's rerank wire format when `RERANKER_MODEL_BASE_URL` points to `https://api.voyageai.com/v1`.
+Vera automatically handles Voyage AI's rerank wire format when `RERANKER_MODEL_BASE_URL` points to `https://api.voyageai.com/v1`. The Qwen preset uses the generic wire format (`top_n`/`results`) via `https://openrouter.ai/api/v1`.
 
 Only model calls leave your machine. Indexing, storage, and search remain local.
 

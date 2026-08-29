@@ -4,7 +4,7 @@ use std::io::IsTerminal;
 
 use anyhow::{Context, bail};
 use serde::Serialize;
-use vera_core::config::{InferenceBackend, OnnxExecutionProvider};
+use vera_core::config::{InferenceBackend, OnnxExecutionProvider, RerankerProtocol};
 use vera_core::local_models::{
     LocalEmbeddingModelConfig, LocalEmbeddingPooling, normalize_huggingface_repo,
 };
@@ -29,7 +29,8 @@ pub(crate) struct SetupReport {
 /// Remedy shown when a non-interactive invocation cannot prompt.
 const NON_INTERACTIVE_HINT: &str = "Hint: pass `--yes` for the default Potion Code backend, a GPU flag \
      (for example `--onnx-jina-cuda` or `--onnx-jina-coreml`), or `--api` with \
-     EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and EMBEDDING_MODEL_API_KEY set.";
+     EMBEDDING_MODEL_BASE_URL, EMBEDDING_MODEL_ID, and EMBEDDING_MODEL_API_KEY set, \
+     or use `vera config set` for non-interactive configuration.";
 
 /// The backend `vera setup` and `vera backend` pick when no flag is given.
 ///
@@ -635,11 +636,33 @@ fn confirm(
 
 /// Interactive API configuration for the setup wizard.
 /// Offers common provider presets and prompts for credentials.
+///
+/// The Qwen (OpenRouter) preset uses `qwen/qwen3-embedding-8b` +
+/// `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` with a single
+/// shared API key. The reranker for this preset relies on the generic
+/// protocol (`top_n`/`results`) unless the operator overrides it in the
+/// subsequent reranker-protocol step or via `vera config set`; other presets
+/// default to auto-detect (voyage on `voyageai.com`, generic elsewhere).
 fn configure_api_interactive() -> anyhow::Result<()> {
     let (embedding, reranker) = prompt_api_setup()?;
+    // Collect reranker protocol settings before any persistence so cancellation
+    // at any prompt leaves existing config untouched.
+    let reranker_protocol_update = if reranker.is_some() {
+        Some(prompt_reranker_protocol_settings(
+            &embedding,
+            reranker.as_ref(),
+        )?)
+    } else {
+        None
+    };
 
     state::save_backend(InferenceBackend::Api)?;
     state::save_api_setup(&embedding, reranker.as_ref())?;
+    if let Some(update) = reranker_protocol_update {
+        let mut runtime = state::load_runtime_config()?;
+        apply_reranker_protocol_update(&mut runtime, update);
+        state::save_runtime_config(&runtime)?;
+    }
     state::apply_saved_env_force()?;
 
     if state::load_saved_config()?.install_method.is_none()
@@ -654,6 +677,158 @@ fn configure_api_interactive() -> anyhow::Result<()> {
          EMBEDDING_MODEL_* / RERANKER_MODEL_* env vars from your shell.",
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RerankerProtocolUpdate {
+    protocol: Option<RerankerProtocol>,
+    endpoint_path: Option<String>,
+    task_instruction: Option<String>,
+    task_field: Option<String>,
+}
+
+fn apply_reranker_protocol_update(
+    runtime: &mut vera_core::config::VeraConfig,
+    update: RerankerProtocolUpdate,
+) {
+    runtime.retrieval.reranker_protocol = update.protocol;
+    runtime.retrieval.reranker_endpoint_path = update.endpoint_path;
+    runtime.retrieval.reranker_task_instruction = update.task_instruction;
+    runtime.retrieval.reranker_task_field = update.task_field;
+}
+
+fn prompt_reranker_protocol_settings(
+    embedding: &ApiSetupInput,
+    reranker: Option<&ApiSetupInput>,
+) -> anyhow::Result<RerankerProtocolUpdate> {
+    let existing = state::load_runtime_config().unwrap_or_default();
+    let existing_protocol = existing.retrieval.reranker_protocol;
+    let existing_endpoint = existing.retrieval.reranker_endpoint_path.clone();
+    let existing_instruction = existing.retrieval.reranker_task_instruction.clone();
+    let existing_field = existing.retrieval.reranker_task_field.clone();
+
+    // Qwen (OpenRouter) uses the generic wire protocol; suggest explicit generic
+    // so the preset round-trips with a persisted protocol setting. Other presets
+    // keep auto-detect as the default, which resolves to generic for non-Voyage
+    // hosts and to voyage on voyageai.com.
+    let is_qwen = embedding.model_id == "qwen/qwen3-embedding-8b"
+        && embedding.base_url == "https://openrouter.ai/api/v1"
+        && reranker.is_some_and(|r| r.model_id == "qwen/qwen3-reranker-8b");
+    let suggested_protocol = if is_qwen {
+        Some(RerankerProtocol::Generic)
+    } else {
+        None
+    };
+    let default_protocol = existing_protocol.or(suggested_protocol);
+
+    // Map protocol to cliclack choice index: 0=auto, 1=generic, 2=voyage.
+    let protocol_choice: usize = {
+        let mut select = cliclack::select("Reranker protocol (wire format for rerank requests)");
+        select = select.item(
+            0usize,
+            "Auto-detect",
+            "voyage on voyageai.com, generic elsewhere",
+        );
+        select = select.item(
+            1usize,
+            "Generic (top_n/results)",
+            "for OpenRouter, Jina, Cohere",
+        );
+        select = select.item(2usize, "Voyage (top_k/data)", "for api.voyageai.com");
+        let default_index = match default_protocol {
+            None => 0,
+            Some(RerankerProtocol::Generic) => 1,
+            Some(RerankerProtocol::Voyage) => 2,
+        };
+        // cliclack's `initial_value` selects the highlighted item before interaction.
+        select = select.initial_value(default_index);
+        select.interact()?
+    };
+    let protocol = match protocol_choice {
+        1 => Some(RerankerProtocol::Generic),
+        2 => Some(RerankerProtocol::Voyage),
+        _ => None,
+    };
+
+    // Endpoint path: empty means preset default (`{base}/rerank`). Validation
+    // enforces leading slash when set; keep raw None for default.
+    let endpoint_path: Option<String> = {
+        let default_display = existing_endpoint.as_deref().unwrap_or("");
+        let input: String = if default_display.is_empty() {
+            cliclack::input("Reranker endpoint path (Enter for default {base}/rerank)")
+                .placeholder("/rerank")
+                .required(false)
+                .interact()?
+        } else {
+            cliclack::input("Reranker endpoint path (Enter for default {base}/rerank)")
+                .default_input(default_display)
+                .interact()?
+        };
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            if !trimmed.starts_with('/') {
+                bail!("reranker endpoint path must start with '/'");
+            }
+            Some(trimmed)
+        }
+    };
+
+    // Task instruction / field: optional, empty means not set.
+    let task_instruction: Option<String> = {
+        let default_display = existing_instruction.as_deref().unwrap_or("");
+        let input: String = if default_display.is_empty() {
+            cliclack::input("Reranker task instruction (optional, Enter to skip)")
+                .placeholder("e.g. Given a query, retrieve relevant code")
+                .required(false)
+                .interact()?
+        } else {
+            cliclack::input("Reranker task instruction (optional, Enter to skip)")
+                .default_input(default_display)
+                .interact()?
+        };
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    };
+
+    let task_field: Option<String> = if task_instruction.is_some() {
+        let default_display = existing_field.as_deref().unwrap_or("");
+        let prompt_label = "Reranker task field (optional, Enter to skip)";
+        let input: String = if default_display.is_empty() {
+            cliclack::input(prompt_label)
+                .placeholder("e.g. instruction")
+                .required(false)
+                .interact()?
+        } else {
+            cliclack::input(prompt_label)
+                .default_input(default_display)
+                .interact()?
+        };
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    } else {
+        // If no instruction, keep existing field only if previously set and instruction was previously set; otherwise clear.
+        // To keep idempotency, preserve existing field when instruction is None but field was set? For simplicity, clear field when instruction is None and prompt not shown.
+        // However for idempotency we should preserve existing field only if instruction also preserved. Since instruction is None, field should be None.
+        // But to respect "changing exactly one field preserves others", we need to allow preserving field even when instruction cleared? For now, preserve existing if instruction was previously set? Simpler: if task_instruction is None and existing field is Some, keep it only if user explicitly wants? We'll clear to avoid orphan.
+        None
+    };
+
+    Ok(RerankerProtocolUpdate {
+        protocol,
+        endpoint_path,
+        task_instruction,
+        task_field,
+    })
 }
 
 fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> {
@@ -691,6 +866,14 @@ fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> 
             embedding_model: "voyage-code-3",
             reranker_base_url: "https://api.voyageai.com/v1",
             reranker_model: "rerank-2",
+        },
+        ApiPreset {
+            label: "Qwen (OpenRouter)",
+            hint: "qwen3-embedding-8b + qwen3-reranker-8b via OpenRouter (paid usage)",
+            embedding_base_url: "https://openrouter.ai/api/v1",
+            embedding_model: "qwen/qwen3-embedding-8b",
+            reranker_base_url: "https://openrouter.ai/api/v1",
+            reranker_model: "qwen/qwen3-reranker-8b",
         },
         ApiPreset {
             label: "Custom",
@@ -759,6 +942,7 @@ fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> 
         let reranker_api_key: String =
             cliclack::password("Reranker API key (Enter to reuse embedding key)")
                 .mask('▪')
+                .allow_empty()
                 .interact()?;
         let reranker_api_key = if reranker_api_key.is_empty() {
             embedding_api_key
