@@ -282,6 +282,10 @@ pub enum HybridSearchError {
         vector_error: String,
     },
 
+    /// The rerank was cancelled via the cancellation token.
+    #[error("rerank cancelled")]
+    Cancelled,
+
     /// Storage or pipeline error.
     #[error("{0}")]
     PipelineError(#[from] anyhow::Error),
@@ -848,6 +852,12 @@ async fn search_hybrid_reranked_inner(
             Ok((reranked, timings))
         }
         Err(rerank_err) => {
+            if matches!(
+                rerank_err,
+                crate::retrieval::reranker::RerankerError::Cancelled
+            ) {
+                return Err(HybridSearchError::Cancelled);
+            }
             timings.reranking = Some(rerank_start.elapsed());
             warn!(
                 error = %rerank_err,

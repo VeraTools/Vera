@@ -401,6 +401,46 @@ fn truncate_document_zero_max_passthrough() {
     assert_eq!(truncate_document("hello", 0), "hello");
 }
 
+#[test]
+fn truncate_document_multibyte_char_budget() {
+    // Each '🦀' is 4 bytes but 1 char. Budget is chars, not bytes.
+    // 10 crabs = 10 chars, 40 bytes. With budget 5, we must get 5 crabs (5 chars),
+    // not 5 bytes (which would be 1 crab + truncated byte).
+    let doc = "🦀".repeat(10); // 10 chars, 40 bytes
+    let result = truncate_document(&doc, 5);
+    assert_eq!(result.chars().count(), 5);
+    assert_eq!(result, "🦀".repeat(5));
+
+    // Boundary with newline: "a🦀\nb🦀\nc" — ensure newline-safe cut respects char count
+    // Doc: chars = ['a','🦀','\n','b','🦀','\n','c'] = 7 chars
+    // Budget 4 => first 4 chars = "a🦀\nb" => rfind '\n' => "a🦀"
+    let doc2 = "a🦀\nb🦀\nc";
+    let result2 = truncate_document(doc2, 4);
+    assert_eq!(result2, "a🦀");
+
+    // Doc exactly at budget must not be truncated (char count, not byte len)
+    // "🦀🦀" = 2 chars, 8 bytes; budget 5 bytes would have truncated if byte-based,
+    // but char budget 5 must keep it whole.
+    let doc3 = "🦀🦀"; // 2 chars
+    assert_eq!(truncate_document(doc3, 5), doc3);
+
+    // Mix of single and multi-byte: "a🦀b🦀c" = 5 chars, 1+4+1+4+1=11 bytes
+    // Budget 3 => "a🦀b" (3 chars)
+    let doc4 = "a🦀b🦀c";
+    assert_eq!(truncate_document(doc4, 3), "a🦀b");
+}
+
+#[test]
+fn truncate_document_multibyte_no_newline_boundary() {
+    // No newline in slice, so char-boundary truncation must be exact
+    let doc = "🦀".repeat(20);
+    // Budget 7 => 7 crabs
+    let result = truncate_document(&doc, 7);
+    assert_eq!(result.chars().count(), 7);
+    // Verify byte length is 28 (7*4), not 7
+    assert_eq!(result.len(), 28);
+}
+
 #[tokio::test]
 async fn api_reranker_unreachable_endpoint() {
     let config = RerankerConfig::new(
@@ -1682,5 +1722,234 @@ mod protocol_wire_tests {
             ),
             "connection error must be classified as transient"
         );
+    }
+
+    #[tokio::test]
+    async fn transient_408_request_timeout_is_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = Arc::clone(&count);
+        tokio::spawn(async move {
+            for i in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_http_request(&mut stream).await;
+                cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i == 0 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 7\r\nConnection: close\r\n\r\ntimeout",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let resp = r#"{"results":[{"index":0,"relevance_score":0.88}]}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                resp.len(),
+                                resp
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let retrieval =
+            make_retrieval_with(None, None, None, None, None, None, None, None, None, None);
+        let cfg = RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+            .with_max_retries(2);
+        let r = ApiReranker::from_configs(cfg, &retrieval).unwrap();
+        let scores = r.rerank("q", &["doc".to_string()]).await.unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "408 must be retried exactly once before succeeding"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_429_with_retry_after_and_cap_is_retried() {
+        // 429 with Retry-After 1s and cap 5s => should wait ~1s then retry and succeed
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = Arc::clone(&count);
+        tokio::spawn(async move {
+            for i in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_http_request(&mut stream).await;
+                cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i == 0 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let resp = r#"{"results":[{"index":0,"relevance_score":0.77}]}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                resp.len(),
+                                resp
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let retrieval = RetrievalConfig {
+            reranker_rate_limit_wait_secs: Some(5),
+            ..make_retrieval_with(None, None, None, None, None, None, None, None, None, None)
+        };
+        let cfg = RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+            .with_max_retries(2)
+            .with_rate_limit_wait_cap(std::time::Duration::from_secs(5));
+        let r = ApiReranker::from_configs(cfg, &retrieval).unwrap();
+        let start = std::time::Instant::now();
+        let scores = r.rerank("q", &["doc".to_string()]).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "429 with Retry-After must have waited before retry, elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_network_error_dropped_connection_is_retried() {
+        // Simulate a network error by closing the connection without a response on first attempt,
+        // then succeeding on the second. reqwest reports this as ConnectionError which must be retried.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = Arc::clone(&count);
+        tokio::spawn(async move {
+            for i in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_http_request(&mut stream).await;
+                cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i == 0 {
+                    // Drop without response => connection error
+                    drop(stream);
+                } else {
+                    let resp = r#"{"results":[{"index":0,"relevance_score":0.66}]}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                resp.len(),
+                                resp
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let retrieval =
+            make_retrieval_with(None, None, None, None, None, None, None, None, None, None);
+        let cfg = RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+            .with_max_retries(2)
+            .with_timeout(std::time::Duration::from_secs(2));
+        let r = ApiReranker::from_configs(cfg, &retrieval).unwrap();
+        let scores = r.rerank("q", &["doc".to_string()]).await.unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "dropped connection (network error) must be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_429_openrouter_body_reset_with_cap_is_retried() {
+        // OpenRouter body shape with X-RateLimit-Reset, clamped by cap
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = Arc::clone(&count);
+        tokio::spawn(async move {
+            for i in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let mut request = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        let header = String::from_utf8_lossy(&request[..end]);
+                        if let Some(cl) = header
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        {
+                            let len: usize =
+                                cl.split(':').nth(1).unwrap().trim().parse().unwrap_or(0);
+                            if request.len() >= end + len {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i == 0 {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let reset_ms = now_ms + 1_000;
+                    let body = format!(
+                        r#"{{"error":{{"message":"Rate limit exceeded","code":429,"metadata":{{"headers":{{"X-RateLimit-Reset":"{reset_ms}"}}}}}}}}"#
+                    );
+                    let header = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(header.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                } else {
+                    let resp = r#"{"results":[{"index":0,"relevance_score":0.9}]}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                resp.len(),
+                                resp
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let retrieval = RetrievalConfig {
+            reranker_rate_limit_wait_secs: Some(2),
+            ..make_retrieval_with(None, None, None, None, None, None, None, None, None, None)
+        };
+        let cfg = RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+            .with_max_retries(2)
+            .with_rate_limit_wait_cap(std::time::Duration::from_secs(2));
+        let r = ApiReranker::from_configs(cfg, &retrieval).unwrap();
+        let scores = r.rerank("q", &["doc".to_string()]).await.unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

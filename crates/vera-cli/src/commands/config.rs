@@ -599,4 +599,223 @@ mod tests {
             Some(serde_json::json!("Passage:"))
         );
     }
+
+    #[test]
+    fn config_set_and_get_reranker_protocol_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "retrieval.reranker_protocol", "generic").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_protocol"),
+            Some(serde_json::json!("generic"))
+        );
+        set_config_value(&mut config, "retrieval.reranker_protocol", "voyage").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_protocol"),
+            Some(serde_json::json!("voyage"))
+        );
+        set_config_value(&mut config, "retrieval.reranker_protocol", "null").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_protocol"),
+            Some(serde_json::Value::Null)
+        );
+        // alias
+        set_config_value(&mut config, "retrieval.rerank_protocol", "generic").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.rerank_protocol"),
+            Some(serde_json::json!("generic"))
+        );
+    }
+
+    #[test]
+    fn config_set_and_get_reranker_endpoint_path_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(
+            &mut config,
+            "retrieval.reranker_endpoint_path",
+            "/v1/reranking",
+        )
+        .unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_endpoint_path"),
+            Some(serde_json::json!("/v1/reranking"))
+        );
+        set_config_value(&mut config, "retrieval.reranker_endpoint_path", "null").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_endpoint_path"),
+            Some(serde_json::Value::Null)
+        );
+        // alias
+        set_config_value(&mut config, "retrieval.rerank_endpoint_path", "/v1/rerank").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.rerank_endpoint_path"),
+            Some(serde_json::json!("/v1/rerank"))
+        );
+    }
+
+    #[test]
+    fn config_set_and_get_reranker_task_instruction_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(
+            &mut config,
+            "retrieval.reranker_task_instruction",
+            "find relevant code",
+        )
+        .unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_task_instruction"),
+            Some(serde_json::json!("find relevant code"))
+        );
+        set_config_value(&mut config, "retrieval.reranker_task_instruction", "null").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_task_instruction"),
+            Some(serde_json::Value::Null)
+        );
+        // alias
+        set_config_value(
+            &mut config,
+            "retrieval.task_instruction",
+            "alias instruction",
+        )
+        .unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.task_instruction"),
+            Some(serde_json::json!("alias instruction"))
+        );
+    }
+
+    #[test]
+    fn config_set_and_get_reranker_task_field_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "retrieval.reranker_task_field", "instruction").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_task_field"),
+            Some(serde_json::json!("instruction"))
+        );
+        set_config_value(&mut config, "retrieval.reranker_task_field", "null").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_task_field"),
+            Some(serde_json::Value::Null)
+        );
+        // alias
+        set_config_value(&mut config, "retrieval.rerank_task_field", "custom_field").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.rerank_task_field"),
+            Some(serde_json::json!("custom_field"))
+        );
+    }
+
+    #[test]
+    fn config_set_and_get_reranker_max_doc_chars_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "retrieval.reranker_max_doc_chars", "1234").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_max_doc_chars"),
+            Some(serde_json::json!(1234))
+        );
+        set_config_value(&mut config, "retrieval.reranker_max_doc_chars", "0").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_max_doc_chars"),
+            Some(serde_json::json!(0))
+        );
+        // alias
+        set_config_value(&mut config, "retrieval.max_rerank_doc_chars", "5678").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.max_rerank_doc_chars"),
+            Some(serde_json::json!(5678))
+        );
+    }
+
+    #[test]
+    fn config_set_and_get_reranker_timeout_secs_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "retrieval.reranker_timeout_secs", "42").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_timeout_secs"),
+            Some(serde_json::json!(42))
+        );
+        // alias
+        set_config_value(&mut config, "retrieval.rerank_timeout_secs", "99").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.rerank_timeout_secs"),
+            Some(serde_json::json!(99))
+        );
+    }
+
+    #[test]
+    fn config_set_and_get_reranker_max_retries_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "retrieval.reranker_max_retries", "5").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_max_retries"),
+            Some(serde_json::json!(5))
+        );
+        set_config_value(&mut config, "retrieval.reranker_max_retries", "0").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_max_retries"),
+            Some(serde_json::json!(0))
+        );
+        // alias
+        set_config_value(&mut config, "retrieval.rerank_max_retries", "3").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.rerank_max_retries"),
+            Some(serde_json::json!(3))
+        );
+    }
+
+    #[test]
+    fn config_set_and_get_reranker_rate_limit_wait_secs_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "retrieval.reranker_rate_limit_wait_secs", "15").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_rate_limit_wait_secs"),
+            Some(serde_json::json!(15))
+        );
+        set_config_value(
+            &mut config,
+            "retrieval.reranker_rate_limit_wait_secs",
+            "null",
+        )
+        .unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_rate_limit_wait_secs"),
+            Some(serde_json::Value::Null)
+        );
+        set_config_value(&mut config, "retrieval.reranker_rate_limit_wait_secs", "0").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_rate_limit_wait_secs"),
+            Some(serde_json::Value::Null)
+        );
+        // alias
+        set_config_value(&mut config, "retrieval.rerank_rate_limit_wait_secs", "20").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.rerank_rate_limit_wait_secs"),
+            Some(serde_json::json!(20))
+        );
+    }
+
+    #[test]
+    fn config_set_and_get_reranker_return_documents_round_trips() {
+        let mut config = vera_core::config::VeraConfig::default();
+        set_config_value(&mut config, "retrieval.reranker_return_documents", "true").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_return_documents"),
+            Some(serde_json::json!(true))
+        );
+        set_config_value(&mut config, "retrieval.reranker_return_documents", "false").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_return_documents"),
+            Some(serde_json::json!(false))
+        );
+        set_config_value(&mut config, "retrieval.reranker_return_documents", "null").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.reranker_return_documents"),
+            Some(serde_json::Value::Null)
+        );
+        // alias
+        set_config_value(&mut config, "retrieval.return_documents", "true").unwrap();
+        assert_eq!(
+            get_config_value(&config, "retrieval.return_documents"),
+            Some(serde_json::json!(true))
+        );
+    }
 }

@@ -1751,6 +1751,41 @@ async fn filtered_results_survive_reranking_and_graceful_degradation() {
 }
 
 #[tokio::test]
+async fn cancelled_rerank_does_not_degrade_to_unreranked_results() {
+    use crate::embedding::test_helpers::MockProvider;
+    use crate::retrieval::reranker::RerankerError;
+    use crate::retrieval::reranker::test_helpers::MockReranker;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (index_dir, dim) = setup_test_index(tmp.path()).await;
+    let provider = MockProvider::new(dim);
+
+    let cancelling = MockReranker::failing(RerankerError::Cancelled);
+
+    // Must NOT return Ok degraded results; must propagate cancellation as typed error.
+    let result = search_hybrid_reranked(
+        &index_dir,
+        &provider,
+        &cancelling,
+        "authenticate",
+        "authenticate",
+        &SearchFilters::default(),
+        5,
+        1,
+        60.0,
+        dim,
+        10,
+        50,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(HybridSearchError::Cancelled)),
+        "cancelled rerank must propagate as HybridSearchError::Cancelled, not degrade to Ok: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn reranker_failure_degrades_to_exact_original_hybrid_order() {
     use crate::embedding::test_helpers::MockProvider;
     use crate::retrieval::reranker::RerankerError;
