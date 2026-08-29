@@ -1545,7 +1545,7 @@ mod protocol_wire_tests {
 
     #[tokio::test]
     async fn retry_classification_permanent_4xx_not_retried() {
-        for status in [400u16, 404, 422] {
+        for status in [400u16, 401, 403, 404, 422] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1558,7 +1558,7 @@ mod protocol_wire_tests {
                 stream
                     .write_all(
                         format!(
-                            "HTTP/1.1 {status} Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 {status} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
                             body
                         )
@@ -1566,7 +1566,7 @@ mod protocol_wire_tests {
                     )
                     .await
                     .unwrap();
-                // Do not accept second connection; if retried, second accept would hang and count stays 1
+                // For transient we would accept multiple connections; for permanent we only count 1
             });
             let retrieval =
                 make_retrieval_with(None, None, None, None, None, None, None, None, None, None);
@@ -1574,64 +1574,113 @@ mod protocol_wire_tests {
                 RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string());
             cfg = cfg.with_max_retries(2);
             let r = ApiReranker::from_configs(cfg, &retrieval).unwrap();
-            let _ = r.rerank("q", &["doc".to_string()]).await;
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let result = r.rerank("q", &["doc".to_string()]).await;
+            // Permanent 4xx must fail
+            assert!(result.is_err(), "status {status} should fail");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(&status.to_string()) || err_str.contains("authentication"),
+                "error should carry status {status}: {err_str}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             assert_eq!(
                 count.load(std::sync::atomic::Ordering::SeqCst),
                 1,
-                "status {status} must not be retried"
+                "permanent status {status} must not be retried (exactly one request)"
             );
         }
     }
 
     #[tokio::test]
     async fn transient_failures_are_retried() {
-        // 500 should be retried
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let cnt = Arc::clone(&count);
-        tokio::spawn(async move {
-            for i in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let _ = read_http_request(&mut stream).await;
-                cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if i == 0 {
-                    let body = "server error";
-                    stream
-                        .write_all(
+        // Each transient class should be retried: 408, 429 (Retry-After), 500, 502, 503 and connection error
+        for (status, body) in [
+            (408u16, "request timeout"),
+            (500, "internal error"),
+            (502, "bad gateway"),
+            (503, "service unavailable"),
+            (429, "too many requests"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cnt = Arc::clone(&count);
+            tokio::spawn(async move {
+                for i in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let _ = read_http_request(&mut stream).await;
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if i == 0 {
+                        let response = if status == 429 {
                             format!(
-                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 body.len(),
                                 body
                             )
-                            .as_bytes(),
-                        )
-                        .await
-                        .unwrap();
-                } else {
-                    let resp = r#"{"results":[{"index":0,"relevance_score":0.9}]}"#;
-                    stream
-                        .write_all(
+                        } else {
                             format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                resp.len(),
-                                resp
+                                "HTTP/1.1 {status} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
                             )
-                            .as_bytes(),
-                        )
-                        .await
-                        .unwrap();
+                        };
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    } else {
+                        let resp = r#"{"results":[{"index":0,"relevance_score":0.9}]}"#;
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    resp.len(),
+                                    resp
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                    }
                 }
-            }
-        });
+            });
+            let retrieval =
+                make_retrieval_with(None, None, None, None, None, None, None, None, None, None);
+            let cfg =
+                RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+                    .with_max_retries(2)
+                    .with_rate_limit_wait_cap(std::time::Duration::from_secs(1));
+            let r = ApiReranker::from_configs(cfg, &retrieval).unwrap();
+            let scores = r.rerank("q", &["doc".to_string()]).await.unwrap();
+            assert_eq!(
+                scores.len(),
+                1,
+                "transient status {status} should eventually succeed"
+            );
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "transient status {status} must be retried"
+            );
+        }
+        // Connection error (refused) is also transient
+        let config = RerankerConfig::new(
+            "http://127.0.0.1:1".to_string(),
+            "m".to_string(),
+            "k".to_string(),
+        )
+        .with_max_retries(1)
+        .with_timeout(std::time::Duration::from_millis(200));
         let retrieval =
             make_retrieval_with(None, None, None, None, None, None, None, None, None, None);
-        let cfg = RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
-            .with_max_retries(2);
-        let r = ApiReranker::from_configs(cfg, &retrieval).unwrap();
-        let scores = r.rerank("q", &["doc".to_string()]).await.unwrap();
-        assert_eq!(scores.len(), 1);
-        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let reranker = ApiReranker::from_configs(config, &retrieval).unwrap();
+        let result = reranker.rerank("q", &["doc".to_string()]).await;
+        assert!(result.is_err());
+        // Should have retried connection errors internally (we can't count, but error type is connection/rate-limit, not permanent)
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                crate::retrieval::reranker::RerankerError::ConnectionError { .. }
+                    | crate::retrieval::reranker::RerankerError::RateLimitError { .. }
+            ),
+            "connection error must be classified as transient"
+        );
     }
 }

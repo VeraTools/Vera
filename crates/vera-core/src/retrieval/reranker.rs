@@ -944,6 +944,7 @@ mod cancellation_tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
 
@@ -964,6 +965,212 @@ mod cancellation_tests {
             .await;
 
         assert!(matches!(result, Err(RerankerError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn api_reranker_cancels_in_flight_request_promptly() {
+        // Server accepts but delays response body for 10s; client cancels after 100ms
+        // and must return Cancelled quickly without waiting for server.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    // Delay response well beyond cancellation window
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let resp = r#"{"results":[{"index":0,"relevance_score":0.9}]}"#;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                resp.len(),
+                                resp
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let config =
+            RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+                .with_timeout(Duration::from_secs(5))
+                .with_max_retries(0);
+        let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let start = Instant::now();
+        let task = tokio::spawn(async move {
+            reranker
+                .rerank_cancellable("query", &["document".to_string()], &cancel_clone)
+                .await
+        });
+        // Give request time to be in-flight
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancellation of in-flight must be prompt")
+            .unwrap();
+        assert!(
+            matches!(result, Err(RerankerError::Cancelled)),
+            "in-flight cancel must yield Cancelled, got {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "in-flight cancellation should not wait for server response"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_reranker_cancels_during_rate_limit_wait() {
+        // 429 with Retry-After 10s, cap 10s -> retry_delay 10s; cancel during wait
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let cnt = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let c = Arc::clone(&cnt);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 10\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                        .await;
+                });
+            }
+        });
+        let config =
+            RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+                .with_timeout(Duration::from_secs(5))
+                .with_max_retries(2)
+                .with_rate_limit_wait_cap(Duration::from_secs(10));
+        let reranker = ApiReranker::new_with_max_rerank_batch(config, 1).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let start = Instant::now();
+        let task = tokio::spawn(async move {
+            reranker
+                .rerank_cancellable("query", &["document".to_string()], &cancel_clone)
+                .await
+        });
+        // Wait for first request to complete and enter backoff wait
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancel during rate-limit wait must be prompt")
+            .unwrap();
+        assert!(matches!(result, Err(RerankerError::Cancelled)));
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "cancel should interrupt rate-limit wait"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "cancel during wait must prevent second request"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_reranker_cancels_between_batches_prevents_next_batch() {
+        // 3 docs, batch 1 => 3 batches. First succeeds, cancel before second.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let cnt = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let c = Arc::clone(&cnt);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    // Read full request (may need multiple reads)
+                    let mut request = Vec::new();
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let end =
+                                request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                            let header = String::from_utf8_lossy(&request[..end]);
+                            if let Some(cl) = header
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            {
+                                let len: usize =
+                                    cl.split(':').nth(1).unwrap().trim().parse().unwrap_or(0);
+                                if request.len() >= end + len {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    c.fetch_add(1, Ordering::SeqCst);
+                    // Slow second batch handling to expose window, but first is quick
+                    // For first request, respond immediately
+                    let resp = r#"{"results":[{"index":0,"relevance_score":0.9}]}"#;
+                    // Small delay to let cancel fire between batches
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                resp.len(),
+                                resp
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let config =
+            RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+                .with_timeout(Duration::from_secs(5))
+                .with_max_retries(0);
+        let reranker = ApiReranker::new_with_max_rerank_batch(config, 1).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        // Spawn with 3 docs (batch 1 -> 3 requests). Cancel after first batch completes.
+        let task = tokio::spawn(async move {
+            let docs = vec!["d0".to_string(), "d1".to_string(), "d2".to_string()];
+            reranker
+                .rerank_cancellable("query", &docs, &cancel_clone)
+                .await
+        });
+        // Wait for first batch to be counted
+        for _ in 0..20 {
+            if count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Cancel between batches
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("inter-batch cancel must be prompt")
+            .unwrap();
+        assert!(matches!(result, Err(RerankerError::Cancelled)));
+        // Must not have issued all 3 batches
+        let final_count = count.load(Ordering::SeqCst);
+        assert!(
+            final_count < 3,
+            "cancel between batches must prevent remaining batches, got {final_count}"
+        );
     }
 
     #[tokio::test]
@@ -1028,6 +1235,7 @@ mod cancellation_tests {
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
+    use crate::config::RetrievalConfig;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -1092,16 +1300,254 @@ mod rate_limit_tests {
     #[tokio::test]
     async fn waits_out_rate_limit_window_when_cap_configured() {
         let (url, request_count) = spawn_rate_limit_server().await;
-        let config = RerankerConfig::new(url, "model".to_string(), "key".to_string())
-            .with_timeout(Duration::from_secs(5))
-            .with_max_retries(2)
-            .with_rate_limit_wait_cap(Duration::from_secs(10));
-        let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
+        let retrieval = RetrievalConfig {
+            reranker_timeout_secs: 5,
+            reranker_max_retries: 2,
+            reranker_rate_limit_wait_secs: Some(10),
+            max_rerank_batch: 20,
+            ..Default::default()
+        };
+        let cfg = RerankerConfig::new(url, "model".to_string(), "key".to_string());
+        let reranker = ApiReranker::from_configs(cfg, &retrieval).unwrap();
 
         let scores = reranker.rerank("query", &["document".to_string()]).await;
 
         assert!(scores.is_ok(), "429 should be retried after the wait hint");
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_after_wait_is_clamped_by_cap() {
+        // Server returns 429 with Retry-After: 4, cap 2 -> should wait ~2 not 4
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let cnt = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let c = Arc::clone(&cnt);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 4\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            )
+                            .await;
+                    } else {
+                        let resp = r#"{"results":[{"index":0,"relevance_score":0.9}]}"#;
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    resp.len(),
+                                    resp
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+        let retrieval = RetrievalConfig {
+            reranker_timeout_secs: 5,
+            reranker_max_retries: 2,
+            reranker_rate_limit_wait_secs: Some(2),
+            max_rerank_batch: 20,
+            ..Default::default()
+        };
+        let cfg = RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string());
+        let reranker = ApiReranker::from_configs(cfg, &retrieval).unwrap();
+        let start = Instant::now();
+        let scores = reranker
+            .rerank("query", &["document".to_string()])
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(4),
+            "Retry-After 4 with cap 2 should wait ~2s, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_body_reset_wait_is_honored_and_clamped_by_cap_end_to_end() {
+        // Exact bca26e9 body shape: {"error":{"message":"...","code":429,"metadata":{"headers":{"X-RateLimit-Reset":"<unix-ms>"}}}}
+        // Server returns 429 with body containing future reset ~3s from now, cap 2 -> should wait ~2
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let cnt = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let c = Arc::clone(&cnt);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let mut request = Vec::new();
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let end =
+                                request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                            let header = String::from_utf8_lossy(&request[..end]);
+                            if let Some(cl) = header
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            {
+                                let len: usize =
+                                    cl.split(':').nth(1).unwrap().trim().parse().unwrap_or(0);
+                                if request.len() >= end + len {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        // Future reset ~ 4s from now
+                        let reset_ms = now_ms + 4000;
+                        let body = format!(
+                            r#"{{"error":{{"message":"Rate limit exceeded","code":429,"metadata":{{"headers":{{"X-RateLimit-Limit":"20","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"{reset_ms}"}}}}}}}}"#
+                        );
+                        let header = format!(
+                            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(body.as_bytes()).await;
+                    } else {
+                        let resp = r#"{"results":[{"index":0,"relevance_score":0.9}]}"#;
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    resp.len(),
+                                    resp
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+        let retrieval = RetrievalConfig {
+            reranker_timeout_secs: 10,
+            reranker_max_retries: 2,
+            reranker_rate_limit_wait_secs: Some(2),
+            max_rerank_batch: 20,
+            ..Default::default()
+        };
+        let cfg = RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string());
+        let reranker = ApiReranker::from_configs(cfg, &retrieval).unwrap();
+        let start = Instant::now();
+        let scores = reranker
+            .rerank("query", &["document".to_string()])
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(4),
+            "OpenRouter reset ~4s with cap 2 should clamp to ~2s, got {elapsed:?}"
+        );
+        // Verify body shape parsing: reset hint must be string unix-ms at correct pointer
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let future_reset = now_ms + 5000;
+        let body = format!(
+            r#"{{"error":{{"message":"Rate limit exceeded","code":429,"metadata":{{"headers":{{"X-RateLimit-Reset":"{future_reset}"}}}}}}}}"#
+        );
+        let parsed = parse_rate_limit_reset(&body).unwrap();
+        assert!(parsed <= Duration::from_secs(6) && parsed >= Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn openrouter_reset_without_cap_degrades_quickly_end_to_end() {
+        // Without cap, a long OpenRouter reset (30s) must not be waited out; should degrade quickly via generic backoff
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let mut request = Vec::new();
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let end =
+                                request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                            let header = String::from_utf8_lossy(&request[..end]);
+                            if let Some(cl) = header
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            {
+                                let len: usize =
+                                    cl.split(':').nth(1).unwrap().trim().parse().unwrap_or(0);
+                                if request.len() >= end + len {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let reset_ms = now_ms + 30_000;
+                    let body = format!(
+                        r#"{{"error":{{"message":"Rate limit exceeded","code":429,"metadata":{{"headers":{{"X-RateLimit-Reset":"{reset_ms}"}}}}}}}}"#
+                    );
+                    let header = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        let config =
+            RerankerConfig::new(format!("http://{addr}"), "m".to_string(), "k".to_string())
+                .with_timeout(Duration::from_secs(5))
+                .with_max_retries(1);
+        // No cap configured (default None)
+        let reranker = ApiReranker::new_with_max_rerank_batch(config, 20).unwrap();
+        let start = Instant::now();
+        let result = reranker.rerank("query", &["document".to_string()]).await;
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(RerankerError::RateLimitError { .. })));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "without cap, long OpenRouter reset must degrade quickly, elapsed {elapsed:?}"
+        );
     }
 
     #[tokio::test]
