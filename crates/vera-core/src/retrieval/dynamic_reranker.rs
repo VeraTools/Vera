@@ -4,7 +4,6 @@ use crate::retrieval::reranker::{
     ApiReranker, RerankScore, Reranker, RerankerConfig, RerankerError,
 };
 use anyhow::Result;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +56,8 @@ pub async fn create_dynamic_reranker(
     match source {
         RerankerSource::Api => {
             let cfg = RerankerConfig::from_env()
-                .map_err(|err| anyhow::anyhow!("failed to configure reranker: {err}"))?
-                .with_timeout(Duration::from_secs(30))
-                .with_max_retries(2);
-            let p = ApiReranker::new_with_max_rerank_batch(cfg, config.retrieval.max_rerank_batch)
+                .map_err(|err| anyhow::anyhow!("failed to configure reranker: {err}"))?;
+            let p = ApiReranker::from_configs(cfg, &config.retrieval)
                 .map_err(|err| anyhow::anyhow!("failed to init reranker: {err}"))?;
             Ok(Some(DynamicReranker::Api(p)))
         }

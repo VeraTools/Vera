@@ -13,13 +13,21 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::chunk_text::{file_name, normalize_path_tokens};
+use crate::config::{RerankerProtocol, RetrievalConfig};
 use crate::retrieval::ranking::file_role_label;
 use crate::types::SearchResult;
+
+/// The exact wire field name for reranker task instructions on supported
+/// protocols (vLLM `/rerank` and OpenRouter Qwen reranker). Pinned by
+/// pre-coding research against vLLM 2024+ docs (`/rerank` `instruction`
+/// parameter, see `docs.vllm.ai/models/pooling_models/scoring`
+/// Cohere Rerank API `instruction` field).
+pub const RERANKER_INSTRUCTION_FIELD: &str = "instruction";
 
 // ── Error types ──────────────────────────────────────────────────────
 
@@ -191,26 +199,26 @@ pub struct ApiReranker {
     config: RerankerConfig,
     pub(crate) max_rerank_batch: usize,
     max_document_chars: usize,
-    /// Whether the configured base URL points at Voyage AI.
-    ///
-    /// Voyage's `/rerank` accepts `top_k` instead of the `top_n` field
-    /// used by SiliconFlow, Jina, Cohere, and the rest of the OpenAI-style
-    /// rerank ecosystem. Detected once at construction; mirrors the
-    /// embedding-side detection in `embedding/provider.rs`.
-    is_voyage: bool,
+    protocol: RerankerProtocol,
+    endpoint_path: Option<String>,
+    task_instruction: Option<String>,
+    task_field: Option<String>,
+    return_documents: Option<bool>,
+    /// Legacy `is_voyage` view for backward compat tests; kept in sync with `protocol`.
+    #[allow(dead_code)]
+    pub(crate) is_voyage: bool,
 }
 
 impl ApiReranker {
     /// Create a new API-based reranker from configuration.
     ///
-    /// This preserves the original constructor contract by resolving the
-    /// batch size from `VERA_MAX_RERANK_BATCH` (defaulting to 20).
+    /// This preserves the original constructor contract by resolving
+    /// configuration from `VeraConfig::default()` (which itself reads the
+    /// legacy `VERA_MAX_RERANK_*` env overrides for its defaults). Explicit
+    /// `RetrievalConfig` values remain authoritative per `aae94f7`.
     pub fn new(config: RerankerConfig) -> Result<Self> {
-        let max_rerank_batch = std::env::var("VERA_MAX_RERANK_BATCH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20);
-        Self::new_with_max_rerank_batch(config, max_rerank_batch)
+        let retrieval = crate::config::VeraConfig::default().retrieval;
+        Self::from_configs(config, &retrieval)
     }
 
     /// Create a new API-based reranker with an explicit batch size.
@@ -218,33 +226,70 @@ impl ApiReranker {
     /// `max_rerank_batch` is the caller's resolved `retrieval.max_rerank_batch`.
     /// It is a parameter rather than an environment lookup so that the value
     /// in `~/.vera/config.json` is the one actually used; 0 disables batching.
+    /// Other retrieval fields are sourced from `VeraConfig::default()` for the
+    /// legacy static path, preserving env-honored defaults but keeping config
+    /// authoritative when an explicit retrieval config is used via
+    /// `from_configs`.
     pub fn new_with_max_rerank_batch(
         config: RerankerConfig,
         max_rerank_batch: usize,
     ) -> Result<Self> {
+        let mut retrieval = crate::config::VeraConfig::default().retrieval;
+        retrieval.max_rerank_batch = max_rerank_batch;
+        Self::from_configs(config, &retrieval)
+    }
+
+    /// Create an API reranker from both the low-level `RerankerConfig`
+    /// (credentials + base URL) and the persisted `RetrievalConfig`
+    /// (protocol, endpoint path, instruction, budgets, timeouts).
+    ///
+    /// This is the authoritative construction path for the dynamic
+    /// retrieval pipeline (`retrieval.max_rerank_batch` per `aae94f7` and
+    /// all other retrieval reranker keys config-authoritative, env only
+    /// via serde defaults).
+    pub fn from_configs(mut config: RerankerConfig, retrieval: &RetrievalConfig) -> Result<Self> {
         crate::init_tls();
-        let max_document_chars = std::env::var("VERA_MAX_RERANK_DOC_CHARS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4800);
+
+        // Retrieval config is the source of truth for these tunables;
+        // apply them to the low-level config so retries/timeouts honour
+        // persisted settings. Explicit retrieval values win over any
+        // env-derived defaults inside `RerankerConfig::from_env`.
+        config.timeout = Duration::from_secs(retrieval.reranker_timeout_secs);
+        config.max_retries = retrieval.reranker_max_retries;
+        config.rate_limit_wait_cap = retrieval
+            .reranker_rate_limit_wait_secs
+            .map(Duration::from_secs);
+
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .build()
             .context("failed to create HTTP client for reranker")?;
 
-        let is_voyage = is_voyage_base_url(&config.base_url);
+        let protocol = resolve_protocol(retrieval, &config.base_url);
+        let is_voyage = protocol == RerankerProtocol::Voyage;
 
         Ok(Self {
             client,
             config,
-            max_rerank_batch,
-            max_document_chars,
+            max_rerank_batch: retrieval.max_rerank_batch,
+            max_document_chars: retrieval.reranker_max_doc_chars,
+            protocol,
+            endpoint_path: retrieval.reranker_endpoint_path.clone(),
+            task_instruction: retrieval.reranker_task_instruction.clone(),
+            task_field: retrieval.reranker_task_field.clone(),
+            return_documents: retrieval.reranker_return_documents,
             is_voyage,
         })
     }
 
     /// Build the rerank endpoint URL.
     fn endpoint_url(&self) -> String {
+        if let Some(path) = &self.endpoint_path {
+            let base = self.config.base_url.trim_end_matches('/');
+            // Configured path is used verbatim (leading `/` required);
+            // no extra `/rerank` is appended.
+            return format!("{base}{path}");
+        }
         let base = self.config.base_url.trim_end_matches('/');
         format!("{base}/rerank")
     }
@@ -258,17 +303,18 @@ impl ApiReranker {
         cancel: &CancellationToken,
     ) -> Result<Vec<RerankScore>, RerankerError> {
         let url = self.endpoint_url();
-        let top = if self.is_voyage {
-            TopLimit::TopK { top_k: top_n }
-        } else {
-            TopLimit::TopN { top_n }
+        let top = match self.protocol {
+            RerankerProtocol::Voyage => TopLimit::TopK { top_k: top_n },
+            RerankerProtocol::Generic => TopLimit::TopN { top_n },
         };
+        let instruction = self.effective_instruction();
         let body = RerankRequest {
             model: &self.config.model_id,
             query,
             documents,
             top,
-            return_documents: Some(false),
+            return_documents: self.return_documents,
+            instruction,
         };
 
         let mut last_err = None;
@@ -298,8 +344,9 @@ impl ApiReranker {
             match request {
                 Ok(scores) => return Ok(scores),
                 Err(e) => {
-                    // Don't retry auth errors.
-                    if matches!(e, RerankerError::AuthError { .. }) {
+                    // Don't retry auth errors or permanent 4xx (400,401,403,404,422).
+                    // Only connection/timeout, 408, 429, and 5xx are transient.
+                    if matches!(e, RerankerError::AuthError { .. }) || !is_retryable_error(&e) {
                         return Err(e);
                     }
                     warn!(
@@ -400,13 +447,18 @@ impl ApiReranker {
                     message: format!("failed to parse reranker response: {e}"),
                 })?;
 
-        // Convert to RerankScore, sorted by relevance_score descending.
+        // Convert to RerankScore, skipping entries without a recognized score field
+        // (VAL-RERANK-016: missing score handled via shortfall path, not error).
+        // Echoed document field is tolerated and never replaces local documents.
         let mut scores: Vec<RerankScore> = resp
             .results
             .into_iter()
-            .map(|r| RerankScore {
-                index: r.index,
-                relevance_score: r.relevance_score,
+            .filter_map(|r| {
+                let score = r.relevance_score?;
+                Some(RerankScore {
+                    index: r.index,
+                    relevance_score: score,
+                })
             })
             .collect();
 
@@ -688,24 +740,57 @@ fn truncate_document(doc: &str, max_chars: usize) -> String {
 
 // ── API request/response types ───────────────────────────────────────
 
-#[derive(Serialize)]
 struct RerankRequest<'a> {
     model: &'a str,
     query: &'a str,
     documents: &'a [String],
-    #[serde(flatten)]
     top: TopLimit,
-    #[serde(skip_serializing_if = "Option::is_none")]
     return_documents: Option<bool>,
+    instruction: Option<Instruction<'a>>,
+}
+
+struct Instruction<'a> {
+    field: &'a str,
+    value: &'a str,
+}
+
+impl<'a> serde::Serialize for RerankRequest<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut len = 4; // model, query, documents, top
+        if self.return_documents.is_some() {
+            len += 1;
+        }
+        if self.instruction.is_some() {
+            len += 1;
+        }
+        let mut map = serializer.serialize_map(Some(len))?;
+        map.serialize_entry("model", self.model)?;
+        map.serialize_entry("query", self.query)?;
+        map.serialize_entry("documents", self.documents)?;
+        match &self.top {
+            TopLimit::TopN { top_n } => map.serialize_entry("top_n", top_n)?,
+            TopLimit::TopK { top_k } => map.serialize_entry("top_k", top_k)?,
+        }
+        if let Some(v) = &self.return_documents {
+            map.serialize_entry("return_documents", v)?;
+        }
+        if let Some(instr) = &self.instruction {
+            map.serialize_entry(instr.field, instr.value)?;
+        }
+        map.end()
+    }
 }
 
 /// Per-provider field name for the top-results limit.
 ///
 /// Voyage AI's `/rerank` requires `top_k`. SiliconFlow / Jina / Cohere
 /// and other OpenAI-style rerank endpoints use `top_n`. The wire format is
-/// otherwise identical, so this is flattened into the request body.
-#[derive(Serialize)]
-#[serde(untagged)]
+/// otherwise identical.
+#[derive(Debug)]
 enum TopLimit {
     TopN { top_n: usize },
     TopK { top_k: usize },
@@ -716,6 +801,7 @@ struct RerankResponse {
     /// Voyage wraps results in `data` instead of `results`. Tolerate both.
     #[serde(alias = "data")]
     results: Vec<RerankResult>,
+    // Tolerate provider extras like id/model/usage and echoed documents.
 }
 
 /// Returns `true` if the configured base URL points at Voyage AI.
@@ -727,11 +813,62 @@ fn is_voyage_base_url(base_url: &str) -> bool {
     base_url.contains("api.voyageai.com")
 }
 
+fn resolve_protocol(retrieval: &RetrievalConfig, base_url: &str) -> RerankerProtocol {
+    if let Some(p) = retrieval.reranker_protocol {
+        p
+    } else if is_voyage_base_url(base_url) {
+        RerankerProtocol::Voyage
+    } else {
+        RerankerProtocol::Generic
+    }
+}
+
+impl ApiReranker {
+    fn effective_instruction(&self) -> Option<Instruction<'_>> {
+        let value = self.task_instruction.as_deref()?;
+        if value.trim().is_empty() {
+            return None;
+        }
+        if let Some(field) = self.task_field.as_deref() {
+            if field.trim().is_empty() {
+                return None;
+            }
+            return Some(Instruction { field, value });
+        }
+        // No explicit field: use protocol default if supported, otherwise omit.
+        let field = match self.protocol {
+            RerankerProtocol::Generic => RERANKER_INSTRUCTION_FIELD,
+            RerankerProtocol::Voyage => return None,
+        };
+        Some(Instruction { field, value })
+    }
+}
+
+/// Whether an error should be retried (transient) vs failed fast (permanent 4xx).
+fn is_retryable_error(err: &RerankerError) -> bool {
+    match err {
+        RerankerError::ConnectionError { .. } => true,
+        RerankerError::RateLimitError { .. } => true,
+        RerankerError::ApiError { status, .. } => {
+            // Retry 408 and 5xx; do not retry other 4xx (400,401,403,404,422 etc).
+            *status == 408 || (500..=599).contains(status)
+        }
+        RerankerError::AuthError { .. } => false,
+        RerankerError::ResponseError { .. } => false,
+        RerankerError::Cancelled => false,
+    }
+}
+
 #[derive(Deserialize)]
 struct RerankResult {
     index: usize,
-    #[serde(alias = "score")]
-    relevance_score: f64,
+    #[serde(default, alias = "score")]
+    relevance_score: Option<f64>,
+    // Echoed document field tolerated (string or object, per provider)
+    #[serde(default)]
+    #[allow(dead_code)]
+    document: Option<serde_json::Value>,
+    // Tolerate extra provider fields like id, etc.
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────
