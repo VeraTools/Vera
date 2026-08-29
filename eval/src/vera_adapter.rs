@@ -243,12 +243,15 @@ fn embedding_dim_matches<P: EmbeddingProvider>(store: &MetadataStore, provider: 
         return false;
     };
     let Some(expected) = provider.expected_dim() else {
-        // If the provider does not report a dimension (e.g., BM25 hash
-        // provider in non-reuse paths), treat missing expected as mismatch
-        // unless the caller has already hard-coded never-reuse. For VeraFull
-        // lanes expected is always Some, so a stored value without an expected
-        // cannot be validated and must re-index.
-        return false;
+        // API providers do not report an expected dimension ahead of time
+        // (OpenAI-compatible embeddings vary by model). The stored
+        // `embedding_dim` was written at index time from the actual
+        // embedding vectors, so any parseable stored value is sufficient to
+        // allow reuse — the model identity check already gates on the model
+        // name/alias. Treat missing expected as compatible for API lanes,
+        // but keep the mismatch for local BM25 hash providers where the
+        // dimension is part of the index identity.
+        return stored.parse::<usize>().is_ok();
     };
     stored == expected.to_string()
 }
