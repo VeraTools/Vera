@@ -92,10 +92,19 @@ fn clamp_done_count(last_done: &mut usize, count: usize) -> usize {
 /// clamped) `effective_done` and an optional fixed total.
 fn display_for_effective_done(parsing_done: Option<usize>, effective_done: usize) -> EmbedDisplay {
     if let Some(total) = parsing_done {
-        EmbedDisplay::Determinate {
-            done: effective_done,
-            total,
+        // Clamp done to total so a stale `total < last_done` edge never
+        // renders as >100% (e.g. indeterminate 3500 done then ParsingDone
+        // total 3000). Percentage display is thus bounded at 100%.
+        let done = effective_done.min(total);
+        if done != effective_done {
+            tracing::warn!(
+                effective_done,
+                total,
+                done,
+                "embedding progress done exceeds fixed total; clamping to total"
+            );
         }
+        EmbedDisplay::Determinate { done, total }
     } else {
         EmbedDisplay::Indeterminate {
             done: effective_done,
@@ -577,6 +586,59 @@ mod tests {
         });
         assert_eq!(honest.last_display(), Some(&ind(10)));
         assert_eq!(update.last_display(), Some(&ind(10)));
+    }
+
+    #[test]
+    fn determinate_done_clamped_to_total() {
+        // Edge where total < last_done (e.g. indeterminate 3500 done then
+        // ParsingDone total 3000) must not render >100%. The determinate
+        // display should clamp done to total so the percentage never exceeds
+        // 100% and the message shows the bounded pair.
+        let mut tracker = HonestProgressTracker::new();
+        // Simulate reaching 3500 while indeterminate
+        let got_ind = tracker
+            .handle(&IndexProgress::EmbeddingProgress {
+                done: 3500,
+                total: 3500,
+            })
+            .unwrap();
+        assert_eq!(got_ind, ind(3500));
+
+        // Parsing completes with a smaller fixed total.
+        tracker.handle(&IndexProgress::ParsingDone { chunk_count: 3000 });
+
+        // Next embedding progress should be clamped to 3000/3000, not 3500/3000.
+        let got_det = tracker
+            .handle(&IndexProgress::EmbeddingProgress {
+                done: 3500,
+                total: 3000,
+            })
+            .unwrap();
+        assert_eq!(
+            got_det,
+            det(3000, 3000),
+            "done must be clamped to total to avoid >100%"
+        );
+        assert_eq!(got_det.message(), "Generating embeddings (3000/3000)");
+        assert_eq!(tracker.last_display(), Some(&det(3000, 3000)));
+
+        // Same edge on the update tracker.
+        let mut upd = UpdateProgressTracker::new();
+        upd.handle(&UpdateProgress::EmbeddingProgress {
+            done: 3500,
+            total: 3500,
+        });
+        upd.handle(&UpdateProgress::ParsingDone {
+            file_count: 10,
+            chunk_count: 3000,
+        });
+        let upd_det = upd
+            .handle(&UpdateProgress::EmbeddingProgress {
+                done: 3500,
+                total: 3000,
+            })
+            .unwrap();
+        assert_eq!(upd_det, det(3000, 3000));
     }
 
     #[test]

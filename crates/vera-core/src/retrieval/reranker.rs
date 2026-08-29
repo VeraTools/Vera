@@ -733,20 +733,31 @@ fn truncate_document(doc: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return doc.to_string();
     }
-    let char_count = doc.chars().count();
-    if char_count <= max_chars {
-        return doc.to_string();
+    // Single-pass traversal: capture the byte offset of the truncation
+    // boundary and remember the last newline within the budget so we
+    // avoid a second scan and an extra `chars().count()`.
+    let mut last_nl: Option<usize> = None;
+    let mut byte_end: Option<usize> = None;
+    for (char_idx, (byte_idx, ch)) in doc.char_indices().enumerate() {
+        if char_idx >= max_chars {
+            byte_end = Some(byte_idx);
+            break;
+        }
+        if ch == '\n' {
+            last_nl = Some(byte_idx);
+        }
     }
-    // Byte offset of the char at position max_chars (first max_chars chars).
-    let byte_end = doc
-        .char_indices()
-        .nth(max_chars)
-        .map(|(i, _)| i)
-        .unwrap_or(doc.len());
-    let slice = &doc[..byte_end];
-    match slice.rfind('\n') {
-        Some(pos) => slice[..pos].to_string(),
-        None => slice.to_string(),
+    let Some(end) = byte_end else {
+        // `char_count == actual char length <= max_chars` — no truncation.
+        return doc.to_string();
+    };
+    // `end` is the byte offset of the first char beyond the budget.
+    debug_assert!(doc.is_char_boundary(end));
+    if let Some(pos) = last_nl {
+        // `last_nl` was recorded within the budget, so `pos < end`.
+        doc[..pos].to_string()
+    } else {
+        doc[..end].to_string()
     }
 }
 
