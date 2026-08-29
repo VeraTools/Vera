@@ -178,7 +178,7 @@ async fn full_index_embeds_bounded_windows_and_preserves_order() {
         index_fingerprint(&index_dir(single_window_dir.path()))
     );
 
-    let events = events.lock().unwrap();
+    let events = events.lock().unwrap().clone();
     assert_eq!(
         events
             .iter()
@@ -195,18 +195,96 @@ async fn full_index_embeds_bounded_windows_and_preserves_order() {
         .unwrap();
     assert_eq!(parsing_done, windowed_summary.chunks_created);
 
-    let mut previous_done = 0;
-    let mut previous_total = 0;
-    for event in events.iter() {
-        if let IndexProgress::EmbeddingProgress { done, total } = event {
-            assert!(*done >= previous_done);
-            assert!(*total >= previous_total);
-            previous_done = *done;
-            previous_total = *total;
+    // Honest-denominator contract (strengthened from the legacy lenient
+    // `previous_total >=` assertion): growing per-window totals must never be
+    // presented as a fixed denominator. The renderer interprets events via
+    // `HonestProgressTracker`: before `ParsingDone` the embed indicator is
+    // indeterminate (no percentage/total), after it switches to a fixed total.
+    use crate::indexing::progress::{EmbedDisplay, HonestProgressTracker};
+
+    let mut tracker = HonestProgressTracker::new();
+    let mut parsing_done_index: Option<usize> = None;
+    let mut fixed_total: Option<usize> = None;
+    let mut seen_indeterminate = false;
+    let mut seen_determinate = false;
+    let mut last_done = 0usize;
+    let mut last_fixed: Option<usize> = None;
+
+    for (idx, event) in events.iter().enumerate() {
+        if let IndexProgress::ParsingDone { chunk_count } = event {
+            parsing_done_index = Some(idx);
+            fixed_total = Some(*chunk_count);
+        }
+        if let Some(display) = tracker.handle(event) {
+            match display {
+                EmbedDisplay::Indeterminate { done } => {
+                    assert!(
+                        parsing_done_index.is_none(),
+                        "indeterminate display must occur before ParsingDone (event {idx})"
+                    );
+                    assert!(
+                        done >= last_done,
+                        "done must be monotonic: {done} < {last_done}"
+                    );
+                    assert!(
+                        !display.shows_percentage(),
+                        "indeterminate must not show percentage"
+                    );
+                    seen_indeterminate = true;
+                    last_done = done;
+                }
+                EmbedDisplay::Determinate { done, total } => {
+                    assert!(
+                        parsing_done_index.is_some(),
+                        "determinate display only after ParsingDone (event {idx})"
+                    );
+                    assert_eq!(
+                        total,
+                        fixed_total.unwrap(),
+                        "fixed total must equal ParsingDone chunk_count and never be restated"
+                    );
+                    if let Some(prev) = last_fixed {
+                        assert_eq!(
+                            prev, total,
+                            "fixed total must never be restated at a different value"
+                        );
+                    }
+                    last_fixed = Some(total);
+                    assert!(
+                        done >= last_done,
+                        "done must be monotonic after ParsingDone"
+                    );
+                    assert!(
+                        display.shows_percentage(),
+                        "determinate must show percentage"
+                    );
+                    assert!(
+                        display.message().contains(&format!("{done}/{total}")),
+                        "determinate message must contain done/total"
+                    );
+                    seen_determinate = true;
+                    last_done = done;
+                }
+                EmbedDisplay::Done { count } => {
+                    assert_eq!(count, windowed_summary.chunks_created);
+                    assert_eq!(count, windowed_summary.embeddings_generated);
+                }
+            }
         }
     }
-    assert_eq!(previous_done, windowed_summary.embeddings_generated);
-    assert_eq!(previous_total, windowed_summary.chunks_created);
+
+    // Structural overlap: at least one embedding must start while parsing is
+    // still in progress (windowed pipeline parses one window ahead).
+    assert!(
+        seen_indeterminate,
+        "windowed pipeline must overlap parse/embed/store: at least one EmbeddingProgress while parsing still in progress"
+    );
+    assert!(
+        seen_determinate,
+        "must switch to fixed total after ParsingDone"
+    );
+    assert_eq!(fixed_total.unwrap(), windowed_summary.chunks_created);
+    assert_eq!(last_done, windowed_summary.embeddings_generated);
 }
 
 #[tokio::test]
