@@ -102,6 +102,41 @@ impl Default for IndexingConfig {
     }
 }
 
+/// Reranker wire protocol / capability selection.
+///
+/// `Generic` covers SiliconFlow, Jina, Cohere and other OpenAI-style
+/// `/rerank` endpoints (`top_n` + `results`). `Voyage` covers Voyage AI
+/// (`top_k` + `data`). Explicit selection overrides hostname auto-detection;
+/// `None` (the default) preserves auto-detection for backward compatibility:
+/// a Voyage hostname maps to `Voyage`, everything else to `Generic`.
+/// Custom proxies can select either protocol without hostname spoofing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RerankerProtocol {
+    Generic,
+    Voyage,
+}
+
+impl FromStr for RerankerProtocol {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "generic" => Ok(Self::Generic),
+            "voyage" => Ok(Self::Voyage),
+            other => Err(format!("unknown reranker protocol: {other}")),
+        }
+    }
+}
+
+impl fmt::Display for RerankerProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Generic => write!(f, "generic"),
+            Self::Voyage => write!(f, "voyage"),
+        }
+    }
+}
+
 /// Configuration for the retrieval pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalConfig {
@@ -122,6 +157,51 @@ pub struct RetrievalConfig {
     /// 0 means unlimited.
     #[serde(default = "default_max_output_chars")]
     pub max_output_chars: usize,
+    /// Explicit reranker wire protocol. `None` preserves hostname
+    /// auto-detection (Voyage hostname → Voyage, else Generic).
+    #[serde(default)]
+    pub reranker_protocol: Option<RerankerProtocol>,
+    /// Explicit reranker endpoint path override. `None` keeps the default
+    /// `{base}/rerank`. When `Some`, the value is used verbatim (leading
+    /// `/` required; no extra `/rerank` appended).
+    #[serde(default)]
+    pub reranker_endpoint_path: Option<String>,
+    /// Optional reranker task instruction (scoring guidance, separate from
+    /// Vera `--intent`). Sent only when the selected protocol supports it
+    /// or an explicit wire field is configured.
+    #[serde(default)]
+    pub reranker_task_instruction: Option<String>,
+    /// Explicit wire field name for the task instruction. When `Some`, the
+    /// instruction is serialized under this field regardless of protocol
+    /// capability; when `None`, the protocol's default field is used if
+    /// supported, otherwise the instruction is omitted.
+    #[serde(default)]
+    pub reranker_task_field: Option<String>,
+    /// Per-document character budget for reranker input. 4800 default,
+    /// newline-safe truncation; 0 means unlimited (no truncation).
+    #[serde(default = "default_reranker_max_doc_chars")]
+    pub reranker_max_doc_chars: usize,
+    /// Reranker request timeout in seconds. 30s default.
+    #[serde(default = "default_reranker_timeout_secs")]
+    pub reranker_timeout_secs: u64,
+    /// Reranker max retries on transient errors. 2 default.
+    #[serde(default = "default_reranker_max_retries")]
+    pub reranker_max_retries: u32,
+    /// Cap on 429 rate-limit wait in seconds. `None` (default) keeps the
+    /// short generic backoff; `Some(n)` sleeps until the quota window reset
+    /// clamped to `n` seconds. `0` is treated as `None` (CLI `0` maps to
+    /// `null`, file `0` likewise means no cap) so the three layers share one
+    /// contract.
+    #[serde(
+        default = "default_reranker_rate_limit_wait_secs",
+        deserialize_with = "deserialize_reranker_rate_limit_wait_secs"
+    )]
+    pub reranker_rate_limit_wait_secs: Option<u64>,
+    /// How `return_documents` is sent. `None` omits the field (per-protocol
+    /// default is `Some(false)` for current providers). `Some(v)` sends that
+    /// boolean verbatim.
+    #[serde(default = "default_reranker_return_documents")]
+    pub reranker_return_documents: Option<bool>,
 }
 
 fn default_max_output_chars() -> usize {
@@ -130,6 +210,67 @@ fn default_max_output_chars() -> usize {
 
 fn default_max_rerank_batch() -> usize {
     env_usize("VERA_MAX_RERANK_BATCH", 20)
+}
+
+fn default_reranker_max_doc_chars() -> usize {
+    env_usize("VERA_MAX_RERANK_DOC_CHARS", 4800)
+}
+
+fn default_reranker_timeout_secs() -> u64 {
+    env_usize("VERA_RERANK_TIMEOUT_SECS", 30) as u64
+}
+
+fn default_reranker_max_retries() -> u32 {
+    env_usize("VERA_RERANK_MAX_RETRIES", 2) as u32
+}
+
+fn default_reranker_rate_limit_wait_secs() -> Option<u64> {
+    match std::env::var("VERA_RERANK_RATE_LIMIT_WAIT_SECS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(parsed) => {
+                if parsed == 0 {
+                    None
+                } else {
+                    Some(parsed)
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    key = "VERA_RERANK_RATE_LIMIT_WAIT_SECS",
+                    value = %value,
+                    error = %error,
+                    "invalid numeric environment override; using default"
+                );
+                None
+            }
+        },
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            tracing::warn!(
+                key = "VERA_RERANK_RATE_LIMIT_WAIT_SECS",
+                error = %error,
+                "could not read numeric environment override; using default"
+            );
+            None
+        }
+    }
+}
+
+fn deserialize_reranker_rate_limit_wait_secs<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<u64>::deserialize(deserializer)?;
+    Ok(opt.filter(|v| *v != 0))
+}
+
+fn default_reranker_return_documents() -> Option<bool> {
+    // No env override for this; keep `Some(false)` as the compatible default
+    // so generic endpoints see today's wire shape. Users can set `None`
+    // (via `null` in JSON or config set) to omit the field per capability.
+    Some(false)
 }
 
 impl Default for RetrievalConfig {
@@ -141,6 +282,15 @@ impl Default for RetrievalConfig {
             reranking_enabled: false,
             max_rerank_batch: default_max_rerank_batch(),
             max_output_chars: default_max_output_chars(),
+            reranker_protocol: None,
+            reranker_endpoint_path: None,
+            reranker_task_instruction: None,
+            reranker_task_field: None,
+            reranker_max_doc_chars: default_reranker_max_doc_chars(),
+            reranker_timeout_secs: default_reranker_timeout_secs(),
+            reranker_max_retries: default_reranker_max_retries(),
+            reranker_rate_limit_wait_secs: default_reranker_rate_limit_wait_secs(),
+            reranker_return_documents: default_reranker_return_documents(),
         }
     }
 }
@@ -1090,5 +1240,243 @@ card0, 1073741824, 4294967296\n";
             2,
             "whitespace-tolerant groups parse"
         );
+    }
+
+    #[test]
+    fn reranker_protocol_parses_case_insensitively() {
+        assert_eq!(
+            "generic".parse::<RerankerProtocol>().unwrap(),
+            RerankerProtocol::Generic
+        );
+        assert_eq!(
+            "VOYAGE".parse::<RerankerProtocol>().unwrap(),
+            RerankerProtocol::Voyage
+        );
+        assert!("unknown".parse::<RerankerProtocol>().is_err());
+        assert_eq!(RerankerProtocol::Generic.to_string(), "generic");
+        assert_eq!(RerankerProtocol::Voyage.to_string(), "voyage");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn retrieval_config_serialization_round_trips_all_reranker_keys() {
+        let mut cfg = RetrievalConfig::default();
+        cfg.reranker_protocol = Some(RerankerProtocol::Voyage);
+        cfg.reranker_endpoint_path = Some("/v1/reranking".to_string());
+        cfg.reranker_task_instruction = Some("rank by relevance".to_string());
+        cfg.reranker_task_field = Some("instruction".to_string());
+        cfg.reranker_max_doc_chars = 1234;
+        cfg.reranker_timeout_secs = 42;
+        cfg.reranker_max_retries = 5;
+        cfg.reranker_rate_limit_wait_secs = Some(15);
+        cfg.reranker_return_documents = Some(true);
+        cfg.max_rerank_batch = 8;
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: RetrievalConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reranker_protocol, cfg.reranker_protocol);
+        assert_eq!(back.reranker_endpoint_path, cfg.reranker_endpoint_path);
+        assert_eq!(
+            back.reranker_task_instruction,
+            cfg.reranker_task_instruction
+        );
+        assert_eq!(back.reranker_task_field, cfg.reranker_task_field);
+        assert_eq!(back.reranker_max_doc_chars, cfg.reranker_max_doc_chars);
+        assert_eq!(back.reranker_timeout_secs, cfg.reranker_timeout_secs);
+        assert_eq!(back.reranker_max_retries, cfg.reranker_max_retries);
+        assert_eq!(
+            back.reranker_rate_limit_wait_secs,
+            cfg.reranker_rate_limit_wait_secs
+        );
+        assert_eq!(
+            back.reranker_return_documents,
+            cfg.reranker_return_documents
+        );
+        assert_eq!(back.max_rerank_batch, cfg.max_rerank_batch);
+    }
+
+    #[test]
+    fn legacy_retrieval_config_deserializes_with_today_defaults() {
+        // Minimal JSON from before the refactor (no new reranker keys)
+        let legacy = r#"{
+            "default_limit": 5,
+            "rrf_k": 60.0,
+            "rerank_candidates": 50,
+            "reranking_enabled": false,
+            "max_rerank_batch": 20,
+            "max_output_chars": 0
+        }"#;
+        let cfg: RetrievalConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.max_rerank_batch, 20);
+        assert_eq!(cfg.reranker_max_doc_chars, 4800);
+        assert_eq!(cfg.reranker_timeout_secs, 30);
+        assert_eq!(cfg.reranker_max_retries, 2);
+        assert_eq!(cfg.reranker_rate_limit_wait_secs, None);
+        assert_eq!(cfg.reranker_protocol, None);
+        assert_eq!(cfg.reranker_task_instruction, None);
+        assert_eq!(cfg.reranker_task_field, None);
+        assert_eq!(cfg.reranker_endpoint_path, None);
+        assert_eq!(cfg.reranker_return_documents, Some(false));
+
+        // VeraConfig wrapper also tolerates missing `core_config.reranker_*`
+        let vera_legacy = r#"{"indexing":{"max_chunk_lines":200,"default_excludes":[],"max_file_size_bytes":1000000,"max_chunk_bytes":24576},"retrieval":{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0},"embedding":{"batch_size":128,"max_concurrent_requests":8,"timeout_secs":60,"max_retries":3,"max_stored_dim":1024}}"#;
+        let vera: VeraConfig = serde_json::from_str(vera_legacy).unwrap();
+        assert_eq!(vera.retrieval.reranker_max_doc_chars, 4800);
+        assert_eq!(vera.retrieval.reranker_protocol, None);
+    }
+
+    #[test]
+    fn reranker_doc_budget_env_precedence_matrix() {
+        // env-only, env+config (config wins), unset — for VERA_MAX_RERANK_DOC_CHARS
+        run_env_test(
+            "config::tests::reranker_doc_budget_env_precedence_matrix_probe",
+            &[
+                ("VERA_MAX_RERANK_DOC_CHARS", Some("9999")),
+                ("VERA_MAX_RERANK_BATCH", None),
+                ("VERA_RERANK_RATE_LIMIT_WAIT_SECS", None),
+                ("VERA_RERANK_TIMEOUT_SECS", None),
+                ("VERA_RERANK_MAX_RETRIES", None),
+            ],
+        );
+        run_env_test(
+            "config::tests::reranker_doc_budget_config_wins_over_env_probe",
+            &[("VERA_MAX_RERANK_DOC_CHARS", Some("9999"))],
+        );
+        run_env_test(
+            "config::tests::reranker_doc_budget_unset_defaults_probe",
+            &[("VERA_MAX_RERANK_DOC_CHARS", None)],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_doc_budget_env_precedence_matrix"]
+    fn reranker_doc_budget_env_precedence_matrix_probe() {
+        // env-only: no config key, env present => env value observed
+        assert_eq!(default_reranker_max_doc_chars(), 9999);
+        let cfg = RetrievalConfig::default();
+        assert_eq!(cfg.reranker_max_doc_chars, 9999);
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_doc_budget_env_precedence_matrix"]
+    fn reranker_doc_budget_config_wins_over_env_probe() {
+        // env + explicit config JSON: file value must win (config authoritative)
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"reranker_max_doc_chars":1200}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.reranker_max_doc_chars, 1200,
+            "config file must win over env 9999"
+        );
+        // Also verify RetrievalConfig::default still sees env (covered by other probe)
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_doc_budget_env_precedence_matrix"]
+    fn reranker_doc_budget_unset_defaults_probe() {
+        assert!(std::env::var("VERA_MAX_RERANK_DOC_CHARS").is_err());
+        assert_eq!(default_reranker_max_doc_chars(), 4800);
+        assert_eq!(RetrievalConfig::default().reranker_max_doc_chars, 4800);
+    }
+
+    #[test]
+    fn reranker_rate_limit_env_precedence_matrix() {
+        run_env_test(
+            "config::tests::reranker_rate_limit_env_precedence_probe",
+            &[("VERA_RERANK_RATE_LIMIT_WAIT_SECS", Some("42"))],
+        );
+        run_env_test(
+            "config::tests::reranker_rate_limit_config_wins_probe",
+            &[("VERA_RERANK_RATE_LIMIT_WAIT_SECS", Some("99"))],
+        );
+        run_env_test(
+            "config::tests::reranker_rate_limit_unset_probe",
+            &[("VERA_RERANK_RATE_LIMIT_WAIT_SECS", None)],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_rate_limit_env_precedence_matrix"]
+    fn reranker_rate_limit_env_precedence_probe() {
+        assert_eq!(default_reranker_rate_limit_wait_secs(), Some(42));
+        assert_eq!(
+            RetrievalConfig::default().reranker_rate_limit_wait_secs,
+            Some(42)
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_rate_limit_env_precedence_matrix"]
+    fn reranker_rate_limit_config_wins_probe() {
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"reranker_rate_limit_wait_secs":10}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.reranker_rate_limit_wait_secs, Some(10));
+        // 0 in config becomes None (explicit unlimited/short), env ignored
+        let json_zero = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"reranker_rate_limit_wait_secs":null}"#;
+        let cfg2: RetrievalConfig = serde_json::from_str(json_zero).unwrap();
+        assert_eq!(cfg2.reranker_rate_limit_wait_secs, None);
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_rate_limit_env_precedence_matrix"]
+    fn reranker_rate_limit_unset_probe() {
+        assert!(std::env::var("VERA_RERANK_RATE_LIMIT_WAIT_SECS").is_err());
+        assert_eq!(default_reranker_rate_limit_wait_secs(), None);
+        assert_eq!(
+            RetrievalConfig::default().reranker_rate_limit_wait_secs,
+            None
+        );
+    }
+
+    #[test]
+    fn reranker_batch_env_precedence_matrix() {
+        // Batch is the pinned case: config authoritative on BOTH dynamic and static paths (aae94f7)
+        run_env_test(
+            "config::tests::reranker_batch_env_only_probe",
+            &[("VERA_MAX_RERANK_BATCH", Some("7"))],
+        );
+        run_env_test(
+            "config::tests::reranker_batch_config_authoritative_probe",
+            &[("VERA_MAX_RERANK_BATCH", Some("99"))],
+        );
+        run_env_test(
+            "config::tests::reranker_batch_unset_probe",
+            &[("VERA_MAX_RERANK_BATCH", None)],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_batch_env_precedence_matrix"]
+    fn reranker_batch_env_only_probe() {
+        assert_eq!(default_max_rerank_batch(), 7);
+        assert_eq!(RetrievalConfig::default().max_rerank_batch, 7);
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_batch_env_precedence_matrix"]
+    fn reranker_batch_config_authoritative_probe() {
+        // Even with env=99, explicit JSON 8 must win (config authoritative)
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":8,"max_output_chars":0}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_rerank_batch, 8);
+        // Dynamic path: ApiReranker::from_configs must use retrieval's 8, not env 99
+        let rcfg = crate::retrieval::reranker::RerankerConfig::new(
+            "http://example.com".to_string(),
+            "m".to_string(),
+            "k".to_string(),
+        );
+        let r = crate::retrieval::reranker::ApiReranker::from_configs(rcfg, &cfg).unwrap();
+        assert_eq!(
+            r.max_rerank_batch, 8,
+            "dynamic path: config 8 must win over env 99"
+        );
+        // Static legacy path still honors env when no explicit retrieval value is passed
+        // (covered by env_only probe); from_configs is the authoritative path.
+    }
+
+    #[test]
+    #[ignore = "driven by reranker_batch_env_precedence_matrix"]
+    fn reranker_batch_unset_probe() {
+        assert!(std::env::var("VERA_MAX_RERANK_BATCH").is_err());
+        assert_eq!(default_max_rerank_batch(), 20);
+        assert_eq!(RetrievalConfig::default().max_rerank_batch, 20);
     }
 }

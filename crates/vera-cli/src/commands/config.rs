@@ -127,6 +127,42 @@ fn print_human_config(config: &vera_core::config::VeraConfig) {
         "    max_rerank_batch          {}",
         config.retrieval.max_rerank_batch
     );
+    println!(
+        "    reranker_protocol         {:?}",
+        config.retrieval.reranker_protocol
+    );
+    println!(
+        "    reranker_endpoint_path    {:?}",
+        config.retrieval.reranker_endpoint_path
+    );
+    println!(
+        "    reranker_task_instruction {:?}",
+        config.retrieval.reranker_task_instruction
+    );
+    println!(
+        "    reranker_task_field       {:?}",
+        config.retrieval.reranker_task_field
+    );
+    println!(
+        "    reranker_max_doc_chars    {}",
+        config.retrieval.reranker_max_doc_chars
+    );
+    println!(
+        "    reranker_timeout_secs     {}",
+        config.retrieval.reranker_timeout_secs
+    );
+    println!(
+        "    reranker_max_retries      {}",
+        config.retrieval.reranker_max_retries
+    );
+    println!(
+        "    reranker_rate_limit_wait_secs {:?}",
+        config.retrieval.reranker_rate_limit_wait_secs
+    );
+    println!(
+        "    reranker_return_documents {:?}",
+        config.retrieval.reranker_return_documents
+    );
     println!();
     println!("  Embedding:");
     println!(
@@ -208,6 +244,47 @@ pub fn get_config_value(
         "retrieval.max_rerank_batch" => Some(serde_json::Value::Number(
             config.retrieval.max_rerank_batch.into(),
         )),
+        "retrieval.reranker_protocol" | "retrieval.rerank_protocol" => {
+            serde_json::to_value(config.retrieval.reranker_protocol).ok()
+        }
+        "retrieval.reranker_endpoint_path"
+        | "retrieval.rerank_endpoint_path"
+        | "retrieval.endpoint_path" => {
+            serde_json::to_value(&config.retrieval.reranker_endpoint_path).ok()
+        }
+        "retrieval.reranker_task_instruction"
+        | "retrieval.rerank_task_instruction"
+        | "retrieval.task_instruction" => {
+            serde_json::to_value(&config.retrieval.reranker_task_instruction).ok()
+        }
+        "retrieval.reranker_task_field"
+        | "retrieval.rerank_task_field"
+        | "retrieval.task_field" => {
+            serde_json::to_value(&config.retrieval.reranker_task_field).ok()
+        }
+        "retrieval.reranker_max_doc_chars"
+        | "retrieval.rerank_max_doc_chars"
+        | "retrieval.max_rerank_doc_chars" => Some(serde_json::Value::Number(
+            config.retrieval.reranker_max_doc_chars.into(),
+        )),
+        "retrieval.reranker_timeout_secs"
+        | "retrieval.rerank_timeout_secs"
+        | "retrieval.timeout_secs" => Some(serde_json::Value::Number(
+            config.retrieval.reranker_timeout_secs.into(),
+        )),
+        "retrieval.reranker_max_retries" | "retrieval.rerank_max_retries" => Some(
+            serde_json::Value::Number(config.retrieval.reranker_max_retries.into()),
+        ),
+        "retrieval.reranker_rate_limit_wait_secs"
+        | "retrieval.rerank_rate_limit_wait_secs"
+        | "retrieval.rate_limit_wait_secs" => {
+            serde_json::to_value(config.retrieval.reranker_rate_limit_wait_secs).ok()
+        }
+        "retrieval.reranker_return_documents"
+        | "retrieval.rerank_return_documents"
+        | "retrieval.return_documents" => {
+            serde_json::to_value(config.retrieval.reranker_return_documents).ok()
+        }
         "embedding.batch_size" => Some(serde_json::Value::Number(
             config.embedding.batch_size.into(),
         )),
@@ -279,6 +356,67 @@ fn set_config_value(
         }
         "retrieval.max_rerank_batch" => {
             config.retrieval.max_rerank_batch = parse_value(key, value)?;
+        }
+        "retrieval.reranker_protocol" | "retrieval.rerank_protocol" => {
+            config.retrieval.reranker_protocol = parse_optional_protocol(key, value)?;
+        }
+        "retrieval.reranker_endpoint_path"
+        | "retrieval.rerank_endpoint_path"
+        | "retrieval.endpoint_path" => {
+            config.retrieval.reranker_endpoint_path = parse_optional_string(key, value)?;
+            if let Some(path) = &config.retrieval.reranker_endpoint_path
+                && !path.starts_with('/')
+            {
+                bail!("{key} must start with '/' when set");
+            }
+        }
+        "retrieval.reranker_task_instruction"
+        | "retrieval.rerank_task_instruction"
+        | "retrieval.task_instruction" => {
+            config.retrieval.reranker_task_instruction = parse_optional_string(key, value)?;
+        }
+        "retrieval.reranker_task_field"
+        | "retrieval.rerank_task_field"
+        | "retrieval.task_field" => {
+            config.retrieval.reranker_task_field = parse_optional_string(key, value)?;
+            if let Some(field) = &config.retrieval.reranker_task_field {
+                const RESERVED: &[&str] = &[
+                    "model",
+                    "query",
+                    "documents",
+                    "top_n",
+                    "top_k",
+                    "return_documents",
+                ];
+                if RESERVED.contains(&field.as_str()) {
+                    bail!(
+                        "{key} must not be a reserved reranker field (model/query/documents/top_n/top_k/return_documents)"
+                    );
+                }
+            }
+        }
+        "retrieval.reranker_max_doc_chars"
+        | "retrieval.rerank_max_doc_chars"
+        | "retrieval.max_rerank_doc_chars" => {
+            config.retrieval.reranker_max_doc_chars = parse_value(key, value)?;
+        }
+        "retrieval.reranker_timeout_secs"
+        | "retrieval.rerank_timeout_secs"
+        | "retrieval.timeout_secs" => {
+            config.retrieval.reranker_timeout_secs = parse_positive(key, value)?;
+        }
+        "retrieval.reranker_max_retries" | "retrieval.rerank_max_retries" => {
+            config.retrieval.reranker_max_retries = parse_value(key, value)?;
+        }
+        "retrieval.reranker_rate_limit_wait_secs"
+        | "retrieval.rerank_rate_limit_wait_secs"
+        | "retrieval.rate_limit_wait_secs" => {
+            config.retrieval.reranker_rate_limit_wait_secs = parse_optional_u64(key, value)?;
+        }
+        "retrieval.reranker_return_documents"
+        | "retrieval.rerank_return_documents"
+        | "retrieval.return_documents" => {
+            config.retrieval.reranker_return_documents = parse_optional_bool(key, value)?;
         }
         "embedding.batch_size" => {
             config.embedding.batch_size = parse_positive(key, value)?;
@@ -368,6 +506,42 @@ fn parse_optional_string(key: &str, value: &str) -> anyhow::Result<Option<String
         bail!("failed to parse {key} as a string: {value}")
     }
     Ok(Some(value.to_string()))
+}
+
+fn parse_optional_protocol(
+    key: &str,
+    value: &str,
+) -> anyhow::Result<Option<vera_core::config::RerankerProtocol>> {
+    if value == "null" {
+        return Ok(None);
+    }
+    let trimmed = value.trim_matches('"');
+    trimmed
+        .parse::<vera_core::config::RerankerProtocol>()
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("failed to parse {key}: {e}"))
+}
+
+fn parse_optional_bool(key: &str, value: &str) -> anyhow::Result<Option<bool>> {
+    if value == "null" {
+        return Ok(None);
+    }
+    value
+        .parse::<bool>()
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("failed to parse {key}: {e}"))
+}
+
+fn parse_optional_u64(key: &str, value: &str) -> anyhow::Result<Option<u64>> {
+    if value == "null" {
+        return Ok(None);
+    }
+    let parsed: u64 = parse_value(key, value)?;
+    if parsed == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(parsed))
+    }
 }
 
 #[cfg(test)]
