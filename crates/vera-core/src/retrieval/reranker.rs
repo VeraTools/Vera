@@ -727,17 +727,23 @@ fn sanitize_error_message(msg: &str) -> String {
 
 /// Truncate a document to at most `max_chars` characters, cutting at the last
 /// newline boundary to avoid splitting mid-line. Documents within the limit
-/// are returned as-is (zero-copy path).
+/// are returned as-is (zero-copy path). `max_chars` is a **char** budget
+/// (Unicode scalar count), matching `RetrievalConfig::reranker_max_doc_chars`.
 fn truncate_document(doc: &str, max_chars: usize) -> String {
-    if max_chars == 0 || doc.len() <= max_chars {
+    if max_chars == 0 {
         return doc.to_string();
     }
-    // Find the last char boundary at or before max_chars.
-    let mut end = max_chars.min(doc.len());
-    while end > 0 && !doc.is_char_boundary(end) {
-        end -= 1;
+    let char_count = doc.chars().count();
+    if char_count <= max_chars {
+        return doc.to_string();
     }
-    let slice = &doc[..end];
+    // Byte offset of the char at position max_chars (first max_chars chars).
+    let byte_end = doc
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(doc.len());
+    let slice = &doc[..byte_end];
     match slice.rfind('\n') {
         Some(pos) => slice[..pos].to_string(),
         None => slice.to_string(),
