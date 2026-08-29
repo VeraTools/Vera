@@ -97,7 +97,7 @@ fn select_seed_symbols(pool: &[SearchResult]) -> Vec<String> {
                 return None;
             }
 
-            let symbol = base_symbol_name(result.symbol_name.as_deref()?);
+            let symbol = result.symbol_name.as_deref()?;
             if symbol.is_empty() {
                 return None;
             }
@@ -105,10 +105,6 @@ fn select_seed_symbols(pool: &[SearchResult]) -> Vec<String> {
         })
         .take(MAX_SEEDS)
         .collect()
-}
-
-fn base_symbol_name(symbol: &str) -> &str {
-    symbol
 }
 
 fn is_seed_symbol_type(symbol_type: SymbolType) -> bool {
