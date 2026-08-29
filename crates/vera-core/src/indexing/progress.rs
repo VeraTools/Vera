@@ -51,6 +51,58 @@ impl EmbedDisplay {
     }
 }
 
+/// Clamp a progress `done` value to the high-water mark.
+///
+/// Returns `effective_done` (either `done` if forward, or existing `last_done`
+/// if backward) and updates `last_done` on forward movement. Emits a warning
+/// on backward movement so pipeline bugs remain visible.
+/// Shared by both trackers so fixes cannot drift.
+fn clamp_effective_done(last_done: &mut usize, done: usize) -> usize {
+    if done < *last_done {
+        tracing::warn!(
+            previous_done = *last_done,
+            done = done,
+            "embedding progress moved backward"
+        );
+        *last_done
+    } else {
+        *last_done = done;
+        done
+    }
+}
+
+/// Clamp a terminal `count` to the high-water mark.
+///
+/// Mirrors `clamp_effective_done` for the `EmbeddingDone` event. Ensures the
+/// completion message never retreats (e.g. Done 400 after progress 600).
+fn clamp_done_count(last_done: &mut usize, count: usize) -> usize {
+    let clamped = count.max(*last_done);
+    if clamped != count {
+        tracing::warn!(
+            previous_done = *last_done,
+            count = count,
+            "embedding done count moved backward, clamping"
+        );
+    }
+    *last_done = (*last_done).max(clamped);
+    clamped
+}
+
+/// Build the display for an embedding progress event from the (already
+/// clamped) `effective_done` and an optional fixed total.
+fn display_for_effective_done(parsing_done: Option<usize>, effective_done: usize) -> EmbedDisplay {
+    if let Some(total) = parsing_done {
+        EmbedDisplay::Determinate {
+            done: effective_done,
+            total,
+        }
+    } else {
+        EmbedDisplay::Indeterminate {
+            done: effective_done,
+        }
+    }
+}
+
 /// Pure state machine for honest denominator rendering.
 ///
 /// It observes the `IndexProgress` stream and decides whether the embed
@@ -82,29 +134,17 @@ impl HonestProgressTracker {
                 // intentionally ignored while parsing is open — it is the
                 // per-window parsed count and would imply a recalculating
                 // denominator if shown.
-                if *done < self.last_done {
-                    // Backward movement would be a bug in the pipeline; we
-                    // still return a display but note it.
-                    tracing::warn!(
-                        previous_done = self.last_done,
-                        done = *done,
-                        "embedding progress moved backward"
-                    );
-                }
-                self.last_done = *done;
-                let display = if let Some(fixed) = self.parsing_done {
-                    EmbedDisplay::Determinate {
-                        done: *done,
-                        total: fixed,
-                    }
-                } else {
-                    EmbedDisplay::Indeterminate { done: *done }
-                };
+                // Render-layer clamp: never show a backward percentage even if
+                // the pipeline emits a backward `done`. We warn and keep the
+                // display at `last_done` so the percentage cannot retreat.
+                let effective_done = clamp_effective_done(&mut self.last_done, *done);
+                let display = display_for_effective_done(self.parsing_done, effective_done);
                 self.last_display = Some(display.clone());
                 Some(display)
             }
             IndexProgress::EmbeddingDone { count } => {
-                let display = EmbedDisplay::Done { count: *count };
+                let clamped = clamp_done_count(&mut self.last_done, *count);
+                let display = EmbedDisplay::Done { count: clamped };
                 self.last_display = Some(display.clone());
                 Some(display)
             }
@@ -139,6 +179,7 @@ impl HonestProgressTracker {
 pub struct UpdateProgressTracker {
     parsing_done: Option<usize>,
     last_done: usize,
+    last_display: Option<EmbedDisplay>,
 }
 
 impl UpdateProgressTracker {
@@ -155,25 +196,17 @@ impl UpdateProgressTracker {
                 None
             }
             UpdateProgress::EmbeddingProgress { done, .. } => {
-                if *done < self.last_done {
-                    tracing::warn!(
-                        previous_done = self.last_done,
-                        done = *done,
-                        "update embedding progress moved backward"
-                    );
-                }
-                self.last_done = *done;
-                let display = if let Some(fixed) = self.parsing_done {
-                    EmbedDisplay::Determinate {
-                        done: *done,
-                        total: fixed,
-                    }
-                } else {
-                    EmbedDisplay::Indeterminate { done: *done }
-                };
+                let effective_done = clamp_effective_done(&mut self.last_done, *done);
+                let display = display_for_effective_done(self.parsing_done, effective_done);
+                self.last_display = Some(display.clone());
                 Some(display)
             }
-            UpdateProgress::EmbeddingDone { count } => Some(EmbedDisplay::Done { count: *count }),
+            UpdateProgress::EmbeddingDone { count } => {
+                let clamped = clamp_done_count(&mut self.last_done, *count);
+                let display = EmbedDisplay::Done { count: clamped };
+                self.last_display = Some(display.clone());
+                Some(display)
+            }
             UpdateProgress::StorageDone => None,
         }
     }
@@ -184,6 +217,11 @@ impl UpdateProgressTracker {
 
     pub fn fixed_total(&self) -> Option<usize> {
         self.parsing_done
+    }
+
+    /// Last embed display, if any (mirrors HonestProgressTracker).
+    pub fn last_display(&self) -> Option<&EmbedDisplay> {
+        self.last_display.as_ref()
     }
 }
 
@@ -402,5 +440,199 @@ mod tests {
             .unwrap();
         assert_eq!(e2, det(100, 200));
         assert!(e2.shows_percentage());
+    }
+
+    #[test]
+    fn render_layer_clamp_prevents_backward_percentage() {
+        // Feed a forward progression then a backward `done`. The render layer
+        // must clamp to `last_done` so the displayed percentage never retreats,
+        // while still emitting the warning (verified by the fact the code path
+        // calls tracing::warn before clamping).
+        let mut tracker = HonestProgressTracker::new();
+        tracker.handle(&IndexProgress::ParsingDone { chunk_count: 5000 });
+
+        let d1 = tracker
+            .handle(&IndexProgress::EmbeddingProgress {
+                done: 3500,
+                total: 5000,
+            })
+            .unwrap();
+        assert_eq!(d1, det(3500, 5000));
+        assert_eq!(tracker.last_display(), Some(&det(3500, 5000)));
+
+        // Backward input: 3000 < 3500 must be clamped to 3500.
+        let d2 = tracker
+            .handle(&IndexProgress::EmbeddingProgress {
+                done: 3000,
+                total: 5000,
+            })
+            .unwrap();
+        assert_eq!(
+            d2,
+            det(3500, 5000),
+            "backward done must be clamped to last_done"
+        );
+        assert_eq!(
+            d2.message(),
+            "Generating embeddings (3500/5000)",
+            "clamped display must not show backward percentage"
+        );
+        assert_eq!(tracker.last_display(), Some(&det(3500, 5000)));
+
+        // Further backward while still indeterminate (no ParsingDone) also clamps.
+        let mut ind_tracker = HonestProgressTracker::new();
+        let a = ind_tracker
+            .handle(&IndexProgress::EmbeddingProgress {
+                done: 1200,
+                total: 9999,
+            })
+            .unwrap();
+        assert_eq!(a, ind(1200));
+        let b = ind_tracker
+            .handle(&IndexProgress::EmbeddingProgress {
+                done: 800,
+                total: 9999,
+            })
+            .unwrap();
+        assert_eq!(
+            b,
+            ind(1200),
+            "indeterminate backward done must clamp to last_done"
+        );
+    }
+
+    #[test]
+    fn update_tracker_clamps_backward_and_exposes_last_display() {
+        let mut tracker = UpdateProgressTracker::new();
+        tracker.handle(&UpdateProgress::ParsingDone {
+            file_count: 2,
+            chunk_count: 1000,
+        });
+        let d1 = tracker
+            .handle(&UpdateProgress::EmbeddingProgress {
+                done: 600,
+                total: 1000,
+            })
+            .unwrap();
+        assert_eq!(d1, det(600, 1000));
+        assert_eq!(tracker.last_display(), Some(&det(600, 1000)));
+        assert_eq!(tracker.fixed_total(), Some(1000));
+
+        let d2 = tracker
+            .handle(&UpdateProgress::EmbeddingProgress {
+                done: 400,
+                total: 1000,
+            })
+            .unwrap();
+        assert_eq!(
+            d2,
+            det(600, 1000),
+            "update tracker must clamp backward done"
+        );
+        assert_eq!(tracker.last_display(), Some(&det(600, 1000)));
+
+        // Indeterminate phase clamping as well.
+        let mut upd = UpdateProgressTracker::new();
+        let e1 = upd
+            .handle(&UpdateProgress::EmbeddingProgress {
+                done: 90,
+                total: 90,
+            })
+            .unwrap();
+        assert_eq!(e1, ind(90));
+        assert_eq!(upd.last_display(), Some(&ind(90)));
+        let e2 = upd
+            .handle(&UpdateProgress::EmbeddingProgress {
+                done: 40,
+                total: 90,
+            })
+            .unwrap();
+        assert_eq!(e2, ind(90));
+        assert_eq!(upd.last_display(), Some(&ind(90)));
+
+        // Done handling also updates last_display.
+        let done = upd
+            .handle(&UpdateProgress::EmbeddingDone { count: 90 })
+            .unwrap();
+        assert_eq!(done, EmbedDisplay::Done { count: 90 });
+        assert_eq!(done, *upd.last_display().unwrap());
+    }
+
+    #[test]
+    fn update_tracker_field_set_matches_honest_tracker() {
+        // Reconciled field set: both trackers keep last_display so callers
+        // can inspect the last rendered state without special-casing.
+        let mut honest = HonestProgressTracker::new();
+        let mut update = UpdateProgressTracker::new();
+        assert_eq!(honest.last_display(), None);
+        assert_eq!(update.last_display(), None);
+
+        honest.handle(&IndexProgress::EmbeddingProgress {
+            done: 10,
+            total: 10,
+        });
+        update.handle(&UpdateProgress::EmbeddingProgress {
+            done: 10,
+            total: 10,
+        });
+        assert_eq!(honest.last_display(), Some(&ind(10)));
+        assert_eq!(update.last_display(), Some(&ind(10)));
+    }
+
+    #[test]
+    fn terminal_done_count_is_clamped_against_high_water_mark() {
+        // EmbeddingDone with a count lower than the observed high-water mark
+        // must not make the terminal display retreat.
+        let mut tracker = HonestProgressTracker::new();
+        tracker.handle(&IndexProgress::ParsingDone { chunk_count: 1000 });
+        tracker
+            .handle(&IndexProgress::EmbeddingProgress {
+                done: 600,
+                total: 1000,
+            })
+            .unwrap();
+        let done = tracker
+            .handle(&IndexProgress::EmbeddingDone { count: 400 })
+            .unwrap();
+        assert_eq!(
+            done,
+            EmbedDisplay::Done { count: 600 },
+            "terminal count must be clamped to last_done"
+        );
+        assert_eq!(
+            tracker.last_display(),
+            Some(&EmbedDisplay::Done { count: 600 })
+        );
+
+        // Forward Done still updates the high-water mark.
+        let mut forward = HonestProgressTracker::new();
+        forward.handle(&IndexProgress::EmbeddingProgress {
+            done: 200,
+            total: 200,
+        });
+        let done2 = forward
+            .handle(&IndexProgress::EmbeddingDone { count: 500 })
+            .unwrap();
+        assert_eq!(done2, EmbedDisplay::Done { count: 500 });
+
+        // Same rule for update tracker.
+        let mut upd = UpdateProgressTracker::new();
+        upd.handle(&UpdateProgress::ParsingDone {
+            file_count: 1,
+            chunk_count: 800,
+        });
+        upd.handle(&UpdateProgress::EmbeddingProgress {
+            done: 700,
+            total: 800,
+        })
+        .unwrap();
+        let upd_done = upd
+            .handle(&UpdateProgress::EmbeddingDone { count: 300 })
+            .unwrap();
+        assert_eq!(
+            upd_done,
+            EmbedDisplay::Done { count: 700 },
+            "update terminal count must clamp"
+        );
     }
 }

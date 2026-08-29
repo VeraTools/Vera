@@ -8,7 +8,10 @@ use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
 use vera_core::indexing::{UpdateOptions, UpdateProgress};
 
-use crate::helpers::{cancel_task_on_signal, wait_for_interrupt};
+use crate::helpers::{
+    cancel_task_on_signal, finalize_progress_ui, handle_embedding_done, render_embed_display,
+    stop_embed_spinner_on_parsing_done, wait_for_interrupt,
+};
 use crate::state;
 
 pub struct CommandOptions {
@@ -155,59 +158,23 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
                     parse_spinner_ref.stop(format!(
                         "Parsed {file_count} changed files into {chunk_count} chunks"
                     ));
-                    if let Some(spinner_widget) = embed_spinner_ref.lock().unwrap().take() {
-                        spinner_widget.stop(format!(
+                    stop_embed_spinner_on_parsing_done(
+                        &embed_spinner_ref,
+                        format!(
                             "Parsed {file_count} changed files into {chunk_count} chunks — finalizing embeddings..."
-                        ));
-                    }
+                        ),
+                    );
                 }
-                UpdateProgress::EmbeddingProgress { .. } => match display {
-                    Some(vera_core::indexing::progress::EmbedDisplay::Indeterminate { done }) => {
-                        let mut guard = embed_spinner_ref.lock().unwrap();
-                        if guard.is_none() {
-                            let w = Arc::new(multi_ref.add(cliclack::spinner()));
-                            w.start(format!("Generating embeddings ({} chunks so far)", done));
-                            *guard = Some(w);
-                        } else if let Some(w) = guard.as_ref() {
-                            w.set_message(format!(
-                                "Generating embeddings ({} chunks so far)",
-                                done
-                            ));
-                        }
-                    }
-                    Some(vera_core::indexing::progress::EmbedDisplay::Determinate {
-                        done,
-                        total,
-                    }) => {
-                        if let Some(spinner_widget) = embed_spinner_ref.lock().unwrap().take() {
-                            spinner_widget
-                                .stop(format!("Generating embeddings ({}/{})", done, total));
-                        }
-                        let mut guard = embed_bar_ref.lock().unwrap();
-                        if guard.is_none() {
-                            let w = Arc::new(multi_ref.add(cliclack::progress_bar(total as u64)));
-                            w.start(format!("Generating embeddings ({}/{})", done, total));
-                            w.set_position(done as u64);
-                            *guard = Some(w);
-                        } else if let Some(w) = guard.as_ref() {
-                            w.set_position(done as u64);
-                            w.set_message(format!("Generating embeddings ({}/{})", done, total));
-                        }
-                    }
-                    Some(vera_core::indexing::progress::EmbedDisplay::Done { .. }) => {}
-                    None => {}
-                },
+                UpdateProgress::EmbeddingProgress { .. } => {
+                    render_embed_display(display, &embed_spinner_ref, &embed_bar_ref, &multi_ref);
+                }
                 UpdateProgress::EmbeddingDone { .. } => {
-                    if let Some(vera_core::indexing::progress::EmbedDisplay::Done { count }) =
-                        display
-                    {
-                        if let Some(bar) = embed_bar_ref.lock().unwrap().take() {
-                            bar.stop(format!("Generated {} embeddings", count));
-                        } else if let Some(spinner_widget) =
-                            embed_spinner_ref.lock().unwrap().take()
-                        {
-                            spinner_widget.stop(format!("Generated {} embeddings", count));
-                        }
+                    let is_done = matches!(
+                        display,
+                        Some(vera_core::indexing::progress::EmbedDisplay::Done { .. })
+                    );
+                    handle_embedding_done(display, &embed_spinner_ref, &embed_bar_ref, &multi_ref);
+                    if is_done {
                         parse_spinner_ref.start("Writing index updates...");
                     }
                 }
@@ -232,32 +199,7 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
             .await
         });
         let result = rt.block_on(cancel_task_on_signal(task, signal, cancellation, "update"));
-        // Honest display for update as well: cancelled / error are not shown as success.
-        let is_cancel = result
-            .as_ref()
-            .is_err_and(|err| err.to_string().to_lowercase().contains("cancel"));
-        if is_cancel {
-            if let Some(bar) = embed_bar.lock().unwrap().take() {
-                bar.cancel("Cancelled");
-            }
-            if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
-                spinner_widget.cancel("Cancelled");
-            }
-            parse_spinner.cancel("Cancelled");
-            multi.cancel();
-        } else if let Err(err) = &result {
-            let msg = err.to_string();
-            if let Some(bar) = embed_bar.lock().unwrap().take() {
-                bar.error(format!("Failed: {msg}"));
-            }
-            if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
-                spinner_widget.error(format!("Failed: {msg}"));
-            }
-            parse_spinner.error(format!("Failed: {msg}"));
-            multi.error(&msg);
-        } else {
-            multi.stop();
-        }
+        finalize_progress_ui(&result, &parse_spinner, &embed_spinner, &embed_bar, &multi);
         result.context("update failed")?
     } else {
         let task_repo_path = repo_path.to_path_buf();

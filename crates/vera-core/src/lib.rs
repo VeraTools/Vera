@@ -19,7 +19,7 @@ pub mod discovery;
 pub mod embedding;
 pub mod git_scope;
 
-pub use cancellation::CancellationToken;
+pub use cancellation::{CancellationToken, Cancelled, is_cancel_error};
 
 /// Install the rustls crypto provider (ring). Safe to call multiple times.
 pub fn init_tls() {
