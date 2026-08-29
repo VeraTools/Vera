@@ -1399,6 +1399,13 @@ fn candidate_pool_is_clamped_to_index_for_extreme_limits() {
 // VAL-FILTER-016: exact_paths-style restrictions reach the island above the cap.
 // The whole-index fetch for flat filtered queries must be driven by index_count,
 // not by the post-filter count, so an island file at the tail is reachable.
+//
+// Note: this unit test uses a tiny synthetic index (21 chunks) to pin the
+// exact-paths predicate and OR plumbing below the 4096 cap. Above-cap proof
+// (4427 chunks, island ranked last) lives in the shell/fixture evidence:
+// `validation/m2-correctness-defects` fixtures `overcap` (4427) via
+// `vera search ... --path src/video` etc. (VAL-FILTER-002/003/004). See
+// `library/user-testing.md` and `evidence/m2-correctness-defects/shell-reach`.
 #[tokio::test]
 async fn exact_paths_filter_reaches_island_above_cap() {
     use crate::embedding::test_helpers::MockProvider;
@@ -1479,6 +1486,8 @@ async fn exact_paths_filter_reaches_island_above_cap() {
 }
 
 // VAL-FILTER-017: multiple --path values work above the cap (OR semantics).
+// Tiny synthetic index pins OR semantics below cap; over-cap (4427) island
+// reach via multiple --path is proven in shell/fixture evidence (VAL-FILTER-017).
 #[tokio::test]
 async fn multiple_path_filters_use_or_semantics() {
     use crate::embedding::test_helpers::MockProvider;
@@ -1622,6 +1631,9 @@ fn video_filter_does_not_match_videoplayer_and_near_miss_hint_preserved() {
 
 // VAL-FILTER-021: filtered above-cap results survive reranking (no re-clamping),
 // and graceful degradation on reranker failure preserves the filtered set.
+// Unit test uses a 2-chunk synthetic index to pin reranking plumbing; over-cap
+// reranking survival is proven in shell/fixture evidence plus the
+// candidate_pool clamping unit test (4427, VAL-FILTER-013).
 #[tokio::test]
 async fn filtered_results_survive_reranking_and_graceful_degradation() {
     use crate::embedding::test_helpers::MockProvider;

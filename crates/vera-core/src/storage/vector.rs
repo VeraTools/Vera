@@ -1369,20 +1369,13 @@ impl VectorStore {
         // it on natural-language queries, and the whole vector arm would then be
         // dropped in favour of BM25-only results. Ask for as many as the backend
         // allows instead.
-        // Honest, pinned diagnostic: only warn when vec0 clamping could actually
-        // lose results (index larger than cap and request exceeds cap). Keep
-        // quiet on below-cap indexes and on small requests.
-        if limit > MAX_KNN_K
-            && let Ok(count) = self.count()
-            && count > MAX_KNN_K as u64
-        {
-            tracing::warn!(
-                requested = limit,
-                clamped = MAX_KNN_K,
-                index_count = count,
-                "vec0 vector search truncated at sqlite-vec KNN cap (4096); results may be incomplete. Use the default flat vector scan (unset VERA_VECTOR_SCAN) for complete results"
-            );
-        }
+        //
+        // Truncation diagnostics are intentionally not emitted here: this storage
+        // layer has no filter context, so a generic `limit > cap` warn would fire
+        // on filtered true negatives (e.g. `--path src/does-not-exist` on a
+        // 4427-chunk index) while the hybrid layer correctly stays quiet via
+        // `has_filter_matches` (which now includes `scope`/`include_generated`).
+        // Filter-aware, actionable diagnostics live in `retrieval::hybrid`.
         let limit = limit.min(MAX_KNN_K);
 
         // `prepare`, not `prepare_cached`: `limit` is interpolated into the

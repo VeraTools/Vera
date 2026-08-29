@@ -151,7 +151,7 @@ const SQL_FIND_TYPE_RELATIONS: &str = "SELECT file_path, line, owner, target, ki
                  WHERE lower(target) = lower(?1)
                  ORDER BY file_path, line, owner";
 
-const SQL_FIND_DEAD_SYMBOLS: &str = "SELECT c.symbol_name, c.file_path, MIN(c.line_start), c.symbol_type
+const SQL_FIND_DEAD_SYMBOLS: &str = "SELECT MIN(c.symbol_name), c.file_path, MIN(c.line_start), MIN(c.symbol_type)
                  FROM chunks c
                  WHERE c.symbol_name IS NOT NULL
                    AND c.symbol_type IN ('function', 'method')
@@ -619,14 +619,15 @@ impl MetadataStore {
     /// Used to distinguish a filtered query that legitimately matches zero chunks index-wide
     /// (true negative, no diagnostic) from one that was truncated and then filtered to fewer than requested
     /// (possible loss, diagnostic required). The check is performed in Rust using the same `SearchFilters`
-    /// matcher as the post-filter step so semantics stay identical.
+    /// matcher as the post-filter step so semantics stay identical, including `scope` and
+    /// `include_generated` which require `content` classification.
     pub fn has_filter_matches(&self, filters: &crate::types::SearchFilters) -> Result<bool> {
         if filters.is_empty() {
             return Ok(false);
         }
         let mut stmt = self
             .conn
-            .prepare("SELECT file_path, language, symbol_type FROM chunks")
+            .prepare("SELECT file_path, language, symbol_type, content FROM chunks")
             .context("failed to prepare filter match check")?;
         let rows = stmt
             .query_map([], |row| {
@@ -634,20 +635,31 @@ impl MetadataStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .context("failed to query filter match check")?;
         for row in rows {
-            let (file_path, lang_str, sym_str) = row.context("failed to read filter match row")?;
+            let (file_path, lang_str, sym_str, content) =
+                row.context("failed to read filter match row")?;
             let language = parse_language(&lang_str);
-            if !filters.matches_file(&file_path, language) {
-                continue;
+            let symbol_type = sym_str.as_deref().map(parse_symbol_type);
+            // Use the full filter matcher so scope/include_generated are accounted for.
+            // A scope-filtered true negative must stay quiet, not incorrectly warn.
+            let probe = crate::types::SearchResult {
+                file_path,
+                line_start: 1,
+                line_end: 1,
+                content,
+                language,
+                score: 0.0,
+                symbol_name: None,
+                symbol_type,
+                part_index: None,
+            };
+            if filters.matches(&probe) {
+                return Ok(true);
             }
-            let sym_type = sym_str.as_deref().map(parse_symbol_type);
-            if !filters.matches_symbol_type(sym_type) {
-                continue;
-            }
-            return Ok(true);
         }
         Ok(false)
     }
@@ -659,7 +671,7 @@ impl MetadataStore {
         }
         let mut stmt = self
             .conn
-            .prepare("SELECT file_path, language, symbol_type FROM chunks")
+            .prepare("SELECT file_path, language, symbol_type, content FROM chunks")
             .context("failed to prepare filter match count")?;
         let rows = stmt
             .query_map([], |row| {
@@ -667,21 +679,30 @@ impl MetadataStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .context("failed to query filter match count")?;
         let mut count = 0usize;
         for row in rows {
-            let (file_path, lang_str, sym_str) = row.context("failed to read filter match row")?;
+            let (file_path, lang_str, sym_str, content) =
+                row.context("failed to read filter match row")?;
             let language = parse_language(&lang_str);
-            if !filters.matches_file(&file_path, language) {
-                continue;
+            let symbol_type = sym_str.as_deref().map(parse_symbol_type);
+            let probe = crate::types::SearchResult {
+                file_path,
+                line_start: 1,
+                line_end: 1,
+                content,
+                language,
+                score: 0.0,
+                symbol_name: None,
+                symbol_type,
+                part_index: None,
+            };
+            if filters.matches(&probe) {
+                count += 1;
             }
-            let sym_type = sym_str.as_deref().map(parse_symbol_type);
-            if !filters.matches_symbol_type(sym_type) {
-                continue;
-            }
-            count += 1;
         }
         Ok(count)
     }

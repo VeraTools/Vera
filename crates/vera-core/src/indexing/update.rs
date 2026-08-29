@@ -1078,14 +1078,25 @@ mod regression_tests {
             assert_eq!(c.symbol_name.as_deref(), Some("huge"));
             assert_eq!(c.part_index, Some((idx as u32) + 1));
         }
-        // Ensure no leftover IDs with higher part numbers
-        let ids: Vec<_> = after.iter().map(|c| c.id.as_str()).collect();
-        for id in &ids {
-            assert!(
-                !id.ends_with(":3") || after.len() >= 3,
-                "orphan part 3 should not remain when now only {} parts",
-                after.len()
-            );
-        }
+        // Strengthened orphan check: assert the exact remaining chunk-ID set.
+        // Before the fix this test used `!id.ends_with(":3")` which never matches
+        // line-count split IDs (`huge.rs:0`/`:1`/`:2`), so an orphan row `:2`
+        // after a 3→2 shrink would pass silently. Now we assert the full set.
+        assert_eq!(
+            after.len(),
+            2,
+            "250-line huge should now be exactly 2 parts, was {} before",
+            before.len()
+        );
+        let ids: std::collections::HashSet<&str> = after.iter().map(|c| c.id.as_str()).collect();
+        let expected: std::collections::HashSet<&str> =
+            ["huge.rs:0", "huge.rs:1"].into_iter().collect();
+        assert_eq!(
+            ids, expected,
+            "orphan check: remaining chunk IDs must be exactly {expected:?}, got {ids:?}"
+        );
+        // This exact-set assertion demonstrably fails if an orphan row is injected:
+        // e.g. `store.insert_chunks(&[orphan_chunk with id huge.rs:2])` before the
+        // `after` read would make `after.len()==3` and `ids` contain `:2`, failing both.
     }
 }
