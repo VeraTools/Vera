@@ -144,11 +144,13 @@ The default Potion Code model runs on all supported machines. Use Jina ONNX with
 
 ## API Mode
 
-Interactive setup prompts for the endpoint URL, model ID, API key, and optional reranker:
+Interactive setup prompts for the endpoint URL, model ID, API key, and optional reranker. The wizard offers presets for OpenAI, Jina, Voyage, and Qwen (OpenRouter) with exact prefills; the Qwen preset uses `qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` with a single shared key (paid usage) and the generic rerank protocol (`top_n`/`results`) by default:
 
 ```bash
 vera setup --api
 ```
+
+The reranker step also configures the wire protocol (auto, generic, or voyage), endpoint path override, and optional task instruction. Qwen via OpenRouter relies on the generic protocol unless overridden. Custom proxies can select `generic` or `voyage` via `retrieval.reranker_protocol` without hostname spoofing.
 
 For non-interactive setup, export the API values first and add `--yes`:
 
@@ -163,6 +165,24 @@ export RERANKER_MODEL_ID=your-reranker-model
 export RERANKER_MODEL_API_KEY=your-api-key
 
 vera setup --api --yes
+
+# Reranker protocol and endpoint overrides (also configurable without a TTY)
+vera config set retrieval.reranker_protocol generic
+vera config set retrieval.reranker_endpoint_path "/rerank"
+vera config set retrieval.reranker_task_instruction "Given a query, retrieve relevant code"
+```
+
+For Qwen via OpenRouter non-interactively:
+
+```bash
+export EMBEDDING_MODEL_BASE_URL=https://openrouter.ai/api/v1
+export EMBEDDING_MODEL_ID=qwen/qwen3-embedding-8b
+export EMBEDDING_MODEL_API_KEY=your-openrouter-key
+export RERANKER_MODEL_BASE_URL=https://openrouter.ai/api/v1
+export RERANKER_MODEL_ID=qwen/qwen3-reranker-8b
+export RERANKER_MODEL_API_KEY=your-openrouter-key
+vera setup --api --yes
+vera config set retrieval.reranker_protocol generic
 ```
 
 Only model calls leave your machine. Indexing, storage, and search remain local.
