@@ -151,6 +151,11 @@ pub fn stop_embed_spinner_on_parsing_done(
 /// and show the final "Generated N embeddings" message. For tiny repos where
 /// no widget was ever created, a short-lived bar is shown. Shared by index
 /// and update.
+///
+/// The fallback bar is only created when `count > 0`: for an up-to-date or
+/// zero-chunk update `EmbeddingDone { count: 0 }` is emitted without any prior
+/// `EmbeddingProgress`, and creating a transient "Generated 0 embeddings" bar
+/// would flash a misleading widget before the next spinner.
 pub fn handle_embedding_done(
     display: Option<EmbedDisplay>,
     embed_spinner: &Arc<Mutex<Option<Arc<cliclack::ProgressBar>>>>,
@@ -162,7 +167,7 @@ pub fn handle_embedding_done(
             bar.stop(format!("Generated {} embeddings", count));
         } else if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
             spinner_widget.stop(format!("Generated {} embeddings", count));
-        } else {
+        } else if count > 0 {
             let w = multi.add(cliclack::progress_bar(count as u64));
             w.start(format!("Generated {} embeddings", count));
             w.stop(format!("Generated {} embeddings", count));
