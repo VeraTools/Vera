@@ -1737,3 +1737,74 @@ async fn filtered_results_survive_reranking_and_graceful_degradation() {
         degraded.iter().map(|r| &r.file_path).collect::<Vec<_>>()
     );
 }
+
+#[tokio::test]
+async fn reranker_failure_degrades_to_exact_original_hybrid_order() {
+    use crate::embedding::test_helpers::MockProvider;
+    use crate::retrieval::reranker::RerankerError;
+    use crate::retrieval::reranker::test_helpers::MockReranker;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (index_dir, dim) = setup_test_index(tmp.path()).await;
+    let provider = MockProvider::new(dim);
+
+    // Baseline hybrid order without reranking
+    let (hybrid_results, _) = search_hybrid(
+        &index_dir,
+        &provider,
+        "authenticate",
+        "authenticate",
+        &SearchFilters::default(),
+        5,
+        60.0,
+        dim,
+        50,
+    )
+    .await
+    .unwrap();
+
+    // Reranked with a failing reranker must return byte-identical hybrid order
+    let failing = MockReranker::failing(RerankerError::ConnectionError {
+        message: "reranker down".to_string(),
+    });
+    let (degraded, _) = search_hybrid_reranked(
+        &index_dir,
+        &provider,
+        &failing,
+        "authenticate",
+        "authenticate",
+        &SearchFilters::default(),
+        5,
+        5,
+        60.0,
+        dim,
+        10,
+        50,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        degraded.len(),
+        hybrid_results.len().min(5),
+        "degraded must have same count as hybrid truncated to fetch_limit"
+    );
+    let hybrid_json = serde_json::to_string(&hybrid_results[..degraded.len()]).unwrap();
+    let degraded_json = serde_json::to_string(&degraded).unwrap();
+    assert_eq!(
+        hybrid_json, degraded_json,
+        "degradation must be byte-identical to hybrid order; hybrid={hybrid_json} degraded={degraded_json}"
+    );
+    // Also verify scores are identical (original hybrid scores preserved)
+    for (h, d) in hybrid_results.iter().zip(degraded.iter()) {
+        assert!(
+            (h.score - d.score).abs() < 1e-12,
+            "score must be preserved: hybrid {} vs degraded {}",
+            h.score,
+            d.score
+        );
+        assert_eq!(h.file_path, d.file_path);
+        assert_eq!(h.line_start, d.line_start);
+        assert_eq!(h.line_end, d.line_end);
+    }
+}
