@@ -2,10 +2,11 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use clap::Args;
+use vera_core::indexing::progress::EmbedDisplay;
 use vera_core::presentation::{CompactResult, truncate_to_budget};
 
 /// Install the process interrupt handler and return a future for its first event.
@@ -71,6 +72,139 @@ pub fn warn_if_index_stale(repo_path: &Path, indexing_config: &vera_core::config
         Err(err) => {
             tracing::debug!(error = %err, "failed to check index freshness");
         }
+    }
+}
+
+/// Whether an error represents cooperative cancellation (typed check).
+///
+/// Thin wrapper around [`vera_core::is_cancel_error`] so CLI call sites use
+/// the typed helper instead of brittle `to_string().contains("cancel")`.
+pub fn is_cancel_error(err: &anyhow::Error) -> bool {
+    vera_core::is_cancel_error(err)
+}
+
+// ── Shared progress rendering (deduplicated for index + update) ─────────
+
+/// Render an embed progress display into the shared spinner/bar widgets.
+///
+/// This is the deduplicated core of `vera index` and `vera update` progress
+/// rendering: indeterminate → spinner, determinate → bar. Both commands call
+/// this so the tracker + embed_spinner/embed_bar + ParsingDone transition
+/// cannot drift. The `display` comes from `HonestProgressTracker` or
+/// `UpdateProgressTracker`; the widget handling is identical.
+pub fn render_embed_display(
+    display: Option<EmbedDisplay>,
+    embed_spinner: &Arc<Mutex<Option<Arc<cliclack::ProgressBar>>>>,
+    embed_bar: &Arc<Mutex<Option<Arc<cliclack::ProgressBar>>>>,
+    multi: &cliclack::MultiProgress,
+) {
+    match display {
+        Some(EmbedDisplay::Indeterminate { done }) => {
+            let mut guard = embed_spinner.lock().unwrap();
+            if guard.is_none() {
+                let w = Arc::new(multi.add(cliclack::spinner()));
+                w.start(format!("Generating embeddings ({} chunks so far)", done));
+                *guard = Some(w);
+            } else if let Some(w) = guard.as_ref() {
+                w.set_message(format!("Generating embeddings ({} chunks so far)", done));
+            }
+        }
+        Some(EmbedDisplay::Determinate { done, total }) => {
+            // If an indeterminate spinner is still around (race where
+            // ParsingDone and first determinate embedding interleave), stop
+            // it before showing the bar.
+            if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
+                spinner_widget.stop(format!(
+                    "Parsed into {total} chunks — finalizing embeddings..."
+                ));
+            }
+            let mut guard = embed_bar.lock().unwrap();
+            if guard.is_none() {
+                let w = Arc::new(multi.add(cliclack::progress_bar(total as u64)));
+                w.start(format!("Generating embeddings ({}/{})", done, total));
+                w.set_position(done as u64);
+                *guard = Some(w);
+            } else if let Some(w) = guard.as_ref() {
+                w.set_position(done as u64);
+                w.set_message(format!("Generating embeddings ({}/{})", done, total));
+            }
+        }
+        Some(EmbedDisplay::Done { .. }) | None => {}
+    }
+}
+
+/// Stop the embed spinner on `ParsingDone` transition, if present.
+///
+/// Shared helper for the ParsingDone branch: both index and update stop the
+/// spinner with a "finalizing embeddings..." message so the determinate bar
+/// can take over without a lingering line.
+pub fn stop_embed_spinner_on_parsing_done(
+    embed_spinner: &Arc<Mutex<Option<Arc<cliclack::ProgressBar>>>>,
+    message: String,
+) {
+    if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
+        spinner_widget.stop(message);
+    }
+}
+
+/// Handle an `EmbeddingDone` display: stop whichever embed widget is active
+/// and show the final "Generated N embeddings" message. For tiny repos where
+/// no widget was ever created, a short-lived bar is shown. Shared by index
+/// and update.
+pub fn handle_embedding_done(
+    display: Option<EmbedDisplay>,
+    embed_spinner: &Arc<Mutex<Option<Arc<cliclack::ProgressBar>>>>,
+    embed_bar: &Arc<Mutex<Option<Arc<cliclack::ProgressBar>>>>,
+    multi: &cliclack::MultiProgress,
+) {
+    if let Some(EmbedDisplay::Done { count }) = display {
+        if let Some(bar) = embed_bar.lock().unwrap().take() {
+            bar.stop(format!("Generated {} embeddings", count));
+        } else if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
+            spinner_widget.stop(format!("Generated {} embeddings", count));
+        } else {
+            let w = multi.add(cliclack::progress_bar(count as u64));
+            w.start(format!("Generated {} embeddings", count));
+            w.stop(format!("Generated {} embeddings", count));
+        }
+    }
+}
+
+/// Finalize the progress UI after the task completes.
+///
+/// Shared cancel/error/success handling: cancellation is detected via the
+/// typed `is_cancel_error` helper (not substring), then widgets are
+/// cancelled, errored, or stopped accordingly. Both `vera index` and
+/// `vera update` call this so the outcome cannot diverge.
+pub fn finalize_progress_ui<T>(
+    result: &anyhow::Result<T>,
+    parse_spinner: &Arc<cliclack::ProgressBar>,
+    embed_spinner: &Arc<Mutex<Option<Arc<cliclack::ProgressBar>>>>,
+    embed_bar: &Arc<Mutex<Option<Arc<cliclack::ProgressBar>>>>,
+    multi: &cliclack::MultiProgress,
+) {
+    let is_cancel = result.as_ref().is_err_and(is_cancel_error);
+    if is_cancel {
+        if let Some(bar) = embed_bar.lock().unwrap().take() {
+            bar.cancel("Cancelled");
+        }
+        if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
+            spinner_widget.cancel("Cancelled");
+        }
+        parse_spinner.cancel("Cancelled");
+        multi.cancel();
+    } else if let Err(err) = result {
+        let msg = err.to_string();
+        if let Some(bar) = embed_bar.lock().unwrap().take() {
+            bar.error(format!("Failed: {msg}"));
+        }
+        if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
+            spinner_widget.error(format!("Failed: {msg}"));
+        }
+        parse_spinner.error(format!("Failed: {msg}"));
+        multi.error(&msg);
+    } else {
+        multi.stop();
     }
 }
 

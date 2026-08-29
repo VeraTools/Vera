@@ -8,7 +8,10 @@ use anyhow::{Context, bail};
 use vera_core::config::InferenceBackend;
 use vera_core::indexing::IndexProgress;
 
-use crate::helpers::{cancel_task_on_signal, print_human_summary, wait_for_interrupt};
+use crate::helpers::{
+    cancel_task_on_signal, finalize_progress_ui, handle_embedding_done, print_human_summary,
+    render_embed_display, stop_embed_spinner_on_parsing_done, wait_for_interrupt,
+};
 use crate::state;
 
 /// Run the `vera index <path>` command.
@@ -154,74 +157,16 @@ pub fn execute(
             }
             IndexProgress::ParsingDone { chunk_count } => {
                 parse_spinner_ref.stop(format!("Parsed into {chunk_count} chunks"));
-                // If we were showing an indeterminate spinner for embeddings,
-                // transition to a determinate bar on the next embedding event.
-                // We stop the spinner here so it does not linger as a separate
-                // line while the bar takes over.
-                if let Some(spinner_widget) = embed_spinner_ref.lock().unwrap().take() {
-                    spinner_widget.stop(format!(
-                        "Parsed into {chunk_count} chunks — finalizing embeddings..."
-                    ));
-                }
+                stop_embed_spinner_on_parsing_done(
+                    &embed_spinner_ref,
+                    format!("Parsed into {chunk_count} chunks — finalizing embeddings..."),
+                );
             }
             IndexProgress::EmbeddingProgress { .. } => {
-                match display {
-                    Some(vera_core::indexing::progress::EmbedDisplay::Indeterminate { done }) => {
-                        let mut guard = embed_spinner_ref.lock().unwrap();
-                        if guard.is_none() {
-                            let w = Arc::new(multi_ref.add(cliclack::spinner()));
-                            w.start(format!("Generating embeddings ({} chunks so far)", done));
-                            *guard = Some(w);
-                        } else if let Some(w) = guard.as_ref() {
-                            w.set_message(format!(
-                                "Generating embeddings ({} chunks so far)",
-                                done
-                            ));
-                        }
-                    }
-                    Some(vera_core::indexing::progress::EmbedDisplay::Determinate {
-                        done,
-                        total,
-                    }) => {
-                        // If an indeterminate spinner is still around (race where
-                        // ParsingDone and first determinate embedding interleave),
-                        // stop it before showing the bar.
-                        if let Some(spinner_widget) = embed_spinner_ref.lock().unwrap().take() {
-                            spinner_widget.stop(format!(
-                                "Parsed into {total} chunks — finalizing embeddings..."
-                            ));
-                        }
-                        let mut guard = embed_bar_ref.lock().unwrap();
-                        if guard.is_none() {
-                            let w = Arc::new(multi_ref.add(cliclack::progress_bar(total as u64)));
-                            w.start(format!("Generating embeddings ({}/{})", done, total));
-                            w.set_position(done as u64);
-                            *guard = Some(w);
-                        } else if let Some(w) = guard.as_ref() {
-                            // Length is fixed on creation; only position/message change.
-                            w.set_position(done as u64);
-                            w.set_message(format!("Generating embeddings ({}/{})", done, total));
-                        }
-                    }
-                    Some(vera_core::indexing::progress::EmbedDisplay::Done { .. }) => {}
-                    None => {}
-                }
+                render_embed_display(display, &embed_spinner_ref, &embed_bar_ref, &multi_ref);
             }
             IndexProgress::EmbeddingDone { .. } => {
-                if let Some(vera_core::indexing::progress::EmbedDisplay::Done { count }) = display {
-                    if let Some(bar) = embed_bar_ref.lock().unwrap().take() {
-                        bar.stop(format!("Generated {} embeddings", count));
-                    } else if let Some(spinner_widget) = embed_spinner_ref.lock().unwrap().take() {
-                        spinner_widget.stop(format!("Generated {} embeddings", count));
-                    } else {
-                        // No embed widget was ever created (e.g. tiny repo
-                        // with no embedding progress events?); create a
-                        // short-lived bar just to show completion.
-                        let w = multi_ref.add(cliclack::progress_bar(count as u64));
-                        w.start(format!("Generated {} embeddings", count));
-                        w.stop(format!("Generated {} embeddings", count));
-                    }
-                }
+                handle_embedding_done(display, &embed_spinner_ref, &embed_bar_ref, &multi_ref);
             }
             IndexProgress::StorageDone => {}
         }
@@ -248,33 +193,7 @@ pub fn execute(
         cancellation,
         "indexing",
     ));
-    // Honest display: cancellation mid-index and mid-run embedding failure are
-    // displayed as cancelled/error states, not a frozen or 100% bar.
-    let is_cancel = result
-        .as_ref()
-        .is_err_and(|err| err.to_string().to_lowercase().contains("cancel"));
-    if is_cancel {
-        if let Some(bar) = embed_bar.lock().unwrap().take() {
-            bar.cancel("Cancelled");
-        }
-        if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
-            spinner_widget.cancel("Cancelled");
-        }
-        parse_spinner.cancel("Cancelled");
-        multi.cancel();
-    } else if let Err(err) = &result {
-        let msg = err.to_string();
-        if let Some(bar) = embed_bar.lock().unwrap().take() {
-            bar.error(format!("Failed: {msg}"));
-        }
-        if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
-            spinner_widget.error(format!("Failed: {msg}"));
-        }
-        parse_spinner.error(format!("Failed: {msg}"));
-        multi.error(&msg);
-    } else {
-        multi.stop();
-    }
+    finalize_progress_ui(&result, &parse_spinner, &embed_spinner, &embed_bar, &multi);
 
     result.context("indexing failed")
 }
