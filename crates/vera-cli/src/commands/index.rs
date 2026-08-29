@@ -120,37 +120,111 @@ pub fn execute(
     }
 
     let multi = cliclack::multi_progress("Indexing...");
-    let spinner = Arc::new(multi.add(cliclack::spinner()));
-    spinner.start("Discovering files...");
-    let embed_bar: Arc<cliclack::ProgressBar> = Arc::new(multi.add(cliclack::progress_bar(0)));
-    let embed_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let parse_spinner = Arc::new(multi.add(cliclack::spinner()));
+    parse_spinner.start("Discovering files...");
 
-    let spinner_ref = Arc::clone(&spinner);
-    let embed_bar_ref = embed_bar.clone();
-    let embed_started_ref = embed_started.clone();
+    // Honest denominator: while parsing is still open, the embedding indicator
+    // is open-ended (count without total / spinner) because cliclack 0.5.6 has
+    // no unset-length API. Once `ParsingDone` arrives we switch to a fixed
+    // total. The pure state machine lives in `vera_core::indexing::progress`.
+    let tracker = Arc::new(std::sync::Mutex::new(
+        vera_core::indexing::progress::HonestProgressTracker::new(),
+    ));
+    let embed_spinner: Arc<std::sync::Mutex<Option<Arc<cliclack::ProgressBar>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let embed_bar: Arc<std::sync::Mutex<Option<Arc<cliclack::ProgressBar>>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
-    let on_progress = move |event: IndexProgress| match event {
-        IndexProgress::DiscoveryDone { file_count } => {
-            spinner_ref.stop(format!("Discovered {file_count} files"));
-            spinner_ref.start("Parsing files...");
-        }
-        IndexProgress::ParsingDone { chunk_count } => {
-            spinner_ref.start(format!("Parsed into {chunk_count} chunks"));
-            spinner_ref.stop(format!("Parsed into {chunk_count} chunks"));
-        }
-        IndexProgress::EmbeddingProgress { done, total } => {
-            embed_bar_ref.set_length(total as u64);
-            if !embed_started_ref.load(std::sync::atomic::Ordering::Relaxed) {
-                embed_started_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                embed_bar_ref.start("Generating embeddings...");
+    let parse_spinner_ref = Arc::clone(&parse_spinner);
+    let tracker_ref = Arc::clone(&tracker);
+    let embed_spinner_ref = Arc::clone(&embed_spinner);
+    let embed_bar_ref = Arc::clone(&embed_bar);
+    let multi_ref = multi.clone();
+
+    let on_progress = move |event: IndexProgress| {
+        // Update the pure tracker and decide what to render.
+        let display = {
+            let mut guard = tracker_ref.lock().unwrap();
+            guard.handle(&event)
+        };
+        match event {
+            IndexProgress::DiscoveryDone { file_count } => {
+                parse_spinner_ref.stop(format!("Discovered {file_count} files"));
+                parse_spinner_ref.start("Parsing files...");
             }
-            embed_bar_ref.set_position(done as u64);
-            embed_bar_ref.set_message(format!("Generating embeddings ({done}/{total})"));
+            IndexProgress::ParsingDone { chunk_count } => {
+                parse_spinner_ref.stop(format!("Parsed into {chunk_count} chunks"));
+                // If we were showing an indeterminate spinner for embeddings,
+                // transition to a determinate bar on the next embedding event.
+                // We stop the spinner here so it does not linger as a separate
+                // line while the bar takes over.
+                if let Some(spinner_widget) = embed_spinner_ref.lock().unwrap().take() {
+                    spinner_widget.stop(format!(
+                        "Parsed into {chunk_count} chunks — finalizing embeddings..."
+                    ));
+                }
+            }
+            IndexProgress::EmbeddingProgress { .. } => {
+                match display {
+                    Some(vera_core::indexing::progress::EmbedDisplay::Indeterminate { done }) => {
+                        let mut guard = embed_spinner_ref.lock().unwrap();
+                        if guard.is_none() {
+                            let w = Arc::new(multi_ref.add(cliclack::spinner()));
+                            w.start(format!("Generating embeddings ({} chunks so far)", done));
+                            *guard = Some(w);
+                        } else if let Some(w) = guard.as_ref() {
+                            w.set_message(format!(
+                                "Generating embeddings ({} chunks so far)",
+                                done
+                            ));
+                        }
+                    }
+                    Some(vera_core::indexing::progress::EmbedDisplay::Determinate {
+                        done,
+                        total,
+                    }) => {
+                        // If an indeterminate spinner is still around (race where
+                        // ParsingDone and first determinate embedding interleave),
+                        // stop it before showing the bar.
+                        if let Some(spinner_widget) = embed_spinner_ref.lock().unwrap().take() {
+                            spinner_widget.stop(format!(
+                                "Parsed into {total} chunks — finalizing embeddings..."
+                            ));
+                        }
+                        let mut guard = embed_bar_ref.lock().unwrap();
+                        if guard.is_none() {
+                            let w = Arc::new(multi_ref.add(cliclack::progress_bar(total as u64)));
+                            w.start(format!("Generating embeddings ({}/{})", done, total));
+                            w.set_position(done as u64);
+                            *guard = Some(w);
+                        } else if let Some(w) = guard.as_ref() {
+                            // Length is fixed on creation; only position/message change.
+                            w.set_position(done as u64);
+                            w.set_message(format!("Generating embeddings ({}/{})", done, total));
+                        }
+                    }
+                    Some(vera_core::indexing::progress::EmbedDisplay::Done { .. }) => {}
+                    None => {}
+                }
+            }
+            IndexProgress::EmbeddingDone { .. } => {
+                if let Some(vera_core::indexing::progress::EmbedDisplay::Done { count }) = display {
+                    if let Some(bar) = embed_bar_ref.lock().unwrap().take() {
+                        bar.stop(format!("Generated {} embeddings", count));
+                    } else if let Some(spinner_widget) = embed_spinner_ref.lock().unwrap().take() {
+                        spinner_widget.stop(format!("Generated {} embeddings", count));
+                    } else {
+                        // No embed widget was ever created (e.g. tiny repo
+                        // with no embedding progress events?); create a
+                        // short-lived bar just to show completion.
+                        let w = multi_ref.add(cliclack::progress_bar(count as u64));
+                        w.start(format!("Generated {} embeddings", count));
+                        w.stop(format!("Generated {} embeddings", count));
+                    }
+                }
+            }
+            IndexProgress::StorageDone => {}
         }
-        IndexProgress::EmbeddingDone { count } => {
-            embed_bar_ref.stop(format!("Generated {count} embeddings"));
-        }
-        IndexProgress::StorageDone => {}
     };
 
     let cancellation = vera_core::CancellationToken::new();
@@ -174,7 +248,33 @@ pub fn execute(
         cancellation,
         "indexing",
     ));
-    multi.stop();
+    // Honest display: cancellation mid-index and mid-run embedding failure are
+    // displayed as cancelled/error states, not a frozen or 100% bar.
+    let is_cancel = result
+        .as_ref()
+        .is_err_and(|err| err.to_string().to_lowercase().contains("cancel"));
+    if is_cancel {
+        if let Some(bar) = embed_bar.lock().unwrap().take() {
+            bar.cancel("Cancelled");
+        }
+        if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
+            spinner_widget.cancel("Cancelled");
+        }
+        parse_spinner.cancel("Cancelled");
+        multi.cancel();
+    } else if let Err(err) = &result {
+        let msg = err.to_string();
+        if let Some(bar) = embed_bar.lock().unwrap().take() {
+            bar.error(format!("Failed: {msg}"));
+        }
+        if let Some(spinner_widget) = embed_spinner.lock().unwrap().take() {
+            spinner_widget.error(format!("Failed: {msg}"));
+        }
+        parse_spinner.error(format!("Failed: {msg}"));
+        multi.error(&msg);
+    } else {
+        multi.stop();
+    }
 
     result.context("indexing failed")
 }

@@ -9,6 +9,7 @@
 pub mod freshness;
 pub mod lock;
 pub mod pipeline;
+pub mod progress;
 pub mod update;
 
 pub use freshness::{IndexFreshness, detect_staleness};
