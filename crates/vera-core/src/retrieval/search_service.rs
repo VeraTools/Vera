@@ -278,7 +278,26 @@ impl SearchContext {
 
         // Profiling: docs/197-profiling.md — three `get_index_meta` reads per
         // query cost ~0.45 ms warm p50, served from stamp-guarded cache.
-        let index_meta = stores.cached_index_meta().ok();
+        // Propagate cache errors to BM25-only rather than silently skipping
+        // compatibility checks (vector space mismatch would otherwise be missed).
+        let index_meta = match stores.cached_index_meta() {
+            Ok(meta) => Some(meta),
+            Err(err) => {
+                warn!(
+                    "failed to read index meta ({}), using BM25-only search",
+                    err
+                );
+                return run_bm25_only(
+                    query,
+                    filters,
+                    fetch_limit,
+                    result_limit,
+                    total_start,
+                    &stores,
+                    config,
+                );
+            }
+        };
         if let Some((Some(s_model), Some(s_dim), s_prefix)) = index_meta {
             if let Some(model_name) = self.model_name.as_deref()
                 && !crate::config::model_names_match_with_aliases(
