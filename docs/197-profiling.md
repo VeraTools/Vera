@@ -25,10 +25,10 @@ Source: issue #197 body + comment `2528f2e` warm measurements + local synthetic 
 
 ## Implemented bounded latency wins (staleness-safe)
 
-Index meta cache and LRU are bounded (stamp-guarded and LRU-capped) and re-verify freshness on every query; BM25 head batch is bounded by its 900 page limit and preserves BM25 order. All build on the `383d21f` baseline (capped reads + cycle-keyed RST) and do not weaken it.
+Index meta cache and LRU are bounded (stamp-guarded and LRU-capped) and re-verify freshness on every query; BM25 head-batch is bounded by its 900 page limit and preserves BM25 order. All build on the `383d21f` baseline (capped reads + cycle-keyed RST) and do not weaken it.
 
 1. **Cache index meta against `MetadataDbStamp`:** same stamp as `indexed_files`; avoids 3 SQLite reads per warm query (~0.45 ms). Cited by meta-cache change.
-2. **Batch BM25 head hydration:** as described in Cache-miss / hydration round-trip summary, the head is now batched (single call when head <=900, which covers typical limit 10 to 20, paged otherwise) preserving order. Cited by BM25 batch change.
+2. **Batch BM25 head hydration:** as described in Cache-miss / hydration round-trip summary. Cited by BM25 batch change.
 3. **Bounded multi-repo resident store:** `SearchContext` now caches up to 4 `SearchStores` via LRU (previously exactly one `Option`). Cross-repo agent sessions (for example querying 4 repos round-robin) paid open cost per switch (~5 to 10 ms: Bm25Index open + MetadataStore open + VectorStore open). LRU of 4 keeps hot repos resident while capping memory (4x mmap handles, 4x BM25 readers). Eviction is LRU, stamp-checked for freshness via `open_stamp`. Cited by LRU change.
 
 ## Methodology notes
