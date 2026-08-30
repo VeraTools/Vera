@@ -113,34 +113,43 @@ fn search_bm25_with_stores_inner(
 
     let mut results = Vec::with_capacity(limit.min(bm25_results.len()));
 
-    // The first `limit` candidates hydrate one row at a time through the
-    // cached single-row statement: when every candidate passes (the common
-    // case, especially unfiltered) this is the cheapest possible path and
-    // fetches nothing that goes unused. If the head falls short (filter
-    // rejection or missing metadata), the remaining pool hydrates in paged
-    // batches, amortizing SQLite round trips over the long rejection tail.
+    // Profiling (`docs/197-profiling.md`): the head originally did N
+    // single-row `get_chunk` round trips (up to `limit` per query). Batching
+    // the head into one `get_chunks_by_ids` call collapses N round trips to
+    // ~1, mirroring the vector path. Tail already paged; kept as-is.
     let (head, tail) = bm25_results.split_at(limit.min(bm25_results.len()));
-    for bm25_result in head {
-        let Some(chunk) = metadata_store
-            .get_chunk(&bm25_result.chunk_id)
-            .with_context(|| {
+    if !head.is_empty() {
+        // Batch head hydration: one round trip instead of N. Chunk ids are
+        // capped at `limit` (typically <=20), so a single batch suffices, but
+        // page at 900 to remain safe for large limits.
+        let mut head_by_id = std::collections::HashMap::new();
+        for page in head.chunks(BM25_HYDRATION_PAGE_MAX) {
+            let ids: Vec<String> = page
+                .iter()
+                .map(|bm25_result| bm25_result.chunk_id.clone())
+                .collect();
+            let page_map = metadata_store.get_chunks_by_ids(&ids).with_context(|| {
                 format!(
-                    "failed to fetch metadata for chunk: {}",
-                    bm25_result.chunk_id
+                    "failed to fetch metadata for {} BM25 head candidates",
+                    ids.len()
                 )
-            })?
-        else {
-            debug!(
-                chunk_id = %bm25_result.chunk_id,
-                "chunk metadata not found, skipping"
-            );
-            continue;
-        };
-        let result = chunk.into_search_result(f64::from(bm25_result.score));
-        if filters.is_some_and(|filters| !filters.matches(&result)) {
-            continue;
+            })?;
+            head_by_id.extend(page_map);
         }
-        results.push(result);
+        for bm25_result in head {
+            let Some(chunk) = head_by_id.remove(&bm25_result.chunk_id) else {
+                debug!(
+                    chunk_id = %bm25_result.chunk_id,
+                    "chunk metadata not found, skipping"
+                );
+                continue;
+            };
+            let result = chunk.into_search_result(f64::from(bm25_result.score));
+            if filters.is_some_and(|filters| !filters.matches(&result)) {
+                continue;
+            }
+            results.push(result);
+        }
     }
 
     if results.len() < limit && !tail.is_empty() {

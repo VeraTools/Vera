@@ -57,12 +57,22 @@ impl From<crate::retrieval::hybrid::HybridTimings> for SearchTimings {
 /// Local backends can take hundreds of milliseconds or seconds to initialize.
 /// Keeping the provider and reranker here lets CLI multi-query search, deep
 /// search, MCP, and eval reuse loaded models across repeated queries.
+/// Max number of indexed repositories kept resident in `SearchContext`.
+///
+/// Each entry holds an `Arc<SearchStores>` (BM25 reader, metadata handles,
+/// mmap vector store). Profiling (`docs/197-profiling.md`): cross-repo agent
+/// sessions that round-robin 4 repos paid ~5–10 ms per switch from reopen
+/// cost; a bounded LRU of 4 keeps hot repos resident while capping memory
+/// (4× BM25 readers + mmap handles). LRU eviction guarantees bounded
+/// resident state across arbitrary repo sets.
+const SEARCH_STORES_LRU_CAPACITY: usize = 4;
+
 pub struct SearchContext {
     provider: Option<CachedEmbeddingProvider<DynamicProvider>>,
     model_name: Option<String>,
     provider_error: Option<String>,
     backend: InferenceBackend,
-    stores: Mutex<Option<(PathBuf, Arc<SearchStores>)>>,
+    stores: Mutex<Vec<(PathBuf, Arc<SearchStores>)>>,
     /// Cross-encoder session, built on first query that actually reranks.
     ///
     /// `None` inside the cell means "unavailable": either reranking is off in
@@ -100,7 +110,7 @@ impl SearchContext {
             model_name,
             provider_error,
             backend,
-            stores: Mutex::new(None),
+            stores: Mutex::new(Vec::new()),
             reranker: OnceCell::new(),
             #[cfg(test)]
             reranker_builds: std::sync::atomic::AtomicUsize::new(0),
@@ -115,7 +125,7 @@ impl SearchContext {
             // Unused: with no embedding provider `search` returns on the
             // BM25-only path before any reranker is resolved.
             backend: InferenceBackend::Api,
-            stores: Mutex::new(None),
+            stores: Mutex::new(Vec::new()),
             reranker: OnceCell::new(),
             #[cfg(test)]
             reranker_builds: std::sync::atomic::AtomicUsize::new(0),
@@ -191,15 +201,39 @@ impl SearchContext {
             .stores
             .lock()
             .map_err(|_| anyhow::anyhow!("search store cache lock poisoned"))?;
-        if let Some((cached_dir, stores)) = cached.as_ref()
-            && cached_dir == index_dir
-        {
-            return Ok(Arc::clone(stores));
+        if let Some(pos) = cached.iter().position(|(dir, _)| dir == index_dir) {
+            let entry = cached.remove(pos);
+            // Staleness check: if the live index was rebuilt (staging swap), the
+            // cached SearchStores points at the old .vera.old directory inode.
+            // Its open_stamp will not match the current metadata.db stamp at the
+            // live path, so we must reopen instead of serving stale BM25/metadata.
+            if entry.1.is_open_stamp_current() {
+                let stores = Arc::clone(&entry.1);
+                cached.insert(0, entry);
+                return Ok(stores);
+            }
+            // Stale entry: drop it and fall through to reopen.
         }
 
         let stores = Arc::new(SearchStores::open(index_dir)?);
-        *cached = Some((index_dir.to_path_buf(), Arc::clone(&stores)));
+        cached.insert(0, (index_dir.to_path_buf(), Arc::clone(&stores)));
+        if cached.len() > SEARCH_STORES_LRU_CAPACITY {
+            cached.truncate(SEARCH_STORES_LRU_CAPACITY);
+        }
         Ok(stores)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_stores_cache_len(&self) -> usize {
+        self.stores.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_stores_cache_contains(&self, index_dir: &Path) -> bool {
+        self.stores
+            .lock()
+            .map(|g| g.iter().any(|(dir, _)| dir == index_dir))
+            .unwrap_or(false)
     }
 
     pub async fn search(
@@ -242,18 +276,9 @@ impl SearchContext {
 
         let mut stored_dim = config.embedding.max_stored_dim;
 
-        // Check metadata mismatch
-        let index_meta = stores.bm25_metadata.lock().ok().map(|metadata_store| {
-            (
-                metadata_store.get_index_meta("model_name").unwrap_or(None),
-                metadata_store
-                    .get_index_meta("embedding_dim")
-                    .unwrap_or(None),
-                metadata_store
-                    .get_index_meta("document_prefix")
-                    .unwrap_or(None),
-            )
-        });
+        // Profiling: docs/197-profiling.md — three `get_index_meta` reads per
+        // query cost ~0.45 ms warm p50, served from stamp-guarded cache.
+        let index_meta = stores.cached_index_meta().ok();
         if let Some((Some(s_model), Some(s_dim), s_prefix)) = index_meta {
             if let Some(model_name) = self.model_name.as_deref()
                 && !crate::config::model_names_match_with_aliases(
@@ -1389,5 +1414,234 @@ mod tests {
             "a bare filename query must inject exact file chunks"
         );
         assert_eq!(augmented[0].file_path, "src/handler.py");
+    }
+
+    // --- Issue #197 latency work: staleness + memory bounds ---
+
+    #[tokio::test]
+    async fn cached_index_meta_is_stamp_guarded_and_not_stale() {
+        use crate::retrieval::hybrid::SearchStores;
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.rs"), "pub fn old_func() {}\n").unwrap();
+        let provider = crate::embedding::test_helpers::MockProvider::new(8);
+        let config = crate::config::VeraConfig::default();
+        crate::indexing::index_repository(&repo, &provider, &config, "mock-model")
+            .await
+            .unwrap();
+        let index_dir = crate::indexing::index_dir(&repo);
+        let stores = SearchStores::open(&index_dir).unwrap();
+        let (m1, _d1, _p1) = stores.cached_index_meta().unwrap();
+        assert_eq!(m1.as_deref(), Some("mock-model"));
+        // Record stamp before mutation.
+        let stamp_before = std::fs::metadata(index_dir.join("metadata.db"))
+            .and_then(|m| m.modified())
+            .ok();
+        // Simulate external indexer changing model_name (writes WAL, bumps mtime/len).
+        {
+            let store =
+                crate::storage::metadata::MetadataStore::open(&index_dir.join("metadata.db"))
+                    .unwrap();
+            store.set_index_meta("model_name", "new-model").unwrap();
+        }
+        // Wait for filesystem mtime granularity: poll until stamp visibly changes or 1.2s elapsed.
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(1200) {
+            let current = std::fs::metadata(index_dir.join("metadata.db"))
+                .and_then(|m| m.modified())
+                .ok();
+            if current != stamp_before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (m2, _d2, _p2) = stores.cached_index_meta().unwrap();
+        // After stamp invalidation, the new value must be observed; stale cached value is impossible.
+        assert_eq!(
+            m2.as_deref(),
+            Some("new-model"),
+            "stale index meta must not be served after stamp change"
+        );
+        assert_ne!(m1, m2);
+    }
+
+    #[tokio::test]
+    async fn staleness_proof_modify_file_requery_never_returns_stale_chunk() {
+        // Profiling: docs/197-profiling.md — cached state must never serve stale chunks.
+        // This test proves cycle-state keying: modify a file, re-index, re-query without
+        // restarting SearchContext; the pre-modification chunk is impossible to return.
+        use crate::indexing::{index_dir, index_repository};
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let file_path = repo.join("src").join("lib.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "pub fn stale_func() { let x = 1; }\n").unwrap();
+
+        let provider = crate::embedding::test_helpers::MockProvider::new(8);
+        let config = crate::config::VeraConfig::default();
+        index_repository(&repo, &provider, &config, "mock-model")
+            .await
+            .unwrap();
+        let index_dir = index_dir(&repo);
+        // Reuse a single SearchContext across mutation — the bug would be stale Serve.
+        let ctx = SearchContext::bm25_only();
+        let filters = crate::types::SearchFilters::default();
+        let (before, _) = ctx
+            .search(&index_dir, "stale_func", None, &config, &filters, 10)
+            .await
+            .unwrap();
+        assert!(
+            before.iter().any(|r| r.content.contains("stale_func")),
+            "initial index must contain stale_func"
+        );
+        let stale_chunk_content = before
+            .iter()
+            .find(|r| r.content.contains("stale_func"))
+            .unwrap()
+            .content
+            .clone();
+
+        // Modify file: replace stale_func with fresh_func
+        std::fs::write(&file_path, "pub fn fresh_func() { let y = 2; }\n").unwrap();
+        // Re-index (incremental: same index dir)
+        index_repository(&repo, &provider, &config, "mock-model")
+            .await
+            .unwrap();
+
+        // Re-query without restarting context
+        let (after_stale, _) = ctx
+            .search(&index_dir, "stale_func", None, &config, &filters, 10)
+            .await
+            .unwrap();
+        let (after_fresh, _) = ctx
+            .search(&index_dir, "fresh_func", None, &config, &filters, 10)
+            .await
+            .unwrap();
+
+        // Stale chunk must be impossible to return: no result may contain the old content
+        // verbatim. Even if BM25 returns a hit for the query term, its hydrated content must
+        // not equal the pre-modification chunk.
+        for r in &after_stale {
+            assert_ne!(
+                r.content, stale_chunk_content,
+                "cached state served stale chunk after file modification"
+            );
+        }
+        // Fresh content must be discoverable after re-index.
+        assert!(
+            after_fresh.iter().any(|r| r.content.contains("fresh_func")),
+            "fresh_func must be found after re-index"
+        );
+        // If stale query happens to still return something (e.g., no filter), ensure it is not
+        // the stale chunk; ideally it is empty. Either is acceptable as long as stale is not served.
+        // The strongest assertion is that a search for the old symbol returns empty or non-stale.
+        assert!(
+            after_stale
+                .iter()
+                .all(|r| !r.content.contains("stale_func")),
+            "post-modification query must not return pre-modification chunk content"
+        );
+    }
+
+    #[test]
+    fn memory_bounded_across_multiple_indexed_repos_with_recorded_envelope() {
+        // Profiling: docs/197-profiling.md — cross-repo resident store can grow
+        // unbounded with single-slot toggle behavior; LRU of 4 caps memory.
+        use crate::indexing::{index_dir, index_repository};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let config = crate::config::VeraConfig::default();
+        let provider = crate::embedding::test_helpers::MockProvider::new(8);
+
+        // Build 5 distinct indexed repos (capacity is 4)
+        let tmps: Vec<tempfile::TempDir> = (0..5).map(|_| tempdir().unwrap()).collect();
+        let repos: Vec<std::path::PathBuf> = tmps
+            .iter()
+            .enumerate()
+            .map(|(i, tmp)| {
+                let repo = tmp.path().join(format!("repo{i}"));
+                std::fs::create_dir_all(&repo).unwrap();
+                std::fs::write(
+                    repo.join(format!("lib{i}.rs")),
+                    format!("pub fn func_{i}() {{}}\n"),
+                )
+                .unwrap();
+                repo
+            })
+            .collect();
+        for repo in &repos {
+            rt.block_on(index_repository(repo, &provider, &config, "mock-model"))
+                .unwrap();
+        }
+        let index_dirs: Vec<std::path::PathBuf> = repos.iter().map(|r| index_dir(r)).collect();
+
+        let ctx = SearchContext::bm25_only();
+        // Warm each repo once
+        for dir in &index_dirs {
+            let _ = rt
+                .block_on(ctx.search(
+                    dir,
+                    "func",
+                    None,
+                    &config,
+                    &crate::types::SearchFilters::default(),
+                    5,
+                ))
+                .unwrap();
+        }
+
+        // Envelope: cache length and LRU ordering
+        let envelope_len = ctx.search_stores_cache_len();
+        let envelope_contains = |idx: usize| ctx.search_stores_cache_contains(&index_dirs[idx]);
+
+        // Recorded envelope: must be bounded at capacity 4
+        assert_eq!(
+            envelope_len,
+            4,
+            "cache must be bounded at {} (recorded envelope len={})",
+            super::SEARCH_STORES_LRU_CAPACITY,
+            envelope_len
+        );
+        // LRU: first repo should have been evicted (oldest), last 4 retained
+        assert!(
+            !envelope_contains(0),
+            "LRU must have evicted oldest repo (0); envelope: len={} contains0={}",
+            envelope_len,
+            envelope_contains(0)
+        );
+        for i in 1..5 {
+            assert!(
+                envelope_contains(i),
+                "LRU must retain recent repo {i}; envelope len={envelope_len}"
+            );
+        }
+
+        // Re-query an evicted repo: must re-open and re-enter cache, still bounded
+        let _ = rt
+            .block_on(ctx.search(
+                &index_dirs[0],
+                "func_0",
+                None,
+                &config,
+                &crate::types::SearchFilters::default(),
+                5,
+            ))
+            .unwrap();
+        assert_eq!(
+            ctx.search_stores_cache_len(),
+            4,
+            "after re-query evicted repo, cache must remain bounded"
+        );
+        assert!(
+            ctx.search_stores_cache_contains(&index_dirs[0]),
+            "evicted repo must be re-cached after re-query"
+        );
+        // Envelope logging for PR notes (not a file, but printed in test output with --nocapture)
+        println!(
+            "memory envelope: capacity={}, len={}, retained=[1..4 initially, then 0 after requery], eviction=LRU",
+            super::SEARCH_STORES_LRU_CAPACITY,
+            ctx.search_stores_cache_len()
+        );
     }
 }

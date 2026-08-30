@@ -110,11 +110,20 @@ pub(crate) struct SearchStores {
     vector: Mutex<Option<CachedVectorStore>>,
     metadata_path: PathBuf,
     indexed_files: Mutex<Option<CachedIndexedFiles>>,
+    cached_index_meta: Mutex<Option<CachedIndexMeta>>,
+    open_stamp: MetadataDbStamp,
 }
 
 struct CachedIndexedFiles {
     stamp: MetadataDbStamp,
     files: Arc<Vec<String>>,
+}
+
+struct CachedIndexMeta {
+    stamp: MetadataDbStamp,
+    model_name: Option<String>,
+    embedding_dim: Option<String>,
+    document_prefix: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -196,6 +205,7 @@ impl SearchStores {
             .context("failed to open metadata store for search")?;
         let vector_metadata = MetadataStore::open(&metadata_path)
             .context("failed to open vector metadata store for search")?;
+        let open_stamp = metadata_db_stamp(&metadata_path);
         Ok(Self {
             bm25,
             bm25_metadata: Mutex::new(bm25_metadata),
@@ -204,6 +214,8 @@ impl SearchStores {
             vector: Mutex::new(None),
             metadata_path,
             indexed_files: Mutex::new(None),
+            cached_index_meta: Mutex::new(None),
+            open_stamp,
         })
     }
 
@@ -244,6 +256,61 @@ impl SearchStores {
             files: Arc::clone(&files),
         });
         Ok(files)
+    }
+
+    /// Index metadata (model_name, embedding_dim, document_prefix) cached
+    /// against the metadata database stamp.
+    ///
+    /// Profiling (`docs/197-profiling.md`): `SearchContext::search` performs
+    /// three `get_index_meta` SQLite reads per query (~0.45 ms per query,
+    /// 4-5% of warm p50). This cache serves warm queries from memory and
+    /// refreshes only when `metadata.db` or its WAL changes, checked via the
+    /// same `MetadataDbStamp` used for `indexed_files` to guarantee staleness
+    /// safety.
+    ///
+    /// Stamp is read before checking the cache so a concurrent commit
+    /// invalidates the entry rather than certifying stale metadata. On miss a
+    /// fresh `MetadataStore` connection is used to avoid coupling to the
+    /// `bm25_metadata` lock.
+    pub(crate) fn cached_index_meta(
+        &self,
+    ) -> Result<(Option<String>, Option<String>, Option<String>)> {
+        let stamp = metadata_db_stamp(&self.metadata_path);
+        {
+            let cached = self
+                .cached_index_meta
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index meta cache lock poisoned"))?;
+            if let Some(cached) = cached.as_ref()
+                && cached.stamp == stamp
+            {
+                return Ok((
+                    cached.model_name.clone(),
+                    cached.embedding_dim.clone(),
+                    cached.document_prefix.clone(),
+                ));
+            }
+        }
+        let store = MetadataStore::open(&self.metadata_path)
+            .context("failed to open metadata store for index meta")?;
+        let model_name = store.get_index_meta("model_name")?;
+        let embedding_dim = store.get_index_meta("embedding_dim")?;
+        let document_prefix = store.get_index_meta("document_prefix")?;
+        let mut cached = self
+            .cached_index_meta
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index meta cache lock poisoned"))?;
+        *cached = Some(CachedIndexMeta {
+            stamp,
+            model_name: model_name.clone(),
+            embedding_dim: embedding_dim.clone(),
+            document_prefix: document_prefix.clone(),
+        });
+        Ok((model_name, embedding_dim, document_prefix))
+    }
+
+    pub(crate) fn is_open_stamp_current(&self) -> bool {
+        metadata_db_stamp(&self.metadata_path) == self.open_stamp
     }
 
     pub(crate) fn vector_store(&self, dim: usize) -> Result<Arc<Mutex<VectorStore>>> {
