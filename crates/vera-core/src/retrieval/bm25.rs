@@ -116,7 +116,10 @@ fn search_bm25_with_stores_inner(
     // Profiling (`docs/197-profiling.md`): the head originally did N
     // single-row `get_chunk` round trips (up to `limit` per query). Batching
     // the head into one `get_chunks_by_ids` call collapses N round trips to
-    // ~1, mirroring the vector path. Tail already paged; kept as-is.
+    // 1 when head <=900 (typical limit 10 to 20, paged otherwise),
+    // mirroring the vector path. Rank unchanged (same chunks, same order),
+    // validated by `paged_hydration_matches_unfiltered_manual_filtering_across_pages`.
+    // Tail already paged; kept as-is.
     let (head, tail) = bm25_results.split_at(limit.min(bm25_results.len()));
     if !head.is_empty() {
         // Batch head hydration: one round trip instead of N. Chunk ids are

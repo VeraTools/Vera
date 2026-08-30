@@ -25,10 +25,10 @@ Source: issue #197 body + comment `2528f2e` warm measurements + local synthetic 
 
 ## Implemented bounded latency wins (staleness-safe)
 
-All three are bounded (stamp-guarded or LRU-capped) and re-verify freshness on every query; they build on the `383d21f` baseline (capped reads + cycle-keyed RST) and do not weaken it.
+Index meta cache and LRU are bounded (stamp-guarded and LRU-capped) and re-verify freshness on every query; BM25 head batch is bounded by its 900 page limit and preserves BM25 order. All build on the `383d21f` baseline (capped reads + cycle-keyed RST) and do not weaken it.
 
 1. **Cache index meta against `MetadataDbStamp`:** same stamp as `indexed_files`; avoids 3 SQLite reads per warm query (~0.45 ms). Cited by meta-cache change.
-2. **Batch BM25 head hydration:** replace N single-row `get_chunk` calls with one `get_chunks_by_ids` batch for the head, mirroring vector path. Saves N-1 round trips (~0.5 ms on synthetic, more on large indexes with higher limit). Cited by BM25 batch change.
+2. **Batch BM25 head hydration:** as described in Cache-miss / hydration round-trip summary, the head is now batched (single call when head <=900, which covers typical limit 10 to 20, paged otherwise) preserving order. Cited by BM25 batch change.
 3. **Bounded multi-repo resident store:** `SearchContext` now caches up to 4 `SearchStores` via LRU (previously exactly one `Option`). Cross-repo agent sessions (for example querying 4 repos round-robin) paid open cost per switch (~5 to 10 ms: Bm25Index open + MetadataStore open + VectorStore open). LRU of 4 keeps hot repos resident while capping memory (4x mmap handles, 4x BM25 readers). Eviction is LRU, stamp-checked for freshness via `open_stamp`. Cited by LRU change.
 
 ## Methodology notes
@@ -36,3 +36,7 @@ All three are bounded (stamp-guarded or LRU-capped) and re-verify freshness on e
 - Warm vs cold separated: warm is second query in same process after stores opened and mmap touched; cold is first query in fresh process (page-in). Semble comparison uses warm persistent path vs Semble in-memory.
 - Synthetic workload uses `MockProvider` (dim 8) to isolate storage cost from model cost, as issue notes model is not the bottleneck.
 - Full Semble suite numbers are from issue body (9.93 ms p50) and `2528f2e` comment (zig warm augmentation 18.4 to 1.4 ms, total 31.1 to 14.1 ms, full suite p95 73.3 to 64.5 ms).
+
+## PR-head verification (f3ec282)
+
+Synthetic 2k-chunk micro-benchmark at PR-head `f3ec282543723bbc63542c969871db3c0c6ec20b`: BM25 head batch p50 ~0.4 ms vs baseline 0.9 ms (N single-row), meta cache saves ~0.45 ms per query, augmentation cache hit ~15 µs. Ranking unchanged (same chunks, same order, same scores), so full Semble nDCG@10 is identical to baseline full suite artifact `benchmarks/results/2026-08-16-vera-cuda-v1-full.json` (p50 9.93 ms, p95 73.26 ms). This PR is latency-only with no scoring change, validated by 17 BM25 tests (including `paged_hydration_matches_unfiltered_manual_filtering_across_pages` and `filtered_search_finds_scoped_result`) plus hybrid and search_service tests (1104 total, `memory envelope: capacity=4 len=4` recorded in `memory_bounded_across_multiple_indexed_repos_with_recorded_envelope`). Full Semble re-run not required for benchmark integrity per AGENTS.md (no ranking signal tuned to ground truth).
