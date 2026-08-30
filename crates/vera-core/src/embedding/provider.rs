@@ -911,6 +911,8 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         && !lower.contains("too large to process")
         && !lower.contains("max allowed tokens per submitted batch")
         && !lower.contains("maximum input length")
+        && !lower.contains("exceeds model maximum")
+        && !lower.contains("input length")
     {
         return None;
     }
@@ -923,6 +925,8 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
     static MAX_BATCH_TOKENS_RE: OnceLock<Regex> = OnceLock::new();
     static BATCH_TOKENS_RE: OnceLock<Regex> = OnceLock::new();
     static MAX_INPUT_LENGTH_RE: OnceLock<Regex> = OnceLock::new();
+    static MODEL_MAXIMUM_RE: OnceLock<Regex> = OnceLock::new();
+    static INPUT_LENGTH_RE: OnceLock<Regex> = OnceLock::new();
     let n_ctx_re = N_CTX_RE.get_or_init(|| Regex::new(r#""n_ctx"\s*:\s*(\d+)"#).unwrap());
     let max_context_re =
         MAX_CONTEXT_RE.get_or_init(|| Regex::new(r"max context size \((\d+)").unwrap());
@@ -938,6 +942,10 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
     // OpenAI: `Invalid 'input[3]': maximum input length is 8192 tokens.`
     let max_input_length_re =
         MAX_INPUT_LENGTH_RE.get_or_init(|| Regex::new(r"maximum input length is (\d+)").unwrap());
+    let model_maximum_re =
+        MODEL_MAXIMUM_RE.get_or_init(|| Regex::new(r"model maximum (\d+)").unwrap());
+    let input_length_re =
+        INPUT_LENGTH_RE.get_or_init(|| Regex::new(r"input length (\d+)").unwrap());
 
     let max_tokens = n_ctx_re
         .captures(&lower)
@@ -954,6 +962,11 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
                 .captures(&lower)
                 .and_then(|caps| caps.get(1))
         })
+        .or_else(|| {
+            model_maximum_re
+                .captures(&lower)
+                .and_then(|caps| caps.get(1))
+        })
         .and_then(|capture| capture.as_str().parse::<usize>().ok())
         .or(Some(8192))?;
 
@@ -967,6 +980,11 @@ fn context_size_info(error: &EmbeddingError) -> Option<ContextSizeInfo> {
         })
         .or_else(|| {
             batch_tokens_re
+                .captures(&lower)
+                .and_then(|caps| caps.get(1))
+        })
+        .or_else(|| {
+            input_length_re
                 .captures(&lower)
                 .and_then(|caps| caps.get(1))
         })
