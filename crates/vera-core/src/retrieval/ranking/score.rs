@@ -1,6 +1,7 @@
 //! Prior scoring and result-shaping heuristics.
 
 use crate::chunk_text::file_name;
+use crate::config::{RetrievalConfig, VeraConfig};
 use crate::corpus::{ContentClass, classify_content};
 use crate::retrieval::query_classifier::QueryType;
 use crate::retrieval::query_utils::{
@@ -86,11 +87,28 @@ pub(super) const CONTENT_SYMBOL_WEIGHT_EMBEDDED: f64 = 1.5;
 /// Content-definition weight for identifier queries.
 pub(super) const CONTENT_SYMBOL_WEIGHT_IDENT: f64 = 3.0;
 
+#[allow(dead_code)]
 pub(super) fn score_prior(
     features: &QueryFeatures,
     result: &SearchResult,
     stage: RankingStage,
     filters: &SearchFilters,
+) -> f64 {
+    score_prior_with_config(
+        features,
+        result,
+        stage,
+        filters,
+        &VeraConfig::default().retrieval,
+    )
+}
+
+pub(super) fn score_prior_with_config(
+    features: &QueryFeatures,
+    result: &SearchResult,
+    stage: RankingStage,
+    filters: &SearchFilters,
+    retrieval_config: &RetrievalConfig,
 ) -> f64 {
     let stage_weight = match stage {
         RankingStage::Initial => 1.0,
@@ -234,7 +252,9 @@ pub(super) fn score_prior(
     // query keywords. Definitions are the canonical location for a concept;
     // they should strongly outrank incidental mentions. Use a weaker boost
     // for broad multi-keyword queries where the symbol match is partial.
-    if features.query_type == QueryType::NaturalLanguage
+    // Gated by ranking_definition_boost (issue #196 signal).
+    if retrieval_config.ranking_definition_boost_enabled()
+        && features.query_type == QueryType::NaturalLanguage
         && is_definition_symbol(result.symbol_type)
         && result.symbol_name.is_some()
         && let Some(symbol_name) = result.symbol_name.as_deref()
@@ -279,8 +299,9 @@ pub(super) fn score_prior(
     // boost it. This catches cases where symbol_type metadata is missing
     // or too coarse. Skip when the user wants non-source content.
     // Use a mild boost; the metadata-based definition boost above handles
-    // strong signals.
-    if features.query_type == QueryType::NaturalLanguage
+    // strong signals. Gated by ranking_definition_boost.
+    if retrieval_config.ranking_definition_boost_enabled()
+        && features.query_type == QueryType::NaturalLanguage
         && !features.keywords.is_empty()
         && !features.wants_runtime_paths
         && !features.wants_config_paths

@@ -1,5 +1,6 @@
 use super::score::*;
 use super::*;
+use crate::config::VeraConfig;
 use crate::types::SymbolType;
 
 fn make_result(
@@ -677,4 +678,142 @@ fn path_weighted_query_requires_path_shaped_token() {
     // Config-filename mentions keep the existing substring behavior.
     assert!(is_path_weighted_query("config.toml loading"));
     assert!(is_path_weighted_query("dockerfile setup"));
+}
+
+// ——— Issue #196: toggleable ranking signals ———
+#[test]
+fn filename_stem_boost_is_toggleable() {
+    // Two files with identical neutral content and symbols so only the
+    // filename stem distinguishes them. The second file's path matches the
+    // query keyword "rendering"; with the boost enabled it must outrank the
+    // base leader, with it disabled the input order must hold.
+    let neutral = "pub fn helper() {}";
+    let results = vec![
+        make_result(
+            "src/auth/middleware.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            neutral,
+        ),
+        make_result(
+            "src/rendering/engine.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            neutral,
+        ),
+    ];
+
+    let ranked_enabled = apply_query_ranking_with_filters_and_config(
+        "rendering engine pipeline",
+        results.clone(),
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &VeraConfig::default(),
+    );
+    assert_eq!(
+        ranked_enabled[0].file_path, "src/rendering/engine.rs",
+        "filename-stem boost should promote rendering/engine.rs when enabled"
+    );
+
+    let mut disabled = VeraConfig::default();
+    disabled.retrieval.ranking_filename_stem_boost = false;
+    let ranked_disabled = apply_query_ranking_with_filters_and_config(
+        "rendering engine pipeline",
+        results,
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &disabled,
+    );
+    assert_eq!(
+        ranked_disabled[0].file_path, "src/auth/middleware.rs",
+        "with filename-stem boost disabled, stem match must not overturn base rank"
+    );
+}
+
+#[test]
+fn definition_boost_is_toggleable() {
+    // Two source files, both non-test, neither blocked. The second file's
+    // content defines the queried symbol `CliRunner` while the first does
+    // not. With the definition boost enabled the second file must win;
+    // disabled, base rank (first) must hold.
+    let results = vec![
+        make_result(
+            "src/click/core.py",
+            Some("Command"),
+            Some(SymbolType::Class),
+            "class Command:\n    def invoke(self): ...",
+        ),
+        make_result(
+            "src/click/testing.py",
+            None,
+            None,
+            "class CliRunner:\n    def invoke(self, cli): ...",
+        ),
+    ];
+
+    let enabled = apply_query_ranking_with_filters_and_config(
+        "CliRunner",
+        results.clone(),
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &VeraConfig::default(),
+    );
+    assert_eq!(
+        enabled[0].file_path, "src/click/testing.py",
+        "definition boost should promote the CliRunner definition site when enabled"
+    );
+
+    let mut disabled = VeraConfig::default();
+    disabled.retrieval.ranking_definition_boost = false;
+    let disabled_ranked = apply_query_ranking_with_filters_and_config(
+        "CliRunner",
+        results,
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &disabled,
+    );
+    assert_eq!(
+        disabled_ranked[0].file_path, "src/click/core.py",
+        "with definition boost disabled, content definition must not overturn base rank"
+    );
+}
+
+#[test]
+fn file_coherence_boost_survives_definition_flag_toggle() {
+    // Coherence boost is independent of definition boost: repeated-file
+    // promotion must still work when the definition flag is off.
+    let results = vec![
+        make_result(
+            "src/misc.rs",
+            Some("misc"),
+            Some(SymbolType::Function),
+            "pub fn misc() {}",
+        ),
+        make_result(
+            "src/auth/session.rs",
+            Some("renewSession"),
+            Some(SymbolType::Function),
+            "pub fn renew_session() {}",
+        ),
+        make_result(
+            "src/auth/session.rs",
+            Some("validateSession"),
+            Some(SymbolType::Function),
+            "pub fn validate_session() {}",
+        ),
+    ];
+
+    let mut disabled = VeraConfig::default();
+    disabled.retrieval.ranking_definition_boost = false;
+    let ranked = apply_query_ranking_with_filters_and_config(
+        "session renewal and validation flow",
+        results,
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &disabled,
+    );
+    assert_eq!(
+        ranked[0].file_path, "src/auth/session.rs",
+        "coherence boost must still promote repeated file even with definition boost off"
+    );
 }

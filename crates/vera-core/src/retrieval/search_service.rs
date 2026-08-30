@@ -15,7 +15,7 @@ use tracing::warn;
 use crate::config::{InferenceBackend, VeraConfig};
 use crate::embedding::{CachedEmbeddingProvider, DynamicProvider, EmbeddingProvider};
 use crate::retrieval::dynamic_reranker::DynamicReranker;
-use crate::retrieval::exact_matches::augment_exact_match_candidates_with_store;
+use crate::retrieval::exact_matches::augment_exact_match_candidates_with_store_and_config;
 pub use crate::retrieval::exact_matches::augment_multi_query_exact_matches;
 use crate::retrieval::hybrid::{
     SearchStores, compute_vector_candidates, search_hybrid_reranked_with_stores,
@@ -219,7 +219,7 @@ impl SearchContext {
         let vector_query = build_query_with_intent(query, intent);
         // True when an intent prefix was actually applied (non-empty intent).
         let has_intent = matches!(vector_query, std::borrow::Cow::Owned(_));
-        let fetch_limit = compute_fetch_limit(query, filters, result_limit);
+        let fetch_limit = compute_fetch_limit_with_config(query, filters, result_limit, config);
         let stores = self.search_stores(index_dir)?;
 
         let Some(provider) = self.provider.as_ref() else {
@@ -236,6 +236,7 @@ impl SearchContext {
                 result_limit,
                 total_start,
                 &stores,
+                config,
             );
         };
 
@@ -272,6 +273,7 @@ impl SearchContext {
                     result_limit,
                     total_start,
                     &stores,
+                    config,
                 );
             }
             // A changed document prefix means the stored vectors live in a
@@ -291,6 +293,7 @@ impl SearchContext {
                     result_limit,
                     total_start,
                     &stores,
+                    config,
                 );
             }
             if let Ok(dim) = s_dim.parse::<usize>() {
@@ -308,6 +311,7 @@ impl SearchContext {
                         result_limit,
                         total_start,
                         &stores,
+                        config,
                     );
                 }
                 stored_dim = dim;
@@ -380,13 +384,14 @@ impl SearchContext {
             .bm25_metadata
             .lock()
             .map_err(|_| anyhow::anyhow!("BM25 metadata store lock poisoned"))?;
-        let results = augment_exact_match_candidates_with_store(
+        let results = augment_exact_match_candidates_with_store_and_config(
             &metadata_store,
             &indexed_files,
             query,
             results,
             ranking_stage,
             filters,
+            config,
         )?;
         timings.augmentation = Some(aug_start.elapsed());
 
@@ -440,8 +445,20 @@ pub(crate) fn build_query_with_intent<'a>(
 ///
 /// Broad natural-language queries need a larger pool even without explicit
 /// filters so deterministic ranking can surface structural chunks that raw RRF
-/// scores placed outside the requested result window.
+/// scores placed outside the requested result window. Gated by the
+/// `ranking_recall_pool_expansion` signal (issue #196) so ablations can
+/// measure its contribution without changing other ranking logic.
+#[allow(dead_code)]
 fn compute_fetch_limit(query: &str, filters: &SearchFilters, result_limit: usize) -> usize {
+    compute_fetch_limit_with_config(query, filters, result_limit, &VeraConfig::default())
+}
+
+pub(crate) fn compute_fetch_limit_with_config(
+    query: &str,
+    filters: &SearchFilters,
+    result_limit: usize,
+    config: &VeraConfig,
+) -> usize {
     let mut fetch_limit = if filters.is_empty() {
         result_limit
     } else {
@@ -456,6 +473,13 @@ fn compute_fetch_limit(query: &str, filters: &SearchFilters, result_limit: usize
 
     if filters.exact_paths.is_some() {
         fetch_limit = fetch_limit.max(result_limit.saturating_mul(12).max(result_limit + 200));
+    }
+
+    // Recall-oriented expansion for NL queries is the #196 signal. When disabled,
+    // only filter-driven expansion applies, keeping the pool tight so the
+    // ablation can measure the recall contribution of the broader pool.
+    if !config.retrieval.ranking_recall_pool_expansion_enabled() {
+        return fetch_limit;
     }
 
     if needs_structural_overfetch(query, filters) {
@@ -516,6 +540,7 @@ fn run_bm25_only(
     result_limit: usize,
     total_start: Instant,
     stores: &Arc<SearchStores>,
+    config: &VeraConfig,
 ) -> Result<(Vec<SearchResult>, SearchTimings)> {
     let bm25_start = Instant::now();
     let metadata_store = stores
@@ -532,13 +557,14 @@ fn run_bm25_only(
     let bm25_elapsed = bm25_start.elapsed();
     let aug_start = Instant::now();
     let indexed_files = stores.indexed_files()?;
-    let results = augment_exact_match_candidates_with_store(
+    let results = augment_exact_match_candidates_with_store_and_config(
         &metadata_store,
         &indexed_files,
         query,
         results,
         RankingStage::Initial,
         filters,
+        config,
     )?;
     let timings = SearchTimings {
         bm25: Some(bm25_elapsed),
@@ -1006,6 +1032,59 @@ mod tests {
             ),
             145
         );
+    }
+
+    #[test]
+    fn recall_pool_expansion_is_toggleable() {
+        let filters = SearchFilters::default();
+        // NL queries overfetch when expansion enabled; identifier queries do not.
+        let enabled = VeraConfig::default();
+        assert!(enabled.retrieval.ranking_recall_pool_expansion_enabled());
+
+        // With expansion on, broad NL queries get inflated fetch limits
+        let expanded = compute_fetch_limit_with_config(
+            "file type detection and filtering",
+            &filters,
+            20,
+            &enabled,
+        );
+        assert_eq!(expanded, 160);
+
+        // With expansion off, same query must stay at base limit (filters empty => result_limit)
+        let mut disabled = VeraConfig::default();
+        disabled.retrieval.ranking_recall_pool_expansion = false;
+        let collapsed = compute_fetch_limit_with_config(
+            "file type detection and filtering",
+            &filters,
+            20,
+            &disabled,
+        );
+        assert_eq!(
+            collapsed, 20,
+            "with recall expansion disabled, NL structural overfetch must not apply"
+        );
+
+        // Filter-driven expansion still applies even when recall expansion is off
+        let filtered = SearchFilters {
+            path_glob: vec!["src/**".to_string()],
+            ..Default::default()
+        };
+        let filtered_collapsed = compute_fetch_limit_with_config(
+            "file type detection and filtering",
+            &filtered,
+            20,
+            &disabled,
+        );
+        assert!(
+            filtered_collapsed >= 200,
+            "path_glob inflation must survive even when recall expansion is off, got {filtered_collapsed}"
+        );
+
+        // Identifier query never inflates, regardless of flag
+        let ident_expanded = compute_fetch_limit_with_config("Config", &filters, 20, &enabled);
+        let ident_collapsed = compute_fetch_limit_with_config("Config", &filters, 20, &disabled);
+        assert_eq!(ident_expanded, 20);
+        assert_eq!(ident_collapsed, 20);
     }
 
     #[test]

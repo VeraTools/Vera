@@ -75,6 +75,37 @@ fn env_usize(key: &str, default: usize) -> usize {
     }
 }
 
+/// Read a `bool` config override from an environment variable, falling back
+/// to `default` when unset or unparseable. Recognizes `1`/`0`, `true`/`false`,
+/// `yes`/`no`, `on`/`off` case-insensitively.
+fn env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => {
+                tracing::warn!(
+                    key,
+                    value = %value,
+                    default,
+                    "invalid boolean environment override; using default"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            tracing::warn!(
+                key,
+                default,
+                error = %error,
+                "could not read boolean environment override; using default"
+            );
+            default
+        }
+    }
+}
+
 fn default_max_chunk_bytes() -> usize {
     env_usize("VERA_MAX_CHUNK_BYTES", 24_576)
 }
@@ -202,6 +233,35 @@ pub struct RetrievalConfig {
     /// boolean verbatim.
     #[serde(default = "default_reranker_return_documents")]
     pub reranker_return_documents: Option<bool>,
+    // ── Issue #196 ranking signals (individually toggleable for ablations) ──
+    /// Filename-stem keyword boost for natural-language queries.
+    ///
+    /// When enabled, files whose stem or parent directory matches query keywords
+    /// receive a pool-relative boost. Mechanism: file names are human-chosen
+    /// module labels; matching them indicates the file implements the queried
+    /// concept (e.g. `session.rs` for "session renewal"). This addresses
+    /// recall-oriented misses where keyword-dense docs/tests outrank the correct
+    /// source file.
+    #[serde(default = "default_ranking_filename_stem_boost")]
+    pub ranking_filename_stem_boost: bool,
+    /// Definition-content boost for natural-language queries.
+    ///
+    /// When enabled, chunks whose content defines a queried concept (e.g.
+    /// `class Session`) and definition chunks whose symbol overlaps query
+    /// keywords are boosted. Mechanism: definitions are canonical anchors for a
+    /// concept; developers asking about a concept usually want the definition
+    /// site, not incidental mentions in docs or fixtures.
+    #[serde(default = "default_ranking_definition_boost")]
+    pub ranking_definition_boost: bool,
+    /// Recall-oriented candidate-pool expansion for natural-language queries.
+    ///
+    /// When enabled, broad NL queries (≥4 words) and structural queries expand
+    /// the fetch limit (up to 8×) so low-ranking but correct files enter the
+    /// ranking stage. Mechanism: intent and cross-file queries are open-ended;
+    /// a tight pool prematurely prunes the answer before ranking signals can
+    /// promote it.
+    #[serde(default = "default_ranking_recall_pool_expansion")]
+    pub ranking_recall_pool_expansion: bool,
 }
 
 fn default_max_output_chars() -> usize {
@@ -273,6 +333,18 @@ fn default_reranker_return_documents() -> Option<bool> {
     Some(false)
 }
 
+fn default_ranking_filename_stem_boost() -> bool {
+    env_bool("VERA_RANKING_FILENAME_STEM_BOOST", true)
+}
+
+fn default_ranking_definition_boost() -> bool {
+    env_bool("VERA_RANKING_DEFINITION_BOOST", true)
+}
+
+fn default_ranking_recall_pool_expansion() -> bool {
+    env_bool("VERA_RANKING_RECALL_POOL_EXPANSION", true)
+}
+
 impl Default for RetrievalConfig {
     fn default() -> Self {
         Self {
@@ -291,6 +363,47 @@ impl Default for RetrievalConfig {
             reranker_max_retries: default_reranker_max_retries(),
             reranker_rate_limit_wait_secs: default_reranker_rate_limit_wait_secs(),
             reranker_return_documents: default_reranker_return_documents(),
+            ranking_filename_stem_boost: default_ranking_filename_stem_boost(),
+            ranking_definition_boost: default_ranking_definition_boost(),
+            ranking_recall_pool_expansion: default_ranking_recall_pool_expansion(),
+        }
+    }
+}
+
+impl RetrievalConfig {
+    /// Filename-stem boost enabled, with env-var override for cheap ablations.
+    pub fn ranking_filename_stem_boost_enabled(&self) -> bool {
+        if std::env::var("VERA_RANKING_FILENAME_STEM_BOOST").is_ok() {
+            env_bool(
+                "VERA_RANKING_FILENAME_STEM_BOOST",
+                self.ranking_filename_stem_boost,
+            )
+        } else {
+            self.ranking_filename_stem_boost
+        }
+    }
+
+    /// Definition-content boost enabled, with env-var override.
+    pub fn ranking_definition_boost_enabled(&self) -> bool {
+        if std::env::var("VERA_RANKING_DEFINITION_BOOST").is_ok() {
+            env_bool(
+                "VERA_RANKING_DEFINITION_BOOST",
+                self.ranking_definition_boost,
+            )
+        } else {
+            self.ranking_definition_boost
+        }
+    }
+
+    /// Recall-pool expansion enabled, with env-var override.
+    pub fn ranking_recall_pool_expansion_enabled(&self) -> bool {
+        if std::env::var("VERA_RANKING_RECALL_POOL_EXPANSION").is_ok() {
+            env_bool(
+                "VERA_RANKING_RECALL_POOL_EXPANSION",
+                self.ranking_recall_pool_expansion,
+            )
+        } else {
+            self.ranking_recall_pool_expansion
         }
     }
 }
@@ -1478,5 +1591,222 @@ card0, 1073741824, 4294967296\n";
         assert!(std::env::var("VERA_MAX_RERANK_BATCH").is_err());
         assert_eq!(default_max_rerank_batch(), 20);
         assert_eq!(RetrievalConfig::default().max_rerank_batch, 20);
+    }
+
+    // ——— Issue #196 signals: toggleable ranking flags ———
+
+    #[test]
+    fn env_bool_parses_variants() {
+        let key = "VERA_TEST_BOOL_VARIANTS";
+        // Use a unique key not used elsewhere; direct set is safe as no other test touches it concurrently.
+        let check = |value: &str, default: bool, expected: bool| {
+            // SAFETY: tests run sequentially for this key; single-threaded mutation is isolated.
+            unsafe { std::env::set_var(key, value) };
+            let got = env_bool(key, default);
+            unsafe { std::env::remove_var(key) };
+            assert_eq!(
+                got, expected,
+                "env_bool({value:?}, default={default}) expected {expected}"
+            );
+        };
+        check("1", false, true);
+        check("1", true, true);
+        check("0", true, false);
+        check("true", false, true);
+        check("TRUE", false, true);
+        check("false", true, false);
+        check("FALSE", true, false);
+        check("yes", false, true);
+        check("no", true, false);
+        check("on", false, true);
+        check("off", true, false);
+        check("maybe", true, true);
+        check("maybe", false, false);
+        // unset falls back to default
+        unsafe { std::env::remove_var(key) };
+        assert!(env_bool(key, true));
+        assert!(!env_bool(key, false));
+    }
+
+    #[test]
+    fn legacy_retrieval_config_new_flags_default_to_true() {
+        let legacy = r#"{
+            "default_limit": 5,
+            "rrf_k": 60.0,
+            "rerank_candidates": 50,
+            "reranking_enabled": false,
+            "max_rerank_batch": 20,
+            "max_output_chars": 0
+        }"#;
+        let cfg: RetrievalConfig = serde_json::from_str(legacy).unwrap();
+        assert!(
+            cfg.ranking_filename_stem_boost,
+            "missing flag must default true for backward compat"
+        );
+        assert!(
+            cfg.ranking_definition_boost,
+            "missing flag must default true"
+        );
+        assert!(
+            cfg.ranking_recall_pool_expansion,
+            "missing flag must default true"
+        );
+        assert!(cfg.ranking_filename_stem_boost_enabled());
+        assert!(cfg.ranking_definition_boost_enabled());
+        assert!(cfg.ranking_recall_pool_expansion_enabled());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn retrieval_config_new_flags_round_trip() {
+        let mut cfg = RetrievalConfig::default();
+        cfg.ranking_filename_stem_boost = false;
+        cfg.ranking_definition_boost = false;
+        cfg.ranking_recall_pool_expansion = false;
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: RetrievalConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.ranking_filename_stem_boost);
+        assert!(!back.ranking_definition_boost);
+        assert!(!back.ranking_recall_pool_expansion);
+        assert!(!back.ranking_filename_stem_boost_enabled());
+        assert!(!back.ranking_definition_boost_enabled());
+        assert!(!back.ranking_recall_pool_expansion_enabled());
+
+        // true round-trip
+        let mut cfg2 = RetrievalConfig::default();
+        cfg2.ranking_filename_stem_boost = true;
+        let json2 = serde_json::to_string(&cfg2).unwrap();
+        let back2: RetrievalConfig = serde_json::from_str(&json2).unwrap();
+        assert!(back2.ranking_filename_stem_boost);
+        assert!(back2.ranking_filename_stem_boost_enabled());
+    }
+
+    #[test]
+    fn ranking_filename_stem_boost_env_precedence_matrix() {
+        run_env_test(
+            "config::tests::ranking_filename_stem_boost_env_only_probe",
+            &[("VERA_RANKING_FILENAME_STEM_BOOST", Some("0"))],
+        );
+        run_env_test(
+            "config::tests::ranking_filename_stem_boost_env_true_overrides_config_false_probe",
+            &[("VERA_RANKING_FILENAME_STEM_BOOST", Some("1"))],
+        );
+        run_env_test(
+            "config::tests::ranking_filename_stem_boost_unset_defaults_probe",
+            &[("VERA_RANKING_FILENAME_STEM_BOOST", None)],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_filename_stem_boost_env_precedence_matrix"]
+    fn ranking_filename_stem_boost_env_only_probe() {
+        // env=0 overrides default true
+        assert!(!default_ranking_filename_stem_boost());
+        let cfg = RetrievalConfig::default();
+        assert!(!cfg.ranking_filename_stem_boost_enabled());
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_filename_stem_boost_env_precedence_matrix"]
+    fn ranking_filename_stem_boost_env_true_overrides_config_false_probe() {
+        // config file says false but env=1 must win (env authoritative for these flags)
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"ranking_filename_stem_boost":false}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            cfg.ranking_filename_stem_boost_enabled(),
+            "env 1 must override config false"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_filename_stem_boost_env_precedence_matrix"]
+    fn ranking_filename_stem_boost_unset_defaults_probe() {
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_BOOST").is_err());
+        assert!(default_ranking_filename_stem_boost());
+        assert!(RetrievalConfig::default().ranking_filename_stem_boost_enabled());
+    }
+
+    #[test]
+    fn ranking_definition_boost_env_precedence_matrix() {
+        run_env_test(
+            "config::tests::ranking_definition_boost_env_only_probe",
+            &[("VERA_RANKING_DEFINITION_BOOST", Some("false"))],
+        );
+        run_env_test(
+            "config::tests::ranking_definition_boost_env_true_overrides_config_false_probe",
+            &[("VERA_RANKING_DEFINITION_BOOST", Some("true"))],
+        );
+        run_env_test(
+            "config::tests::ranking_definition_boost_unset_defaults_probe",
+            &[("VERA_RANKING_DEFINITION_BOOST", None)],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_definition_boost_env_precedence_matrix"]
+    fn ranking_definition_boost_env_only_probe() {
+        assert!(!default_ranking_definition_boost());
+        assert!(!RetrievalConfig::default().ranking_definition_boost_enabled());
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_definition_boost_env_precedence_matrix"]
+    fn ranking_definition_boost_env_true_overrides_config_false_probe() {
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"ranking_definition_boost":false}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            cfg.ranking_definition_boost_enabled(),
+            "env true must override config false"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_definition_boost_env_precedence_matrix"]
+    fn ranking_definition_boost_unset_defaults_probe() {
+        assert!(std::env::var("VERA_RANKING_DEFINITION_BOOST").is_err());
+        assert!(default_ranking_definition_boost());
+        assert!(RetrievalConfig::default().ranking_definition_boost_enabled());
+    }
+
+    #[test]
+    fn ranking_recall_pool_expansion_env_precedence_matrix() {
+        run_env_test(
+            "config::tests::ranking_recall_pool_expansion_env_only_probe",
+            &[("VERA_RANKING_RECALL_POOL_EXPANSION", Some("0"))],
+        );
+        run_env_test(
+            "config::tests::ranking_recall_pool_expansion_env_true_overrides_config_false_probe",
+            &[("VERA_RANKING_RECALL_POOL_EXPANSION", Some("1"))],
+        );
+        run_env_test(
+            "config::tests::ranking_recall_pool_expansion_unset_defaults_probe",
+            &[("VERA_RANKING_RECALL_POOL_EXPANSION", None)],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_recall_pool_expansion_env_precedence_matrix"]
+    fn ranking_recall_pool_expansion_env_only_probe() {
+        assert!(!default_ranking_recall_pool_expansion());
+        assert!(!RetrievalConfig::default().ranking_recall_pool_expansion_enabled());
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_recall_pool_expansion_env_precedence_matrix"]
+    fn ranking_recall_pool_expansion_env_true_overrides_config_false_probe() {
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"ranking_recall_pool_expansion":false}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            cfg.ranking_recall_pool_expansion_enabled(),
+            "env 1 must override config false"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by ranking_recall_pool_expansion_env_precedence_matrix"]
+    fn ranking_recall_pool_expansion_unset_defaults_probe() {
+        assert!(std::env::var("VERA_RANKING_RECALL_POOL_EXPANSION").is_err());
+        assert!(default_ranking_recall_pool_expansion());
+        assert!(RetrievalConfig::default().ranking_recall_pool_expansion_enabled());
     }
 }

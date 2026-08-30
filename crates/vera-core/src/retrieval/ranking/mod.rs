@@ -5,6 +5,7 @@
 //! config files at repo root, test/docs noise, symbol-type disambiguation, and
 //! same-file crowding for multi-file questions.
 
+use crate::config::VeraConfig;
 use crate::corpus::{classify_path, content_class_label};
 use crate::types::{Language, SearchFilters, SearchResult};
 
@@ -38,13 +39,29 @@ pub(crate) fn apply_query_ranking_with_filters(
     stage: RankingStage,
     filters: &SearchFilters,
 ) -> Vec<SearchResult> {
+    apply_query_ranking_with_filters_and_config(
+        query,
+        results,
+        stage,
+        filters,
+        &VeraConfig::default(),
+    )
+}
+
+pub(crate) fn apply_query_ranking_with_filters_and_config(
+    query: &str,
+    results: Vec<SearchResult>,
+    stage: RankingStage,
+    filters: &SearchFilters,
+    config: &VeraConfig,
+) -> Vec<SearchResult> {
     if results.len() <= 1 {
         return results;
     }
 
     let features = QueryFeatures::from_query(query);
     let wants_diversity = features.wants_multi_file_diversity;
-    let scores = score_pool(&features, stage, filters, &results);
+    let scores = score_pool_with_config(&features, stage, filters, &results, config);
     finish_ranking(results, scores, wants_diversity)
 }
 
@@ -52,11 +69,28 @@ pub(crate) fn apply_query_ranking_with_filters(
 /// target, so score the pool under every subquery's features and keep each
 /// result's best score. A single joined query would promote only the first
 /// subquery's exact match and crowd out the rest (issue #121).
+#[allow(dead_code)]
 pub(crate) fn apply_query_ranking_multi_query(
     queries: &[String],
     results: Vec<SearchResult>,
     stage: RankingStage,
     filters: &SearchFilters,
+) -> Vec<SearchResult> {
+    apply_query_ranking_multi_query_with_config(
+        queries,
+        results,
+        stage,
+        filters,
+        &VeraConfig::default(),
+    )
+}
+
+pub(crate) fn apply_query_ranking_multi_query_with_config(
+    queries: &[String],
+    results: Vec<SearchResult>,
+    stage: RankingStage,
+    filters: &SearchFilters,
+    config: &VeraConfig,
 ) -> Vec<SearchResult> {
     if queries.is_empty() || results.len() <= 1 {
         return results;
@@ -67,10 +101,9 @@ pub(crate) fn apply_query_ranking_multi_query(
     for query in queries {
         let features = QueryFeatures::from_query(query);
         wants_diversity |= features.wants_multi_file_diversity;
-        for (best, score) in scores
-            .iter_mut()
-            .zip(score_pool(&features, stage, filters, &results))
-        {
+        for (best, score) in scores.iter_mut().zip(score_pool_with_config(
+            &features, stage, filters, &results, config,
+        )) {
             *best = best.max(score);
         }
     }
@@ -80,27 +113,43 @@ pub(crate) fn apply_query_ranking_multi_query(
 /// Score every pool entry under one query's features: retrieval position
 /// (base rank), additive priors, then pool-relative boosts scaled by the
 /// pool's best combined score so signal strength tracks retrieval confidence.
+#[allow(dead_code)]
 fn score_pool(
     features: &QueryFeatures,
     stage: RankingStage,
     filters: &SearchFilters,
     results: &[SearchResult],
 ) -> Vec<f64> {
+    score_pool_with_config(features, stage, filters, results, &VeraConfig::default())
+}
+
+fn score_pool_with_config(
+    features: &QueryFeatures,
+    stage: RankingStage,
+    filters: &SearchFilters,
+    results: &[SearchResult],
+    config: &VeraConfig,
+) -> Vec<f64> {
+    let retrieval = &config.retrieval;
     let len = results.len() as f64;
     let mut scores: Vec<f64> = results
         .iter()
         .enumerate()
         .map(|(idx, result)| {
             let base_rank = 1.0 - (idx as f64 / len);
-            let prior = score_prior(features, result, stage, filters);
+            let prior = score_prior_with_config(features, result, stage, filters, retrieval);
             base_rank + prior
         })
         .collect();
 
     let max_score = scores.iter().copied().fold(0.0_f64, f64::max).max(1e-6);
     apply_coherence_boost(features, &mut scores, results, max_score);
-    apply_keyword_path_boost(features, &mut scores, results, max_score);
-    apply_content_symbol_boost(features, &mut scores, results, max_score);
+    if retrieval.ranking_filename_stem_boost_enabled() {
+        apply_keyword_path_boost(features, &mut scores, results, max_score);
+    }
+    if retrieval.ranking_definition_boost_enabled() {
+        apply_content_symbol_boost(features, &mut scores, results, max_score);
+    }
 
     scores
 }
