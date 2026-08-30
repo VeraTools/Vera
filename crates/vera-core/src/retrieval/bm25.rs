@@ -113,73 +113,60 @@ fn search_bm25_with_stores_inner(
 
     let mut results = Vec::with_capacity(limit.min(bm25_results.len()));
 
-    // The first `limit` candidates hydrate one row at a time through the
-    // cached single-row statement: when every candidate passes (the common
-    // case, especially unfiltered) this is the cheapest possible path and
-    // fetches nothing that goes unused. If the head falls short (filter
-    // rejection or missing metadata), the remaining pool hydrates in paged
-    // batches, amortizing SQLite round trips over the long rejection tail.
+    // Profiling (`docs/197-profiling.md`): the head originally did N
+    // single-row `get_chunk` round trips (up to `limit` per query). Batching
+    // the head into one `get_chunks_by_ids` call collapses N round trips to
+    // 1 when head <=900 (typical limit 10 to 20, paged otherwise),
+    // mirroring the vector path. Rank unchanged (same chunks, same order),
+    // validated by `paged_hydration_matches_unfiltered_manual_filtering_across_pages`.
+    // Tail already paged; kept as-is.
     let (head, tail) = bm25_results.split_at(limit.min(bm25_results.len()));
-    for bm25_result in head {
-        let Some(chunk) = metadata_store
-            .get_chunk(&bm25_result.chunk_id)
-            .with_context(|| {
-                format!(
-                    "failed to fetch metadata for chunk: {}",
-                    bm25_result.chunk_id
-                )
-            })?
-        else {
-            debug!(
-                chunk_id = %bm25_result.chunk_id,
-                "chunk metadata not found, skipping"
-            );
-            continue;
-        };
-        let result = chunk.into_search_result(f64::from(bm25_result.score));
-        if filters.is_some_and(|filters| !filters.matches(&result)) {
-            continue;
+    // Shared helper: batch-hydrate a page, restore BM25 ordering, apply
+    // filters, and append to `results` until `limit` is reached.
+    let hydrate_page = |page: &[crate::storage::bm25::Bm25SearchResult],
+                        results: &mut Vec<SearchResult>|
+     -> Result<bool> {
+        if page.is_empty() || results.len() >= limit {
+            return Ok(results.len() >= limit);
         }
-        results.push(result);
+        let ids: Vec<String> = page
+            .iter()
+            .map(|bm25_result| bm25_result.chunk_id.clone())
+            .collect();
+        let mut chunks_by_id = metadata_store.get_chunks_by_ids(&ids).with_context(|| {
+            format!("failed to fetch metadata for {} BM25 candidates", ids.len())
+        })?;
+        for bm25_result in page {
+            let Some(chunk) = chunks_by_id.remove(&bm25_result.chunk_id) else {
+                debug!(
+                    chunk_id = %bm25_result.chunk_id,
+                    "chunk metadata not found, skipping"
+                );
+                continue;
+            };
+            let result = chunk.into_search_result(f64::from(bm25_result.score));
+            if filters.is_some_and(|filters| !filters.matches(&result)) {
+                continue;
+            }
+            results.push(result);
+            if results.len() >= limit {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+
+    for page in head.chunks(BM25_HYDRATION_PAGE_MAX) {
+        if hydrate_page(page, &mut results)? {
+            break;
+        }
     }
 
     if results.len() < limit && !tail.is_empty() {
         let hydration_page_size = limit.saturating_mul(4).clamp(256, BM25_HYDRATION_PAGE_MAX);
 
         for page in tail.chunks(hydration_page_size) {
-            let ids: Vec<String> = page
-                .iter()
-                .map(|bm25_result| bm25_result.chunk_id.clone())
-                .collect();
-            let mut chunks_by_id = metadata_store.get_chunks_by_ids(&ids).with_context(|| {
-                format!("failed to fetch metadata for {} BM25 candidates", ids.len())
-            })?;
-
-            for bm25_result in page {
-                // `remove` moves the chunk out of the page map: every id is
-                // visited once, so no clone is needed.
-                let Some(chunk) = chunks_by_id.remove(&bm25_result.chunk_id) else {
-                    debug!(
-                        chunk_id = %bm25_result.chunk_id,
-                        "chunk metadata not found, skipping"
-                    );
-                    continue;
-                };
-
-                let result = chunk.into_search_result(f64::from(bm25_result.score));
-
-                if filters.is_some_and(|filters| !filters.matches(&result)) {
-                    continue;
-                }
-
-                results.push(result);
-
-                if results.len() >= limit {
-                    break;
-                }
-            }
-
-            if results.len() >= limit {
+            if hydrate_page(page, &mut results)? {
                 break;
             }
         }
