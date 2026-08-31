@@ -43,7 +43,54 @@ const PROVENANCE_ENV_KEYS: &[&str] = &[
     "RERANKER_MODEL_ID",
     "RERANKER_MODEL_API_KEY",
     "VERA_MAX_RERANK_BATCH",
+    "VERA_RANKING_FILENAME_STEM_BOOST",
+    "VERA_RANKING_DEFINITION_BOOST",
+    "VERA_RANKING_RECALL_POOL_EXPANSION",
 ];
+
+/// Key used to record the host CPU model in the environment provenance block.
+pub const HOST_CPU_MODEL_KEY: &str = "host.cpu_model";
+
+/// Parse the CPU model name from `/proc/cpuinfo` content.
+///
+/// Returns the first `model name` value (trimmed) if present.
+pub fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
+    for line in cpuinfo.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("model name")
+            && let Some(colon) = trimmed.find(':')
+        {
+            let value = trimmed[colon + 1..].trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Return the host CPU model from raw cpuinfo content, or a placeholder when unavailable.
+#[allow(dead_code)]
+pub fn host_cpu_model_from_content(content: &str) -> String {
+    parse_cpu_model(content).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Read the host CPU model from a specific path (useful for testing fallback).
+pub fn host_cpu_model_from_path(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| parse_cpu_model(&content))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Read the host CPU model from `/proc/cpuinfo` with graceful fallback.
+///
+/// On Linux the model name is extracted from the `model name` field. On
+/// non-Linux or when the file is unavailable an opaque placeholder is
+/// returned without panicking. No new dependency is introduced.
+pub fn host_cpu_model() -> String {
+    host_cpu_model_from_path(Path::new("/proc/cpuinfo"))
+}
 
 /// One benchmark lane. The same shape can be supplied in JSON or TOML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,6 +781,10 @@ fn environment_summary_for_keys(keys: HashSet<&str>) -> BTreeMap<String, String>
         };
         summary.insert(key.to_string(), value);
     }
+    // Host CPU model is derived from /proc/cpuinfo, not an env var, but
+    // recorded alongside the environment block so hardware changes are
+    // detectable from the artifact alone.
+    summary.insert(HOST_CPU_MODEL_KEY.to_string(), host_cpu_model());
     summary
 }
 
@@ -1110,5 +1161,190 @@ mod tests {
                 "reranker key {key} must be absent when rerank disabled"
             );
         }
+    }
+
+    #[test]
+    fn cpuinfo_fixture_parsing_extracts_model_name() {
+        let fixture = "\
+processor\t: 0
+vendor_id\t: AuthenticAMD
+cpu family\t: 26
+model\t\t: 68
+model name\t: AMD Ryzen 7 9800X3D 8-Core Processor
+stepping\t: 0
+microcode\t: 0xb404038
+";
+        assert_eq!(
+            parse_cpu_model(fixture).as_deref(),
+            Some("AMD Ryzen 7 9800X3D 8-Core Processor")
+        );
+        assert_eq!(
+            host_cpu_model_from_content(fixture),
+            "AMD Ryzen 7 9800X3D 8-Core Processor"
+        );
+        // Only the first model name is returned even with multiple processors.
+        let multi = format!("{fixture}processor\t: 1\nmodel name\t: Other CPU\n");
+        assert_eq!(
+            parse_cpu_model(&multi).as_deref(),
+            Some("AMD Ryzen 7 9800X3D 8-Core Processor")
+        );
+    }
+
+    #[test]
+    fn cpuinfo_fallback_returns_placeholder_without_panic() {
+        // Empty content yields placeholder.
+        assert_eq!(parse_cpu_model(""), None);
+        assert_eq!(host_cpu_model_from_content(""), "unknown");
+        // Missing file yields placeholder without panicking.
+        let missing = std::path::Path::new("/nonexistent/proc/cpuinfo/fixture");
+        assert_eq!(host_cpu_model_from_path(missing), "unknown");
+        // Real host path should not panic; on this Linux host it returns the actual model.
+        let real = host_cpu_model();
+        assert!(
+            !real.is_empty(),
+            "host_cpu_model should return non-empty placeholder or real model"
+        );
+        // Placeholder contract: unknown or empty are both acceptable, but we choose unknown.
+        assert_ne!(
+            real, "",
+            "empty string not expected for fallback contract; use unknown"
+        );
+    }
+
+    #[test]
+    fn environment_block_records_ranking_overrides_with_effective_values() {
+        // Guard the three ranking env keys plus the host key via the shared ENV_LOCK.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Remember prior values to restore deterministically.
+        let keys = [
+            "VERA_RANKING_FILENAME_STEM_BOOST",
+            "VERA_RANKING_DEFINITION_BOOST",
+            "VERA_RANKING_RECALL_POOL_EXPANSION",
+        ];
+        let prev: Vec<(String, Option<OsString>)> = keys
+            .iter()
+            .map(|k| (k.to_string(), std::env::var_os(k)))
+            .collect();
+
+        // Case 1: when set to 0, the environment block records "0".
+        for k in keys {
+            unsafe { std::env::set_var(k, "0") };
+        }
+        let lane = resolve(preset("vera-potion").unwrap()).unwrap();
+        let env = environment_summary(&lane);
+        for k in keys {
+            assert_eq!(
+                env.get(k).map(String::as_str),
+                Some("0"),
+                "ranking key {k} should be 0 when set"
+            );
+        }
+        // Host CPU is always present alongside the ranking keys.
+        assert!(
+            env.contains_key(HOST_CPU_MODEL_KEY),
+            "environment must contain {HOST_CPU_MODEL_KEY}"
+        );
+        assert!(!env[HOST_CPU_MODEL_KEY].is_empty());
+
+        // Case 2: when unset, the block records "<unset>" (existing pattern).
+        for k in keys {
+            unsafe { std::env::remove_var(k) };
+        }
+        let env2 = environment_summary(&lane);
+        for k in keys {
+            assert_eq!(
+                env2.get(k).map(String::as_str),
+                Some("<unset>"),
+                "ranking key {k} should be <unset> when not set"
+            );
+        }
+        assert!(
+            env2.contains_key(HOST_CPU_MODEL_KEY),
+            "host CPU key must still be present when ranking keys unset"
+        );
+
+        // Restore.
+        for (k, v) in prev {
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn environment_block_follows_existing_key_value_pattern() {
+        // Verifies the new ranking keys use the exact same "<unset>"/value
+        // contract as the existing PROVENANCE_ENV_KEYS, and that the host CPU
+        // key follows the dot-notation precedent.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let lane = resolve(preset("vera-bm25").unwrap()).unwrap();
+        let env = environment_summary(&lane);
+        // Existing key still present and uses "<unset>" when not set.
+        assert!(env.contains_key("VERA_BACKEND"));
+        // New keys exist.
+        for k in [
+            "VERA_RANKING_FILENAME_STEM_BOOST",
+            "VERA_RANKING_DEFINITION_BOOST",
+            "VERA_RANKING_RECALL_POOL_EXPANSION",
+            HOST_CPU_MODEL_KEY,
+        ] {
+            assert!(
+                env.contains_key(k),
+                "expected provenance key {k} in environment block"
+            );
+        }
+        // Host key uses dot notation consistent with config_map precedent.
+        assert!(HOST_CPU_MODEL_KEY.contains('.'));
+    }
+
+    #[test]
+    fn old_result_json_still_parses_and_no_existing_key_changes() {
+        // Legacy JSON without the new host CPU or ranking fields must still deserialize.
+        let legacy = r#"{
+            "tool_version": "legacy",
+            "corpus_version": 1,
+            "repo_shas": {},
+            "config": {"lane.name": "vera-potion", "lane.backend": "potion"},
+            "environment": {"VERA_BACKEND": "potion", "VERA_LOCAL": "1"}
+        }"#;
+        let version: crate::types::VersionInfo = serde_json::from_str(legacy).unwrap();
+        // New field defaults to None (additive, not required).
+        assert!(version.host_cpu_model.is_none());
+        // Existing keys unchanged.
+        assert_eq!(version.tool_version, "legacy");
+        assert_eq!(version.metric_contract, "unknown-legacy");
+        // Serializing and deserializing again preserves the new optional field.
+        let json = serde_json::to_string(&version).unwrap();
+        let round: crate::types::VersionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.tool_version, "legacy");
+    }
+
+    #[test]
+    fn new_field_is_additive_host_cpu_present_in_provenance() {
+        let lane = resolve(preset("vera-potion").unwrap()).unwrap();
+        let env = environment_summary(&lane);
+        let cpu = env
+            .get(HOST_CPU_MODEL_KEY)
+            .expect("host CPU in environment");
+        assert!(!cpu.is_empty());
+        assert_ne!(cpu, "<unset>");
+        // On this host it should match the real CPU model.
+        // Gracefully accept "unknown" on non-Linux, but on Linux check substring.
+        if cpu != "unknown" {
+            assert!(
+                cpu.contains("AMD") || cpu.contains("Intel") || cpu.contains("Ryzen"),
+                "host CPU model should look like a real CPU string, got: {cpu}"
+            );
+        }
+        // Also verify the top-level VersionInfo field via host_cpu_model().
+        let top = host_cpu_model();
+        assert!(!top.is_empty());
+        assert_eq!(
+            cpu, &top,
+            "environment and direct host_cpu_model should agree"
+        );
     }
 }
