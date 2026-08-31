@@ -4,6 +4,8 @@
 
 **Baseline:** `9.93 ms` p50 / `73.26 ms` p95 on the full Semble suite (1,251 tasks) at `072c725` (v1.2.0). Semble in-memory baseline: `2.3 ms` p50. Gap ~7.6 ms is architectural (persistent vs in-process NumPy flat scan).
 
+Hardware caveat: those numbers were measured on the pre-upgrade CPU (Ryzen 7 7600X3D) on 2026-08-25. The host was upgraded to Ryzen 7 9800X3D on 2026-08-28, so latency and throughput numbers are not comparable across the upgrade without re-measuring the baseline on the same host. The corrected same-host baseline on 9800X3D is 7.88 ms p50 / 60.88 ms p95 mean over three runs at 072c725 (benchmarks/results/issue197-rebaseline-20260831T224259Z-full-072c725-run1.json, benchmarks/results/issue197-rebaseline-20260831T224610Z-full-072c725-run2.json, benchmarks/results/issue197-rebaseline-20260831T224914Z-full-072c725-run3.json) and is the operative comparison for post-upgrade latency claims. Ranking-quality metrics (nDCG, recall, MRR) remain comparable.
+
 ## Measured stage breakdown (persistent path, warm process)
 
 Source: issue #197 body + comment `2528f2e` warm measurements + local synthetic 2,000-chunk micro-benchmark (MockProvider dim 8, 200 files x 4 chunks, Tantivy + SQLite + flat mmap, `SearchStores` warm).
