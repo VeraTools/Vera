@@ -13,6 +13,99 @@ use crate::commands;
 use crate::helpers::LocalEmbeddingModelFlags;
 use crate::state::{self, ApiSetupInput};
 
+/// Stable identifier for API presets. Qwen-specific optimizations
+/// (single shared key and auto Generic protocol) key on this discriminant
+/// instead of display strings or model_id/base_url equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiPresetId {
+    OpenAi,
+    Jina,
+    Voyage,
+    Qwen,
+    Custom,
+}
+
+impl ApiPresetId {
+    pub(crate) fn is_qwen(self) -> bool {
+        self == Self::Qwen
+    }
+}
+
+pub(crate) fn preset_uses_single_shared_key(id: ApiPresetId) -> bool {
+    id.is_qwen()
+}
+
+pub(crate) fn preset_uses_auto_generic(id: ApiPresetId) -> bool {
+    id.is_qwen()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ApiPreset {
+    pub(crate) id: ApiPresetId,
+    pub(crate) label: &'static str,
+    pub(crate) hint: &'static str,
+    pub(crate) embedding_base_url: &'static str,
+    pub(crate) embedding_model: &'static str,
+    pub(crate) reranker_base_url: &'static str,
+    pub(crate) reranker_model: &'static str,
+}
+
+pub(crate) const API_PRESETS: &[ApiPreset] = &[
+    ApiPreset {
+        id: ApiPresetId::OpenAi,
+        label: "OpenAI",
+        hint: "text-embedding-3-small, no built-in reranker",
+        embedding_base_url: "https://api.openai.com/v1",
+        embedding_model: "text-embedding-3-small",
+        reranker_base_url: "",
+        reranker_model: "",
+    },
+    ApiPreset {
+        id: ApiPresetId::Jina,
+        label: "Jina AI",
+        hint: "jina-embeddings-v3 + jina-reranker-v2",
+        embedding_base_url: "https://api.jina.ai/v1",
+        embedding_model: "jina-embeddings-v3",
+        reranker_base_url: "https://api.jina.ai/v1",
+        reranker_model: "jina-reranker-v2-base-multilingual",
+    },
+    ApiPreset {
+        id: ApiPresetId::Voyage,
+        label: "Voyage AI",
+        hint: "voyage-code-3 + rerank-2",
+        embedding_base_url: "https://api.voyageai.com/v1",
+        embedding_model: "voyage-code-3",
+        reranker_base_url: "https://api.voyageai.com/v1",
+        reranker_model: "rerank-2",
+    },
+    ApiPreset {
+        id: ApiPresetId::Qwen,
+        label: "Qwen (OpenRouter)",
+        hint: "qwen3-embedding-8b + qwen3-reranker-8b via OpenRouter (paid usage)",
+        embedding_base_url: "https://openrouter.ai/api/v1",
+        embedding_model: "qwen/qwen3-embedding-8b",
+        reranker_base_url: "https://openrouter.ai/api/v1",
+        reranker_model: "qwen/qwen3-reranker-8b",
+    },
+    ApiPreset {
+        id: ApiPresetId::Custom,
+        label: "Custom",
+        hint: "enter your own OpenAI-compatible endpoints",
+        embedding_base_url: "",
+        embedding_model: "",
+        reranker_base_url: "",
+        reranker_model: "",
+    },
+];
+
+#[allow(dead_code)] // exercised by the preset-identity round-trip test
+pub(crate) fn preset_by_id(id: ApiPresetId) -> &'static ApiPreset {
+    API_PRESETS
+        .iter()
+        .find(|preset| preset.id == id)
+        .expect("preset id must exist in API_PRESETS")
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct SetupReport {
     mode: String,
@@ -126,9 +219,13 @@ pub fn run(
         )
         .context("API mode needs endpoint credentials and no terminal is available for prompts")?;
     }
-    let api_setup = (needs_api_prompt && interactive)
+    let api_setup_with_preset = (needs_api_prompt && interactive)
         .then(prompt_api_setup)
         .transpose()?;
+    // Wizard cares about preset identity (Qwen single-key + auto-Generic);
+    // the generic `run` path only needs the raw inputs, so strip the id here.
+    let api_setup =
+        api_setup_with_preset.map(|(embedding, reranker, _preset_id)| (embedding, reranker));
 
     configure_backend_with_api_setup(
         effective_backend,
@@ -652,17 +749,13 @@ fn confirm(
 /// subsequent reranker-protocol step or via `vera config set`; other presets
 /// default to auto-detect (voyage on `voyageai.com`, generic elsewhere).
 fn configure_api_interactive() -> anyhow::Result<()> {
-    let (embedding, reranker) = prompt_api_setup()?;
+    let (embedding, reranker, preset_id) = prompt_api_setup()?;
     // Collect reranker protocol settings before any persistence so cancellation
     // at any prompt leaves existing config untouched.
     // Qwen (OpenRouter) uses the generic protocol; apply it without prompting
     // so the preset completes with a single key entry (friction: before, three
     // extra prompts for protocol/endpoint/task even though defaults are correct).
-    let is_qwen = embedding.model_id == "qwen/qwen3-embedding-8b"
-        && embedding.base_url == "https://openrouter.ai/api/v1"
-        && reranker
-            .as_ref()
-            .is_some_and(|r| r.model_id == "qwen/qwen3-reranker-8b");
+    let is_qwen = preset_uses_auto_generic(preset_id);
     let reranker_protocol_update = if reranker.is_some() {
         if is_qwen {
             Some(RerankerProtocolUpdate {
@@ -672,10 +765,7 @@ fn configure_api_interactive() -> anyhow::Result<()> {
                 task_field: None,
             })
         } else {
-            Some(prompt_reranker_protocol_settings(
-                &embedding,
-                reranker.as_ref(),
-            )?)
+            Some(prompt_reranker_protocol_settings_for_preset(preset_id)?)
         }
     } else {
         None
@@ -722,9 +812,8 @@ fn apply_reranker_protocol_update(
     runtime.retrieval.reranker_task_field = update.task_field;
 }
 
-fn prompt_reranker_protocol_settings(
-    embedding: &ApiSetupInput,
-    reranker: Option<&ApiSetupInput>,
+fn prompt_reranker_protocol_settings_for_preset(
+    preset_id: ApiPresetId,
 ) -> anyhow::Result<RerankerProtocolUpdate> {
     let existing = state::load_runtime_config().unwrap_or_default();
     let existing_protocol = existing.retrieval.reranker_protocol;
@@ -736,10 +825,7 @@ fn prompt_reranker_protocol_settings(
     // so the preset round-trips with a persisted protocol setting. Other presets
     // keep auto-detect as the default, which resolves to generic for non-Voyage
     // hosts and to voyage on voyageai.com.
-    let is_qwen = embedding.model_id == "qwen/qwen3-embedding-8b"
-        && embedding.base_url == "https://openrouter.ai/api/v1"
-        && reranker.is_some_and(|r| r.model_id == "qwen/qwen3-reranker-8b");
-    let suggested_protocol = if is_qwen {
+    let suggested_protocol = if preset_uses_auto_generic(preset_id) {
         Some(RerankerProtocol::Generic)
     } else {
         None
@@ -856,59 +942,8 @@ fn prompt_reranker_protocol_settings(
     })
 }
 
-fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> {
-    #[derive(Clone)]
-    struct ApiPreset {
-        label: &'static str,
-        hint: &'static str,
-        embedding_base_url: &'static str,
-        embedding_model: &'static str,
-        reranker_base_url: &'static str,
-        reranker_model: &'static str,
-    }
-
-    let presets = [
-        ApiPreset {
-            label: "OpenAI",
-            hint: "text-embedding-3-small, no built-in reranker",
-            embedding_base_url: "https://api.openai.com/v1",
-            embedding_model: "text-embedding-3-small",
-            reranker_base_url: "",
-            reranker_model: "",
-        },
-        ApiPreset {
-            label: "Jina AI",
-            hint: "jina-embeddings-v3 + jina-reranker-v2",
-            embedding_base_url: "https://api.jina.ai/v1",
-            embedding_model: "jina-embeddings-v3",
-            reranker_base_url: "https://api.jina.ai/v1",
-            reranker_model: "jina-reranker-v2-base-multilingual",
-        },
-        ApiPreset {
-            label: "Voyage AI",
-            hint: "voyage-code-3 + rerank-2",
-            embedding_base_url: "https://api.voyageai.com/v1",
-            embedding_model: "voyage-code-3",
-            reranker_base_url: "https://api.voyageai.com/v1",
-            reranker_model: "rerank-2",
-        },
-        ApiPreset {
-            label: "Qwen (OpenRouter)",
-            hint: "qwen3-embedding-8b + qwen3-reranker-8b via OpenRouter (paid usage)",
-            embedding_base_url: "https://openrouter.ai/api/v1",
-            embedding_model: "qwen/qwen3-embedding-8b",
-            reranker_base_url: "https://openrouter.ai/api/v1",
-            reranker_model: "qwen/qwen3-reranker-8b",
-        },
-        ApiPreset {
-            label: "Custom",
-            hint: "enter your own OpenAI-compatible endpoints",
-            embedding_base_url: "",
-            embedding_model: "",
-            reranker_base_url: "",
-            reranker_model: "",
-        },
-    ];
+fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>, ApiPresetId)> {
+    let presets = API_PRESETS;
 
     let mut select = cliclack::select("Select an API provider");
     for (i, p) in presets.iter().enumerate() {
@@ -923,7 +958,7 @@ fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> 
     // redundant Enter presses before the key). Skip those prompts for Qwen
     // and go straight to the single credential entry, reusing it for both
     // endpoints without a second prompt.
-    if preset.label == "Qwen (OpenRouter)" {
+    if preset_uses_single_shared_key(preset.id) {
         let api_key: String = cliclack::password("OpenRouter API key")
             .mask('▪')
             .interact()?;
@@ -940,7 +975,7 @@ fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> 
             model_id: preset.reranker_model.to_string(),
             api_key,
         });
-        return Ok((embedding, reranker));
+        return Ok((embedding, reranker, preset.id));
     }
 
     // Embedding base URL
@@ -1010,7 +1045,7 @@ fn prompt_api_setup() -> anyhow::Result<(ApiSetupInput, Option<ApiSetupInput>)> 
         None
     };
 
-    Ok((embedding, reranker))
+    Ok((embedding, reranker, preset.id))
 }
 
 fn prompt_required_input(
@@ -1176,5 +1211,71 @@ mod tests {
                 "no usable DirectX 12 GPU here: {unusable:?}"
             );
         }
+    }
+
+    /// Qwen optimizations must trigger on preset identity (ApiPresetId::Qwen),
+    /// not on display strings or model_id/base_url equality. Changing the
+    /// label text must not change behavior, and spoofing the label on a
+    /// different preset must not trigger Qwen-only paths. This pins the
+    /// single-shared-key prompt skip and the auto Generic protocol.
+    #[test]
+    fn qwen_optimizations_trigger_on_preset_identity_not_label_text() {
+        // Single-shared-key and auto-Generic helpers are pure over the id.
+        for (id, should_be_qwen) in [
+            (ApiPresetId::OpenAi, false),
+            (ApiPresetId::Jina, false),
+            (ApiPresetId::Voyage, false),
+            (ApiPresetId::Qwen, true),
+            (ApiPresetId::Custom, false),
+        ] {
+            assert_eq!(
+                preset_uses_single_shared_key(id),
+                should_be_qwen,
+                "single-shared-key for {id:?}"
+            );
+            assert_eq!(
+                preset_uses_auto_generic(id),
+                should_be_qwen,
+                "auto-Generic for {id:?}"
+            );
+            assert_eq!(id.is_qwen(), should_be_qwen, "is_qwen for {id:?}");
+        }
+
+        // Round-trip: the canonical Qwen entry still round-trips through id.
+        let qwen = preset_by_id(ApiPresetId::Qwen);
+        assert_eq!(qwen.id, ApiPresetId::Qwen);
+        assert_eq!(qwen.label, "Qwen (OpenRouter)");
+        assert_eq!(qwen.embedding_model, "qwen/qwen3-embedding-8b");
+        assert_eq!(qwen.reranker_model, "qwen/qwen3-reranker-8b");
+        assert!(preset_uses_single_shared_key(qwen.id));
+        assert!(preset_uses_auto_generic(qwen.id));
+
+        // Label spoof: Qwen id with a fake label must still be treated as Qwen
+        // (proves we don't key on `preset.label == "Qwen (OpenRouter)"`).
+        let spoofed = ApiPreset {
+            id: ApiPresetId::Qwen,
+            label: "Totally Not Qwen",
+            hint: "spoofed",
+            embedding_base_url: "https://example.com/v1",
+            embedding_model: "fake",
+            reranker_base_url: "https://example.com/v1",
+            reranker_model: "fake",
+        };
+        assert!(preset_uses_single_shared_key(spoofed.id));
+        assert!(preset_uses_auto_generic(spoofed.id));
+
+        // Opposite spoof: Custom id whose label pretends to be Qwen must NOT
+        // be treated as Qwen (proves label text is ignored).
+        let fake_qwen = ApiPreset {
+            id: ApiPresetId::Custom,
+            label: "Qwen (OpenRouter)",
+            hint: "spoofed qwen label on wrong id",
+            embedding_base_url: "https://openrouter.ai/api/v1",
+            embedding_model: "qwen/qwen3-embedding-8b",
+            reranker_base_url: "https://openrouter.ai/api/v1",
+            reranker_model: "qwen/qwen3-reranker-8b",
+        };
+        assert!(!preset_uses_single_shared_key(fake_qwen.id));
+        assert!(!preset_uses_auto_generic(fake_qwen.id));
     }
 }

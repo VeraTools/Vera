@@ -326,6 +326,35 @@ impl ResolvedLane {
         if let Some(reuse_index) = self.spec.reuse_index {
             config.insert("lane.reuse_index".to_string(), reuse_index.to_string());
         }
+        if provenance.rerank {
+            // Explicit reranker provenance (replaces run-note fallback)
+            let retrieval = vera_core::config::VeraConfig::default().retrieval;
+            config.insert(
+                "retrieval.rerank_candidates".to_string(),
+                retrieval.rerank_candidates.to_string(),
+            );
+            config.insert(
+                "retrieval.reranker_max_doc_chars".to_string(),
+                retrieval.reranker_max_doc_chars.to_string(),
+            );
+            config.insert(
+                "retrieval.max_rerank_batch".to_string(),
+                retrieval.max_rerank_batch.to_string(),
+            );
+            // Bare keys per the milestone spec shorthand
+            config.insert(
+                "rerank_candidates".to_string(),
+                retrieval.rerank_candidates.to_string(),
+            );
+            config.insert(
+                "reranker_max_doc_chars".to_string(),
+                retrieval.reranker_max_doc_chars.to_string(),
+            );
+            config.insert(
+                "max_rerank_batch".to_string(),
+                retrieval.max_rerank_batch.to_string(),
+            );
+        }
         config
     }
 }
@@ -1018,5 +1047,68 @@ mod tests {
         // BM25 lane is identified as bm25 (backend None) and should never reuse; the adapter's
         // hard-coded false is verified in vera_adapter tests.
         assert!(lane.is_bm25());
+    }
+
+    #[test]
+    fn lane_reranker_provenance_emitted_when_rerank_enabled() {
+        // Explicit reranker provenance replaces the run-note fallback
+        // (VAL-SCREEN-011): version_info.config must contain candidate depth,
+        // doc budget, and batch when reranking is enabled.
+        let base = preset("vera-bm25").unwrap();
+        let rerank_spec = LaneSpec {
+            name: "api-rerank".to_string(),
+            backend: "api".to_string(),
+            rerank: true,
+            model_id: Some("test-model".to_string()),
+            ..base.clone()
+        };
+        let lane = resolve(rerank_spec).unwrap();
+        let prov = lane.provenance().unwrap();
+        assert!(prov.rerank, "api lane with rerank=true must be reranking");
+        let map = lane.config_map(&prov);
+        for key in [
+            "retrieval.rerank_candidates",
+            "retrieval.reranker_max_doc_chars",
+            "retrieval.max_rerank_batch",
+            "rerank_candidates",
+            "reranker_max_doc_chars",
+            "max_rerank_batch",
+        ] {
+            assert!(
+                map.contains_key(key),
+                "reranker key {key} must be present when rerank enabled"
+            );
+        }
+        assert_eq!(map.get("retrieval.rerank_candidates").unwrap(), "50");
+        assert_eq!(map.get("retrieval.reranker_max_doc_chars").unwrap(), "4800");
+        assert_eq!(map.get("retrieval.max_rerank_batch").unwrap(), "20");
+        assert_eq!(map.get("rerank_candidates").unwrap(), "50");
+        assert_eq!(map.get("reranker_max_doc_chars").unwrap(), "4800");
+        assert_eq!(map.get("max_rerank_batch").unwrap(), "20");
+
+        let no_rerank_spec = LaneSpec {
+            name: "api-no-rerank".to_string(),
+            backend: "api".to_string(),
+            rerank: false,
+            model_id: Some("test-model".to_string()),
+            ..base
+        };
+        let lane2 = resolve(no_rerank_spec).unwrap();
+        let prov2 = lane2.provenance().unwrap();
+        assert!(!prov2.rerank);
+        let map2 = lane2.config_map(&prov2);
+        for key in [
+            "retrieval.rerank_candidates",
+            "retrieval.reranker_max_doc_chars",
+            "retrieval.max_rerank_batch",
+            "rerank_candidates",
+            "reranker_max_doc_chars",
+            "max_rerank_batch",
+        ] {
+            assert!(
+                !map2.contains_key(key),
+                "reranker key {key} must be absent when rerank disabled"
+            );
+        }
     }
 }
