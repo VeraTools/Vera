@@ -57,6 +57,7 @@ pub fn attach_provenance(report: &mut EvalReport, provenance: ReportProvenance) 
     report.version_info.task_set = Some(provenance.task_set);
     report.version_info.environment = provenance.environment;
     report.version_info.vera_git_sha = provenance.vera_git_sha;
+    report.version_info.host_cpu_model = Some(crate::lanes::host_cpu_model());
     report.version_info.command = provenance.command;
     report.version_info.corpus_version = provenance.corpus_version;
     report.version_info.metric_contract = METRIC_CONTRACT.to_string();
@@ -128,6 +129,7 @@ pub fn run_benchmark_scoped(
             lane: None,
             task_set: None,
             vera_git_sha: None,
+            host_cpu_model: None,
             command: Vec::new(),
             environment: BTreeMap::new(),
         },
@@ -288,6 +290,7 @@ pub fn run_benchmark_with_mock(mock: &MockAdapter, tasks: &[BenchmarkTask]) -> E
             lane: None,
             task_set: None,
             vera_git_sha: None,
+            host_cpu_model: None,
             command: Vec::new(),
             environment: BTreeMap::new(),
         },

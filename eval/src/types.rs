@@ -191,6 +191,9 @@ pub struct VersionInfo {
     /// Vera source revision used for the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vera_git_sha: Option<String>,
+    /// Host CPU model (from /proc/cpuinfo model name on Linux, "unknown" fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu_model: Option<String>,
     /// Process arguments used to invoke the evaluator.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
@@ -321,6 +324,7 @@ mod tests {
             lane: None,
             task_set: None,
             vera_git_sha: None,
+            host_cpu_model: Some("AMD Ryzen 7 9800X3D 8-Core Processor".to_string()),
             command: Vec::new(),
             environment: BTreeMap::new(),
         };

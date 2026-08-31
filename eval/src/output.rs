@@ -238,6 +238,7 @@ mod tests {
                 lane: None,
                 task_set: None,
                 vera_git_sha: None,
+                host_cpu_model: None,
                 command: Vec::new(),
                 environment: Default::default(),
             },
