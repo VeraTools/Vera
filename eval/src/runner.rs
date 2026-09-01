@@ -23,6 +23,7 @@ pub struct ReportProvenance {
     pub command: Vec<String>,
     pub corpus_version: u32,
     pub semble: Option<SembleSnapshot>,
+    pub host_cpu_model: String,
 }
 
 /// Trait for tool adapters that execute search queries.
@@ -52,12 +53,15 @@ pub trait ToolAdapter {
 }
 
 /// Add invocation metadata to a completed report.
+///
+/// `provenance.host_cpu_model` is the cached `/proc/cpuinfo` value for this
+/// report, shared with `provenance.environment` so equality is by construction.
 pub fn attach_provenance(report: &mut EvalReport, provenance: ReportProvenance) {
     report.version_info.lane = provenance.lane;
     report.version_info.task_set = Some(provenance.task_set);
     report.version_info.environment = provenance.environment;
     report.version_info.vera_git_sha = provenance.vera_git_sha;
-    report.version_info.host_cpu_model = Some(crate::lanes::host_cpu_model());
+    report.version_info.host_cpu_model = Some(provenance.host_cpu_model);
     report.version_info.command = provenance.command;
     report.version_info.corpus_version = provenance.corpus_version;
     report.version_info.metric_contract = METRIC_CONTRACT.to_string();

@@ -33,22 +33,22 @@ const LOCAL_MODEL_ENV_KEYS: &[&str] = &[
 ];
 
 const PROVENANCE_ENV_KEYS: &[&str] = &[
-    "VERA_BACKEND",
-    "VERA_LOCAL",
+    "EMBEDDING_MODEL_API_KEY",
     "EMBEDDING_MODEL_BASE_URL",
     "EMBEDDING_MODEL_ID",
-    "EMBEDDING_MODEL_API_KEY",
     "EMBEDDING_QUERY_PREFIX",
+    "RERANKER_MODEL_API_KEY",
     "RERANKER_MODEL_BASE_URL",
     "RERANKER_MODEL_ID",
-    "RERANKER_MODEL_API_KEY",
-    "VERA_MAX_RERANK_BATCH",
-    "VERA_RANKING_FILENAME_STEM_BOOST",
-    "VERA_RANKING_DEFINITION_BOOST",
-    "VERA_RANKING_RECALL_POOL_EXPANSION",
-    "VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY",
-    "VERA_RANKING_CANDIDATE_POOL_MULTIPLIER",
+    "VERA_BACKEND",
     "VERA_INDEXING_CHUNK_MAX_CHARS",
+    "VERA_LOCAL",
+    "VERA_MAX_RERANK_BATCH",
+    "VERA_RANKING_CANDIDATE_POOL_MULTIPLIER",
+    "VERA_RANKING_DEFINITION_BOOST",
+    "VERA_RANKING_FILENAME_STEM_BOOST",
+    "VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY",
+    "VERA_RANKING_RECALL_POOL_EXPANSION",
 ];
 
 /// Key used to record the host CPU model in the environment provenance block.
@@ -73,7 +73,7 @@ pub fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
 }
 
 /// Return the host CPU model from raw cpuinfo content, or a placeholder when unavailable.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn host_cpu_model_from_content(content: &str) -> String {
     parse_cpu_model(content).unwrap_or_else(|| "unknown".to_string())
 }
@@ -748,28 +748,36 @@ fn set_env_os(key: &str, value: Option<&OsString>) {
 }
 
 /// Summarize relevant runtime environment without emitting credentials.
-pub fn environment_summary(lane: &ResolvedLane) -> BTreeMap<String, String> {
+///
+/// `host_cpu_model` is the cached `/proc/cpuinfo` value for this report;
+/// passing it ensures the environment block and `VersionInfo.host_cpu_model`
+/// are equal by construction.
+pub fn environment_summary(lane: &ResolvedLane, host_cpu_model: &str) -> BTreeMap<String, String> {
     let keys: HashSet<&str> = PROVENANCE_ENV_KEYS
         .iter()
         .copied()
         .chain(lane.spec.environment.keys().map(String::as_str))
         .chain(LOCAL_MODEL_ENV_KEYS.iter().copied())
         .collect();
-    environment_summary_for_keys(keys)
+    environment_summary_for_keys(keys, host_cpu_model)
 }
 
 /// Summarize the evaluator's relevant process environment for non-model lanes.
-pub fn process_environment_summary() -> BTreeMap<String, String> {
+pub fn process_environment_summary(host_cpu_model: &str) -> BTreeMap<String, String> {
     environment_summary_for_keys(
         PROVENANCE_ENV_KEYS
             .iter()
             .copied()
             .chain(LOCAL_MODEL_ENV_KEYS.iter().copied())
             .collect(),
+        host_cpu_model,
     )
 }
 
-fn environment_summary_for_keys(keys: HashSet<&str>) -> BTreeMap<String, String> {
+fn environment_summary_for_keys(
+    keys: HashSet<&str>,
+    host_cpu_model: &str,
+) -> BTreeMap<String, String> {
     let mut summary = BTreeMap::new();
     for key in keys {
         let value = std::env::var(key).unwrap_or_else(|_| "<unset>".to_string());
@@ -786,8 +794,9 @@ fn environment_summary_for_keys(keys: HashSet<&str>) -> BTreeMap<String, String>
     }
     // Host CPU model is derived from /proc/cpuinfo, not an env var, but
     // recorded alongside the environment block so hardware changes are
-    // detectable from the artifact alone.
-    summary.insert(HOST_CPU_MODEL_KEY.to_string(), host_cpu_model());
+    // detectable from the artifact alone. The value is supplied by the
+    // caller (cached once per report) so both sites are equal by construction.
+    summary.insert(HOST_CPU_MODEL_KEY.to_string(), host_cpu_model.to_string());
     summary
 }
 
@@ -1216,7 +1225,7 @@ microcode\t: 0xb404038
 
     #[test]
     fn environment_block_records_ranking_overrides_with_effective_values() {
-        // Guard the three ranking env keys plus the host key via the shared ENV_LOCK.
+        // Guard the three ranking env keys **** the host key via the shared ENV_LOCK.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Remember prior values to restore deterministically.
         let keys = [
@@ -1228,13 +1237,14 @@ microcode\t: 0xb404038
             .iter()
             .map(|k| (k.to_string(), std::env::var_os(k)))
             .collect();
+        let host_cpu = host_cpu_model();
 
         // Case 1: when set to 0, the environment block records "0".
         for k in keys {
             unsafe { std::env::set_var(k, "0") };
         }
         let lane = resolve(preset("vera-potion").unwrap()).unwrap();
-        let env = environment_summary(&lane);
+        let env = environment_summary(&lane, &host_cpu);
         for k in keys {
             assert_eq!(
                 env.get(k).map(String::as_str),
@@ -1253,7 +1263,7 @@ microcode\t: 0xb404038
         for k in keys {
             unsafe { std::env::remove_var(k) };
         }
-        let env2 = environment_summary(&lane);
+        let env2 = environment_summary(&lane, &host_cpu);
         for k in keys {
             assert_eq!(
                 env2.get(k).map(String::as_str),
@@ -1284,7 +1294,8 @@ microcode\t: 0xb404038
         // key follows the dot-notation precedent.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let lane = resolve(preset("vera-bm25").unwrap()).unwrap();
-        let env = environment_summary(&lane);
+        let host_cpu = host_cpu_model();
+        let env = environment_summary(&lane, &host_cpu);
         // Existing key still present and uses "<unset>" when not set.
         assert!(env.contains_key("VERA_BACKEND"));
         // New keys exist.
@@ -1328,7 +1339,8 @@ microcode\t: 0xb404038
     #[test]
     fn new_field_is_additive_host_cpu_present_in_provenance() {
         let lane = resolve(preset("vera-potion").unwrap()).unwrap();
-        let env = environment_summary(&lane);
+        let host_cpu = host_cpu_model();
+        let env = environment_summary(&lane, &host_cpu);
         let cpu = env
             .get(HOST_CPU_MODEL_KEY)
             .expect("host CPU in environment");
@@ -1348,6 +1360,102 @@ microcode\t: 0xb404038
         assert_eq!(
             cpu, &top,
             "environment and direct host_cpu_model should agree"
+        );
+    }
+
+    #[test]
+    fn cached_host_cpu_equality_by_construction() {
+        // Prove the report records one cached value used by both sites.
+        // Fabricate a distinct CPU string and pass it to both the environment
+        // block and the VersionInfo assembly; they must be equal and must
+        // equal the fabricated input (not a second file read).
+        let fabricated = "test-cpu-model-xyz-123";
+        let lane = resolve(preset("vera-potion").unwrap()).unwrap();
+        let env = environment_summary(&lane, fabricated);
+        assert_eq!(
+            env.get(HOST_CPU_MODEL_KEY).map(String::as_str),
+            Some(fabricated)
+        );
+
+        // Also prove process_environment_summary uses the same cached value.
+        let env2 = process_environment_summary(fabricated);
+        assert_eq!(
+            env2.get(HOST_CPU_MODEL_KEY).map(String::as_str),
+            Some(fabricated)
+        );
+
+        // And that attach_provenance records the same cached value in both
+        // environment and VersionInfo.host_cpu_model.
+        use crate::runner::{ReportProvenance, attach_provenance};
+        use crate::types::{TaskSetIdentity, VersionInfo};
+
+        let mut report = crate::types::EvalReport {
+            tool_name: "test".to_string(),
+            timestamp: "2026-08-31T00:00:00Z".to_string(),
+            version_info: VersionInfo {
+                tool_version: "test".to_string(),
+                corpus_version: 1,
+                metric_contract: "test".to_string(),
+                semble: None,
+                repo_shas: std::collections::HashMap::new(),
+                config: std::collections::HashMap::new(),
+                lane: None,
+                task_set: None,
+                vera_git_sha: None,
+                host_cpu_model: None,
+                command: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            },
+            per_task: Vec::new(),
+            per_category: std::collections::HashMap::new(),
+            aggregate: crate::types::AggregateMetrics {
+                retrieval: crate::types::RetrievalMetrics {
+                    ndcg: 0.0,
+                    recall_at_1: 0.0,
+                    recall_at_5: 0.0,
+                    recall_at_10: 0.0,
+                    mrr: 0.0,
+                },
+                performance: crate::types::PerformanceMetrics {
+                    latency_p50_ms: 0.0,
+                    latency_p95_ms: 0.0,
+                    index_time_secs: 0.0,
+                    storage_size_bytes: 0,
+                    total_token_count: 0,
+                },
+                task_count: 0,
+            },
+        };
+        let provenance = ReportProvenance {
+            lane: None,
+            task_set: TaskSetIdentity {
+                count: 0,
+                task_ids_sha256: "test".to_string(),
+            },
+            config: std::collections::BTreeMap::new(),
+            environment: env.clone(),
+            vera_git_sha: None,
+            command: Vec::new(),
+            corpus_version: 1,
+            semble: None,
+            host_cpu_model: fabricated.to_string(),
+        };
+        attach_provenance(&mut report, provenance);
+        assert_eq!(
+            report.version_info.host_cpu_model.as_deref(),
+            Some(fabricated)
+        );
+        assert_eq!(
+            report
+                .version_info
+                .environment
+                .get(HOST_CPU_MODEL_KEY)
+                .map(String::as_str),
+            Some(fabricated)
+        );
+        assert_eq!(
+            report.version_info.environment.get(HOST_CPU_MODEL_KEY),
+            report.version_info.host_cpu_model.as_ref()
         );
     }
 }
