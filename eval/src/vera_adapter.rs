@@ -283,6 +283,19 @@ fn indexing_config_matches(store: &MetadataStore, config: &VeraConfig) -> bool {
     {
         return false;
     }
+    // Chunk char budget is content-affecting (~750-char hypothesis). Stored
+    // under "chunk_max_chars" (new) with alias "max_chunk_chars" for compat.
+    // Old indexes lack the key; treat missing as 0 (DEFAULT OFF) so
+    // byte-identical default chunking still reuses old indexes.
+    let stored_chunk_chars = value
+        .get("chunk_max_chars")
+        .or_else(|| value.get("max_chunk_chars"))
+        .or_else(|| value.get("max_chunk_characters"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if stored_chunk_chars != config.indexing.chunk_max_chars_effective() as u64 {
+        return false;
+    }
     if value.get("max_file_size_bytes").and_then(|v| v.as_u64())
         != Some(config.indexing.max_file_size_bytes)
     {

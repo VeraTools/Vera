@@ -104,6 +104,10 @@ fn print_human_config(config: &vera_core::config::VeraConfig) {
         "    max_chunk_bytes           {}",
         config.indexing.max_chunk_bytes
     );
+    println!(
+        "    chunk_max_chars           {}",
+        config.indexing.chunk_max_chars
+    );
     println!();
     println!("  Retrieval:");
     println!(
@@ -162,6 +166,14 @@ fn print_human_config(config: &vera_core::config::VeraConfig) {
     println!(
         "    reranker_return_documents {:?}",
         config.retrieval.reranker_return_documents
+    );
+    println!(
+        "    ranking_multiplicative_path_penalty {}",
+        config.retrieval.ranking_multiplicative_path_penalty
+    );
+    println!(
+        "    ranking_candidate_pool_multiplier {}",
+        config.retrieval.ranking_candidate_pool_multiplier
     );
     println!();
     println!("  Embedding:");
@@ -228,6 +240,9 @@ pub fn get_config_value(
         "indexing.max_chunk_bytes" => Some(serde_json::Value::Number(
             config.indexing.max_chunk_bytes.into(),
         )),
+        "indexing.chunk_max_chars" | "indexing.max_chunk_chars" => Some(serde_json::Value::Number(
+            config.indexing.chunk_max_chars.into(),
+        )),
         "retrieval.default_limit" => Some(serde_json::Value::Number(
             config.retrieval.default_limit.into(),
         )),
@@ -285,6 +300,16 @@ pub fn get_config_value(
         | "retrieval.return_documents" => {
             serde_json::to_value(config.retrieval.reranker_return_documents).ok()
         }
+        "retrieval.ranking_multiplicative_path_penalty"
+        | "retrieval.ranking_path_penalty"
+        | "retrieval.ranking_multiplicative_penalty" => Some(serde_json::Value::Bool(
+            config.retrieval.ranking_multiplicative_path_penalty,
+        )),
+        "retrieval.ranking_candidate_pool_multiplier"
+        | "retrieval.ranking_pool_multiplier"
+        | "retrieval.ranking_candidate_pool_size_multiplier" => Some(serde_json::Value::Bool(
+            config.retrieval.ranking_candidate_pool_multiplier,
+        )),
         "embedding.batch_size" => Some(serde_json::Value::Number(
             config.embedding.batch_size.into(),
         )),
@@ -338,6 +363,11 @@ fn set_config_value(
         }
         "indexing.max_chunk_bytes" => {
             config.indexing.max_chunk_bytes = parse_value(key, value)?;
+        }
+        "indexing.chunk_max_chars"
+        | "indexing.max_chunk_chars"
+        | "indexing.max_chunk_characters" => {
+            config.indexing.chunk_max_chars = parse_value(key, value)?;
         }
         "retrieval.default_limit" => {
             config.retrieval.default_limit = parse_positive(key, value)?;
@@ -417,6 +447,16 @@ fn set_config_value(
         | "retrieval.rerank_return_documents"
         | "retrieval.return_documents" => {
             config.retrieval.reranker_return_documents = parse_optional_bool(key, value)?;
+        }
+        "retrieval.ranking_multiplicative_path_penalty"
+        | "retrieval.ranking_path_penalty"
+        | "retrieval.ranking_multiplicative_penalty" => {
+            config.retrieval.ranking_multiplicative_path_penalty = parse_value(key, value)?;
+        }
+        "retrieval.ranking_candidate_pool_multiplier"
+        | "retrieval.ranking_pool_multiplier"
+        | "retrieval.ranking_candidate_pool_size_multiplier" => {
+            config.retrieval.ranking_candidate_pool_multiplier = parse_value(key, value)?;
         }
         "embedding.batch_size" => {
             config.embedding.batch_size = parse_positive(key, value)?;
