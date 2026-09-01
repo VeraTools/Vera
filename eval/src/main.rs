@@ -346,17 +346,19 @@ fn run_lane(
     };
 
     let provenance = lane.provenance()?;
+    let host_cpu_model = crate::lanes::host_cpu_model();
     runner::attach_provenance(
         &mut report,
         runner::ReportProvenance {
             lane: Some(provenance.clone()),
             task_set: lanes::task_set_identity(&evaluated_tasks),
             config: lane.config_map(&provenance),
-            environment: lanes::environment_summary(lane),
+            environment: lanes::environment_summary(lane, &host_cpu_model),
             vera_git_sha: vera_git_sha(),
             command: std::env::args().collect(),
             corpus_version: corpus.version,
             semble: corpus.semble,
+            host_cpu_model,
         },
     );
     Ok(report)
@@ -370,17 +372,19 @@ fn run_mock(tasks: Vec<types::BenchmarkTask>, tool_name: &str) -> Result<types::
         }
         _ => unreachable!("mock tool validated by caller"),
     };
+    let host_cpu_model = crate::lanes::host_cpu_model();
     runner::attach_provenance(
         &mut report,
         runner::ReportProvenance {
             lane: None,
             task_set: lanes::task_set_identity(&tasks),
             config: BTreeMap::new(),
-            environment: lanes::process_environment_summary(),
+            environment: lanes::process_environment_summary(&host_cpu_model),
             vera_git_sha: vera_git_sha(),
             command: std::env::args().collect(),
             corpus_version: 1,
             semble: None,
+            host_cpu_model,
         },
     );
     Ok(report)

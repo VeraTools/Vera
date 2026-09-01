@@ -536,12 +536,28 @@ async fn search_hybrid_inner(
     // backend detection (is_flat, index_count) and the later vector search.
     // This halves manifest reads + Mutex contention per warm query while
     // preserving stamp-guarded staleness (the single open already checked).
+    // Retain the original error as context so failures remain debuggable
+    // (fallback to BM25 is unchanged; the error is surfaced via the warn! log
+    // and the BothFailed variant).
+    let mut vector_store_error: Option<anyhow::Error> = None;
     let vector_store_cached: Option<Arc<Mutex<VectorStore>>> = match &stores {
-        Some(s) => s.vector_store(stored_dim).ok(),
+        Some(s) => match s.vector_store(stored_dim) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                vector_store_error = Some(e);
+                None
+            }
+        },
         None => None,
     };
     let vector_store_direct: Option<VectorStore> = if stores.is_none() {
-        VectorStore::open(&index_dir.join("vectors.db"), stored_dim).ok()
+        match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                vector_store_error = Some(e);
+                None
+            }
+        }
     } else {
         None
     };
@@ -611,9 +627,11 @@ async fn search_hybrid_inner(
                 Err(err) => Err(err),
             }
         }
-        (Some(_), None, _) => Err(VectorSearchError::StorageError(anyhow::anyhow!(
-            "failed to open vector store"
-        ))),
+        (Some(_), None, _) => Err(VectorSearchError::StorageError(
+            vector_store_error
+                .map(|e| e.context("failed to open vector store"))
+                .unwrap_or_else(|| anyhow::anyhow!("failed to open vector store")),
+        )),
         (None, _, Some(vector_store)) => {
             let vector_metadata_result = MetadataStore::open(&index_dir.join("metadata.db"))
                 .context("failed to open metadata store");
@@ -653,9 +671,11 @@ async fn search_hybrid_inner(
                 Err(err) => Err(VectorSearchError::StorageError(err)),
             }
         }
-        (None, _, None) => Err(VectorSearchError::StorageError(anyhow::anyhow!(
-            "failed to open vector store"
-        ))),
+        (None, _, None) => Err(VectorSearchError::StorageError(
+            vector_store_error
+                .map(|e| e.context("failed to open vector store"))
+                .unwrap_or_else(|| anyhow::anyhow!("failed to open vector store")),
+        )),
     };
     let embed_elapsed = vector_outcome
         .as_ref()

@@ -668,6 +668,32 @@ pub(super) fn apply_content_symbol_boost(
 /// demoting penalized ones.
 pub(super) const MULTIPLICATIVE_PATH_PENALTY_FACTOR: f64 = 0.3;
 
+/// Shared directory-classification constants (single definition to prevent drift).
+const TEST_DIRS: &[&str] = &[
+    "t",
+    "test",
+    "tests",
+    "testing",
+    "__tests__",
+    "spec",
+    "specs",
+    "testdata",
+    "fixture",
+    "fixtures",
+];
+const EXAMPLE_DIRS: &[&str] = &[
+    "example",
+    "examples",
+    "sample",
+    "samples",
+    "demo",
+    "demos",
+    "bench",
+    "benches",
+    "benchmark",
+    "benchmarks",
+];
+
 /// Apply the ~0.3× multiplicative penalty for test/compat/example paths.
 ///
 /// Respects the existing boost-directory gating (definition boost's
@@ -714,18 +740,6 @@ pub(super) fn apply_multiplicative_path_penalty(
 }
 
 fn definition_site_role_blocked_is_test(features: &QueryFeatures, result: &SearchResult) -> bool {
-    const TEST_DIRS: &[&str] = &[
-        "t",
-        "test",
-        "tests",
-        "testing",
-        "__tests__",
-        "spec",
-        "specs",
-        "testdata",
-        "fixture",
-        "fixtures",
-    ];
     let lower = result.file_path.to_ascii_lowercase();
     let mut parts = lower.rsplit('/');
     let filename = parts.next().unwrap_or("");
@@ -740,18 +754,6 @@ fn definition_site_role_blocked_is_example(
     features: &QueryFeatures,
     result: &SearchResult,
 ) -> bool {
-    const EXAMPLE_DIRS: &[&str] = &[
-        "example",
-        "examples",
-        "sample",
-        "samples",
-        "demo",
-        "demos",
-        "bench",
-        "benches",
-        "benchmark",
-        "benchmarks",
-    ];
     let lower = result.file_path.to_ascii_lowercase();
     let mut parts = lower.rsplit('/');
     let filename = parts.next().unwrap_or("");
@@ -774,30 +776,6 @@ fn definition_site_role_blocked_is_example(
 /// module named `testing.py` (click's CliRunner lives in
 /// src/click/testing.py) or `example.py` is still a definition site.
 fn definition_site_role_blocked(features: &QueryFeatures, result: &SearchResult) -> bool {
-    const TEST_DIRS: &[&str] = &[
-        "t",
-        "test",
-        "tests",
-        "testing",
-        "__tests__",
-        "spec",
-        "specs",
-        "testdata",
-        "fixture",
-        "fixtures",
-    ];
-    const EXAMPLE_DIRS: &[&str] = &[
-        "example",
-        "examples",
-        "sample",
-        "samples",
-        "demo",
-        "demos",
-        "bench",
-        "benches",
-        "benchmark",
-        "benchmarks",
-    ];
     let lower = result.file_path.to_ascii_lowercase();
     let mut parts = lower.rsplit('/');
     let filename = parts.next().unwrap_or("");
