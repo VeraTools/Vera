@@ -175,7 +175,7 @@ vera explain-path path/to/file
 
 ## Benchmarks
 
-Semble benchmark comparison on 1,251 tasks across 63 repositories (Vera v1.2.0 row measured 2026-08-26; Semble column from the 2026-08-23 comparison):
+Semble benchmark comparison on 1,251 tasks across 63 repositories (Vera v1.2.0 row measured 2026-08-26 on the pre-upgrade Ryzen 7 7600X3D host; Semble column from the 2026-08-23 comparison):
 
 | Tool | nDCG@10 | R@1 | R@5 | R@10 | MRR | Query p50 | Index time | Index size |
 |------|---------|------|------|-------|-----|-----------|------------|------------|
@@ -183,6 +183,8 @@ Semble benchmark comparison on 1,251 tasks across 63 repositories (Vera v1.2.0 r
 | Semble 0.5.5, full rerank stack | **0.8514** | **0.6747** | 0.9177 | **0.9656** | **0.8348** | **2.3 ms** | **100 s** | 32 GB |
 
 Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, graded relevance, and suffix-corrected path matching in the scorer. On the 320-task tuning subset, Vera scored `0.8534` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7654` versus Semble at `0.7655`. See [docs/benchmarks.md](docs/benchmarks.md) for the screening tables and historical comparisons.
+
+Latency figures from the 2026-08-26 host are not directly comparable to measurements on the current Ryzen 7 9800X3D host. See the hardware caveat in [docs/197-profiling.md](docs/197-profiling.md) and the v1.3.0 notes in [docs/whats-new.md](docs/whats-new.md). All new ranking knobs added in v1.3.0 ship default off, so the v1.2.0 ranking defaults match v1.3.0 and the quality columns (nDCG, recall, MRR) still represent current behavior.
 
 Full methodology and version history: [docs/benchmarks.md](docs/benchmarks.md).
 
