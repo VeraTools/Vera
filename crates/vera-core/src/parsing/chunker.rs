@@ -630,6 +630,82 @@ pub fn split_oversized_chunks(chunks: Vec<Chunk>, max_bytes: usize) -> Vec<Chunk
     result
 }
 
+/// Split chunks that exceed `max_chars` (character count) into smaller sub-chunks.
+///
+/// 0 disables char-based splitting (DEFAULT OFF). When enabled (~750), each
+/// oversized chunk is split at line boundaries so no sub-chunk exceeds
+/// `max_chars` characters. Mirrors `split_oversized_chunks` but uses
+/// character counts rather than byte counts, giving finer embedding locality
+/// for long chunks while preserving line boundaries.
+///
+pub fn split_oversized_chunks_by_chars(chunks: Vec<Chunk>, max_chars: usize) -> Vec<Chunk> {
+    if max_chars == 0 {
+        return chunks;
+    }
+
+    let mut result = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let char_count = chunk.content.chars().count();
+        if char_count <= max_chars {
+            result.push(chunk);
+            continue;
+        }
+
+        let lines: Vec<&str> = chunk.content.lines().collect();
+        let total = lines.len() as u32;
+        let mut current: u32 = 0;
+        let mut part = 1u32;
+
+        while current < total {
+            let mut lo = current;
+            let mut hi = (total - 1).min(current + 500);
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                let candidate: usize = lines[current as usize..=mid as usize]
+                    .iter()
+                    .map(|l| l.chars().count() + 1)
+                    .sum();
+                if candidate <= max_chars {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+
+            let end = lo.max(current);
+            let sub_content = lines[current as usize..=end as usize].join("\n");
+            let bare_name = chunk.symbol_name.clone();
+            let is_single = part == 1 && end + 1 >= total;
+            let part_index = if bare_name.is_none() || is_single {
+                None
+            } else {
+                Some(part)
+            };
+            let id = if is_single {
+                chunk.id.clone()
+            } else {
+                format!("{}:{part}", chunk.id)
+            };
+
+            result.push(Chunk {
+                id,
+                file_path: chunk.file_path.clone(),
+                line_start: chunk.line_start + current,
+                line_end: chunk.line_start + end,
+                content: sub_content,
+                language: chunk.language,
+                symbol_type: chunk.symbol_type,
+                symbol_name: bare_name,
+                part_index,
+            });
+
+            part += 1;
+            current = end + 1;
+        }
+    }
+    result
+}
+
 /// Join lines from `start_row` to `end_row` (inclusive, 0-based) into a string.
 fn join_lines(lines: &[&str], start_row: u32, end_row: u32) -> String {
     let start = start_row as usize;
@@ -1308,5 +1384,149 @@ mod tests {
             assert_eq!(c.symbol_name.as_deref(), Some("ByteProbe"));
             assert_eq!(c.part_index, Some((idx as u32) + 1));
         }
+    }
+
+    // ── Issue #196 hypothesis: ~750-char chunks (DEFAULT OFF, byte-identical when off) ──
+
+    #[test]
+    fn chunk_max_chars_off_is_byte_identical() {
+        // Gating: when chunk_max_chars is 0 (DEFAULT OFF), char splitting must be
+        // a no-op and produce byte-identical output vs master (no extra splits).
+        let content = "a".repeat(2000);
+        let chunk = Chunk {
+            id: "src/large.rs:0".to_string(),
+            file_path: "src/large.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: content.clone(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("Large".to_string()),
+            part_index: None,
+        };
+        let unsplit = split_oversized_chunks_by_chars(vec![chunk.clone()], 0);
+        assert_eq!(
+            unsplit.len(),
+            1,
+            "max_chars=0 must not split (DEFAULT OFF, byte-identical)"
+        );
+        assert_eq!(unsplit[0].content, content);
+        assert_eq!(unsplit[0].id, chunk.id);
+        assert_eq!(unsplit[0].part_index, None);
+
+        // Also verify the high-level config gating: default IndexingConfig
+        // (chunk_max_chars=0) produces same chunks as master.
+        let default_cfg = IndexingConfig::default();
+        assert_eq!(default_cfg.chunk_max_chars, 0);
+        assert_eq!(default_cfg.chunk_max_chars_effective(), 0);
+        assert!(!default_cfg.chunk_max_chars_enabled());
+        // Simulate a file that would be split by the 750-char knob but not by
+        // the 24 KB byte cap. With knob off, it must stay single-part.
+        let line = "x".repeat(100);
+        let src = (0..10).map(|_| line.clone()).collect::<Vec<_>>().join("\n");
+        let chunks_byte_only = split_oversized_chunks(
+            vec![Chunk {
+                id: "src/file.rs:0".to_string(),
+                file_path: "src/file.rs".to_string(),
+                line_start: 1,
+                line_end: 10,
+                content: src.clone(),
+                language: Language::Rust,
+                symbol_type: Some(SymbolType::Function),
+                symbol_name: Some("Func".to_string()),
+                part_index: None,
+            }],
+            24_576,
+        );
+        assert_eq!(chunks_byte_only.len(), 1, "24 KB cap should not split 1 KB file");
+        let chunks_gated =
+            split_oversized_chunks_by_chars(chunks_byte_only.clone(), default_cfg.chunk_max_chars_effective());
+        assert_eq!(
+            chunks_gated.len(),
+            chunks_byte_only.len(),
+            "char knob OFF must be byte-identical (no extra splits)"
+        );
+        assert_eq!(chunks_gated[0].content, chunks_byte_only[0].content);
+    }
+
+    #[test]
+    fn chunk_max_chars_on_splits_finer_than_byte_cap() {
+        // When enabled at ~750 chars, a long chunk should be split into
+        // finer pieces than the 24 KB byte cap would.
+        let content = "line content with some text\n".repeat(50); // ~1400 chars
+        let chunk = Chunk {
+            id: "src/large.rs:0".to_string(),
+            file_path: "src/large.rs".to_string(),
+            line_start: 1,
+            line_end: 50,
+            content: content.clone(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("Large".to_string()),
+            part_index: None,
+        };
+        let unsplit_bytes = split_oversized_chunks(vec![chunk.clone()], 24_576);
+        assert_eq!(unsplit_bytes.len(), 1, "24 KB byte cap should not split this");
+        let split_chars = split_oversized_chunks_by_chars(vec![chunk], 750);
+        assert!(
+            split_chars.len() >= 2,
+            "750-char budget should split into ≥2 parts, got {}",
+            split_chars.len()
+        );
+        for c in &split_chars {
+            assert!(
+                c.content.chars().count() <= 750,
+                "sub-chunk exceeds 750 chars: {} chars",
+                c.content.chars().count()
+            );
+            assert_eq!(c.symbol_name.as_deref(), Some("Large"));
+        }
+        // part_index and bare-name shape mirrors byte path
+        for (idx, c) in split_chars.iter().enumerate() {
+            assert_eq!(c.part_index, Some((idx as u32) + 1));
+            assert_eq!(c.id, format!("src/large.rs:0:{}", idx + 1));
+        }
+        // Single-part unsplit case must keep bare name and no part_index
+        let small = Chunk {
+            id: "src/small.rs:0".to_string(),
+            file_path: "src/small.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            content: "small".to_string(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("Small".to_string()),
+            part_index: None,
+        };
+        let unsplit_small = split_oversized_chunks_by_chars(vec![small.clone()], 750);
+        assert_eq!(unsplit_small.len(), 1);
+        assert_eq!(unsplit_small[0].part_index, None);
+        assert_eq!(unsplit_small[0].id, small.id);
+    }
+
+    #[test]
+    fn chunk_max_chars_split_preserves_no_gaps() {
+        // No content gaps when splitting by chars (same guarantee as bytes).
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i} content")).collect();
+        let content = lines.join("\n");
+        let chunk = Chunk {
+            id: "src/file.rs:0".to_string(),
+            file_path: "src/file.rs".to_string(),
+            line_start: 1,
+            line_end: 20,
+            content: content.clone(),
+            language: Language::Rust,
+            symbol_type: Some(SymbolType::Function),
+            symbol_name: Some("Func".to_string()),
+            part_index: None,
+        };
+        let split = split_oversized_chunks_by_chars(vec![chunk], 50);
+        assert!(split.len() > 1);
+        let reconstructed = split
+            .iter()
+            .map(|c| c.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(reconstructed, content);
     }
 }

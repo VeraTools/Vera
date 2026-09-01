@@ -150,6 +150,9 @@ fn score_pool_with_config(
     if retrieval.ranking_definition_boost_enabled() {
         apply_content_symbol_boost(features, &mut scores, results, max_score);
     }
+    if retrieval.ranking_multiplicative_path_penalty_enabled() {
+        apply_multiplicative_path_penalty(features, &mut scores, results);
+    }
 
     scores
 }

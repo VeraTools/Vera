@@ -817,3 +817,193 @@ fn file_coherence_boost_survives_definition_flag_toggle() {
         "coherence boost must still promote repeated file even with definition boost off"
     );
 }
+
+// ── Issue #196 hypotheses: multiplicative path penalty (DEFAULT OFF, 0.3×) ──
+
+#[test]
+fn multiplicative_path_penalty_is_toggleable() {
+    // Two files with equal base rank and neutral content; one is in tests/.
+    // With penalty disabled (DEFAULT OFF) the input order holds. With it
+    // enabled, the tests/ fixture must be demoted below src/ — multiplicative
+    // 0.3× preserves ordering among non-penalized while demoting penalized.
+    let neutral = "pub fn helper() {}";
+    let results = vec![
+        make_result(
+            "tests/fixtures/helper.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            neutral,
+        ),
+        make_result(
+            "src/helper.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            neutral,
+        ),
+    ];
+
+    // DEFAULT OFF: first result (tests/) should stay first because scores are
+    // base_rank + prior where prior's additive test penalty (-0.95) already
+    // applies, but the multiplicative gate is OFF. To isolate the multiplicative
+    // effect, we use a query that does NOT trigger additive test penalty?
+    // Actually additive penalty always applies for tests/ when not wanting tests.
+    // The multiplicative is extra; with it OFF, ordering is determined by base
+    // rank + additive only. Since first has higher base_rank (1.0 vs 0.5), it
+    // may still outrank src/ depending on additive. Instead we place src/ first
+    // so that additive alone keeps src/ first, and multiplicative is the extra
+    // guarantee. Simplify: src/ first, tests/ second — with additive, src/
+    // already wins; multiplicative keeps that.
+    let src_first = vec![
+        make_result(
+            "src/helper.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            neutral,
+        ),
+        make_result(
+            "tests/fixtures/helper.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            neutral,
+        ),
+    ];
+
+    let mut disabled = VeraConfig::default();
+    disabled.retrieval.ranking_multiplicative_path_penalty = false;
+    let ranked_off = apply_query_ranking_with_filters_and_config(
+        "helper utility",
+        src_first.clone(),
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &disabled,
+    );
+    assert_eq!(
+        ranked_off[0].file_path, "src/helper.rs",
+        "with penalty OFF, src/ should still beat tests/ (additive already)"
+    );
+
+    let mut enabled = VeraConfig::default();
+    enabled.retrieval.ranking_multiplicative_path_penalty = true;
+    let ranked_on = apply_query_ranking_with_filters_and_config(
+        "helper utility",
+        src_first,
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &enabled,
+    );
+    assert_eq!(
+        ranked_on[0].file_path, "src/helper.rs",
+        "with penalty ON, src/ must still beat tests/ (multiplicative reinforces)"
+    );
+
+    // More direct: place tests/ first — even though it starts with higher
+    // base_rank, the multiplicative penalty must demote it below src/.
+    let tests_first = vec![
+        make_result(
+            "tests/fixtures/helper.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            neutral,
+        ),
+        make_result(
+            "src/helper.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            neutral,
+        ),
+    ];
+    let ranked_tests_first_on = apply_query_ranking_with_filters_and_config(
+        "helper utility",
+        tests_first.clone(),
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &enabled,
+    );
+    assert_eq!(
+        ranked_tests_first_on[0].file_path, "src/helper.rs",
+        "multiplicative 0.3× must demote tests/ below equally-scoring src/ even when tests/ starts first"
+    );
+
+    // Respects gating: when query explicitly wants tests, penalty must not fire.
+    let ranked_wants_tests = apply_query_ranking_with_filters_and_config(
+        "helper utility tests",
+        tests_first,
+        RankingStage::Initial,
+        &SearchFilters::default(),
+        &enabled,
+    );
+    // When query wants tests, the penalized path is not demoted — it may keep
+    // its base_rank advantage. We only assert it is not multiplicatively
+    // demoted below src/ in that mode. Since base_rank plus no additive,
+    // tests/ first should stay first.
+    assert_eq!(
+        ranked_wants_tests[0].file_path, "tests/fixtures/helper.rs",
+        "when query wants tests, penalty must respect gating and not demote"
+    );
+}
+
+#[test]
+fn multiplicative_path_penalty_is_multiplicative_not_additive() {
+    // Directly verify the factor is multiplicative: apply the penalty to known
+    // scores and check ratio is ~0.3, not a constant subtract.
+    let features = QueryFeatures::from_query("helper utility");
+    assert!(
+        !features.wants_test_paths,
+        "query should not want test paths for this probe"
+    );
+    let results = vec![
+        make_result(
+            "tests/fixtures/helper.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            "pub fn helper() {}",
+        ),
+        make_result(
+            "src/helper.rs",
+            Some("helper"),
+            Some(SymbolType::Function),
+            "pub fn helper() {}",
+        ),
+    ];
+    let mut scores = vec![10.0, 10.0];
+    apply_multiplicative_path_penalty(&features, &mut scores, &results);
+    assert!(
+        (scores[0] - 3.0).abs() < 1e-6,
+        "tests/ score should be 10.0 * 0.3 = 3.0, got {}",
+        scores[0]
+    );
+    assert!(
+        (scores[1] - 10.0).abs() < 1e-6,
+        "src/ score should stay 10.0, got {}",
+        scores[1]
+    );
+
+    // Compat and example also penalized with same factor
+    let compat_results = vec![make_result(
+        "src/compat/session.rs",
+        Some("session"),
+        Some(SymbolType::Function),
+        "pub fn session() {}",
+    )];
+    let mut compat_scores = vec![7.0];
+    apply_multiplicative_path_penalty(&features, &mut compat_scores, &compat_results);
+    assert!(
+        (compat_scores[0] - 2.1).abs() < 1e-6,
+        "compat path should be 7.0 * 0.3 = 2.1, got {}",
+        compat_scores[0]
+    );
+
+    let example_results = vec![make_result(
+        "examples/demo.rs",
+        Some("demo"),
+        Some(SymbolType::Function),
+        "pub fn demo() {}",
+    )];
+    let mut example_scores = vec![4.0];
+    apply_multiplicative_path_penalty(&features, &mut example_scores, &example_results);
+    assert!(
+        (example_scores[0] - 1.2).abs() < 1e-6,
+        "example path should be 4.0 * 0.3 = 1.2, got {}",
+        example_scores[0]
+    );
+}
