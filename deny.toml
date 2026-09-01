@@ -1,4 +1,3 @@
-# CI trigger for docs PR 243: no functional change, ensures stable+MSRV checks run on docs-only change
 [advisories]
 # Unsound-advisory checking covers transitive dependencies too, so advisories
 # like RUSTSEC-2026-0253 (lru via tantivy) surface here instead of only in
