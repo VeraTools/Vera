@@ -60,7 +60,11 @@ pub fn parse_file_with_diagnostics(
     // Special-case formats that don't use standard symbol extraction.
     if language == Language::Markdown {
         let chunks = chunker::markdown_section_chunks(source, file_path);
-        return Ok((apply_splits(chunks, config), Vec::new(), ParseDiagnostics::default()));
+        return Ok((
+            apply_splits(chunks, config),
+            Vec::new(),
+            ParseDiagnostics::default(),
+        ));
     }
     if language == Language::Rst {
         let (chunks, diagnostics) = parse_rst_section_chunks(source, file_path)?;
@@ -68,7 +72,11 @@ pub fn parse_file_with_diagnostics(
     }
     if language.prefers_file_chunking() {
         let chunks = chunker::whole_file_chunk(source, file_path, language);
-        return Ok((apply_splits(chunks, config), Vec::new(), ParseDiagnostics::default()));
+        return Ok((
+            apply_splits(chunks, config),
+            Vec::new(),
+            ParseDiagnostics::default(),
+        ));
     }
     if uses_indexing_tier0_fallback(language) {
         let chunks = chunker::tier0_line_chunks(source, file_path, language);

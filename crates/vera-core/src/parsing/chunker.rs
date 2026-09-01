@@ -1438,9 +1438,15 @@ mod tests {
             }],
             24_576,
         );
-        assert_eq!(chunks_byte_only.len(), 1, "24 KB cap should not split 1 KB file");
-        let chunks_gated =
-            split_oversized_chunks_by_chars(chunks_byte_only.clone(), default_cfg.chunk_max_chars_effective());
+        assert_eq!(
+            chunks_byte_only.len(),
+            1,
+            "24 KB cap should not split 1 KB file"
+        );
+        let chunks_gated = split_oversized_chunks_by_chars(
+            chunks_byte_only.clone(),
+            default_cfg.chunk_max_chars_effective(),
+        );
         assert_eq!(
             chunks_gated.len(),
             chunks_byte_only.len(),
@@ -1466,7 +1472,11 @@ mod tests {
             part_index: None,
         };
         let unsplit_bytes = split_oversized_chunks(vec![chunk.clone()], 24_576);
-        assert_eq!(unsplit_bytes.len(), 1, "24 KB byte cap should not split this");
+        assert_eq!(
+            unsplit_bytes.len(),
+            1,
+            "24 KB byte cap should not split this"
+        );
         let split_chars = split_oversized_chunks_by_chars(vec![chunk], 750);
         assert!(
             split_chars.len() >= 2,

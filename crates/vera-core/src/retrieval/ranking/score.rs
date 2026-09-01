@@ -691,7 +691,9 @@ pub(super) fn apply_multiplicative_path_penalty(
         // ContentClass gate plus the definition-boost directory gating so
         // both signals respect the same explicit-request logic.
         if !features.wants_test_paths {
-            if matches!(role, ContentClass::Test) || definition_site_role_blocked_is_test(features, result) {
+            if matches!(role, ContentClass::Test)
+                || definition_site_role_blocked_is_test(features, result)
+            {
                 penalized = true;
             }
         }
@@ -714,7 +716,15 @@ pub(super) fn apply_multiplicative_path_penalty(
 
 fn definition_site_role_blocked_is_test(features: &QueryFeatures, result: &SearchResult) -> bool {
     const TEST_DIRS: &[&str] = &[
-        "t", "test", "tests", "testing", "__tests__", "spec", "specs", "testdata", "fixture",
+        "t",
+        "test",
+        "tests",
+        "testing",
+        "__tests__",
+        "spec",
+        "specs",
+        "testdata",
+        "fixture",
         "fixtures",
     ];
     let lower = result.file_path.to_ascii_lowercase();
@@ -732,8 +742,16 @@ fn definition_site_role_blocked_is_example(
     result: &SearchResult,
 ) -> bool {
     const EXAMPLE_DIRS: &[&str] = &[
-        "example", "examples", "sample", "samples", "demo", "demos", "bench", "benches",
-        "benchmark", "benchmarks",
+        "example",
+        "examples",
+        "sample",
+        "samples",
+        "demo",
+        "demos",
+        "bench",
+        "benches",
+        "benchmark",
+        "benchmarks",
     ];
     let lower = result.file_path.to_ascii_lowercase();
     let mut parts = lower.rsplit('/');

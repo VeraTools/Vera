@@ -220,7 +220,6 @@ impl IndexingConfig {
         self.chunk_max_chars_effective() != 0
     }
 }
-}
 
 /// Reranker wire protocol / capability selection.
 ///
@@ -532,8 +531,7 @@ impl Default for RetrievalConfig {
             ranking_definition_boost: default_ranking_definition_boost(),
             ranking_recall_pool_expansion: default_ranking_recall_pool_expansion(),
             ranking_multiplicative_path_penalty: default_ranking_multiplicative_path_penalty(),
-            ranking_candidate_pool_multiplier:
-                default_ranking_candidate_pool_multiplier(),
+            ranking_candidate_pool_multiplier: default_ranking_candidate_pool_multiplier(),
         }
     }
 }
