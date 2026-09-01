@@ -12,18 +12,18 @@ Release highlights from v1.0 onward. For the current benchmark tables and method
 
 ### Indexing progress and reuse
 
-- The embedding progress bar is now honest. While parsing is still in progress it shows open-ended work so far with no percentage, then switches to a fixed total at `ParsingDone` and fills monotonically to 100 percent. Cancellation and mid-run failures no longer imply success, small single-window repos show a fixed total directly, and non-TTY, `--no-progress` and `--json` modes are unchanged.
+- The embedding progress bar is now honest. While parsing is still in progress it shows open-ended work so far with no percentage, then switches to a fixed total at `ParsingDone` and fills monotonically to 100%. Cancellation and mid-run failures no longer imply success, small single-window repos show a fixed total directly, and non-TTY, `--no-progress` and `--json` modes are unchanged.
 - Evaluation lanes can reuse a current index when identity gates pass. `reuse_index: true` skips indexing only when the on-disk index matches embedding model name (including `model_aliases` and `VERA_EMBEDDING_MODEL_ALIASES`), document prefix, staleness, embedding dimension, content-affecting indexing config, and format version, with correct size accounting and BM25 never reusing.
 
 ### Ranking and retrieval
 
 - Three ranking signals for issue #196 are now toggleable with mechanism-first rationales: filename-stem boost, definition boost, and recall-pool expansion. Each has a config knob and `VERA_RANKING_*` env override, implemented separately from measurement and proven by dual-set ablations on the 320-task subset and 180-task independent set with full-suite confirmation before any quality claim.
-- Three additional hypotheses (multiplicative path penalties, candidate-pool multiplier, 750-char chunks) are implemented as default-off knobs with the same config and env pattern and correct index-identity wiring. Dual-set measurement on 320, 180 and full 1,251-task suites showed each below the 0.5 percent full-suite aggregate bar or with regression, so all three stay default off with honest negatives recorded. The chunk arm cites the prior 2048 window and cap negatives and reports its own index-time and storage cost.
+- Three additional hypotheses (multiplicative path penalties, candidate-pool multiplier, 750-char chunks) are implemented as default-off knobs with correct index-identity wiring. Dual-set ablations on the 320-task subset and 180-task independent set plus full 1,251-task confirmation showed each below the 0.5% full-suite aggregate bar or with regression, so all three stay default off with honest negatives recorded. The chunk arm cites the prior 2048 window and cap negatives and reports its own index-time and storage cost.
 - Reranker protocol now cleanly separates generic (`top_n` / `results`) from Voyage (`top_k` / `data`) with explicit config override over hostname auto-detection, and resilience covers permanent 4xx no-retry, capped `Retry-After` and `X-RateLimit-Reset` waits, cancellation, and graceful degradation.
 
 ### Setup and first-run
 
-- `vera setup` ships a Qwen OpenRouter preset and `vera setup --qwen` hardening, with `installation.md` and `models.md` updated in the same commits. The first-run flow is streamlined to a single key with auto protocol selection, and `README.md` plus both package READMEs move together for user-facing changes.
+- `vera setup` ships a Qwen (OpenRouter) preset in the interactive `vera setup` flow with single-key hardening, with `installation.md` and `models.md` updated in the same commits. The first-run flow is streamlined to a single key with auto protocol selection, and `README.md` plus both package READMEs move together for user-facing changes.
 - `vera doctor` now tolerates blank env values and probes DirectML more accurately, `vera uninstall` reports shim classification more precisely, and `retrieval.max_output_chars` help correctly shows `0 = unlimited`.
 
 ### Evaluation and provenance
