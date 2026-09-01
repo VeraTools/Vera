@@ -122,32 +122,28 @@ fn default_max_chunk_bytes() -> usize {
 }
 
 fn default_chunk_max_chars() -> usize {
-    // Primary env var follows VERA_INDEXING_* convention; fall back to
-    // legacy VERA_MAX_CHUNK_CHARS / VERA_CHUNK_MAX_CHARS aliases for
-    // backward compat / validator flexibility.
-    if let Ok(value) = std::env::var("VERA_INDEXING_CHUNK_MAX_CHARS") {
-        return match value.parse::<usize>() {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                tracing::warn!(
-                    key = "VERA_INDEXING_CHUNK_MAX_CHARS",
-                    value = %value,
-                    error = %error,
-                    "invalid numeric environment override; using default 0"
-                );
-                0
-            }
-        };
-    }
-    if let Ok(value) = std::env::var("VERA_MAX_CHUNK_CHARS") {
-        return value.parse::<usize>().unwrap_or_default();
-    }
-    if let Ok(value) = std::env::var("VERA_CHUNK_MAX_CHARS") {
-        return value.parse::<usize>().unwrap_or_default();
-    }
-    // Also handle VERA_INDEXING_MAX_CHUNK_CHARS alias if validator uses that order
-    if let Ok(value) = std::env::var("VERA_INDEXING_MAX_CHUNK_CHARS") {
-        return value.parse::<usize>().unwrap_or_default();
+    // Alias set and precedence match `IndexingConfig::chunk_max_chars_effective`
+    // (per alias-discipline convention): first wins, identical order.
+    for key in [
+        "VERA_INDEXING_CHUNK_MAX_CHARS",
+        "VERA_INDEXING_MAX_CHUNK_CHARS",
+        "VERA_MAX_CHUNK_CHARS",
+        "VERA_CHUNK_MAX_CHARS",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            return match value.parse::<usize>() {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    tracing::warn!(
+                        key,
+                        value = %value,
+                        error = %error,
+                        "invalid numeric environment override; using default 0"
+                    );
+                    0
+                }
+            };
+        }
     }
     0
 }
@@ -458,15 +454,18 @@ fn default_ranking_recall_pool_expansion() -> bool {
 
 fn default_ranking_multiplicative_path_penalty() -> bool {
     // Default OFF — only enabled when env is truthy or config explicitly true.
-    // Accept numeric "5"/"0" style is NOT needed here; penalty is pure bool.
-    // We also accept alias env VERA_RANKING_PATH_PENALTY for validator flexibility.
-    if std::env::var("VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY").is_ok() {
-        return env_bool("VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY", false);
+    // Alias set and precedence match `ranking_multiplicative_path_penalty_enabled`
+    // (per alias-discipline convention): first wins, identical order.
+    for key in [
+        "VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY",
+        "VERA_RANKING_PATH_PENALTY",
+        "VERA_RANKING_MULTIPLICATIVE_PENALTY",
+    ] {
+        if std::env::var(key).is_ok() {
+            return env_bool(key, false);
+        }
     }
-    if std::env::var("VERA_RANKING_PATH_PENALTY").is_ok() {
-        return env_bool("VERA_RANKING_PATH_PENALTY", false);
-    }
-    env_bool("VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY", false)
+    false
 }
 
 fn default_ranking_candidate_pool_multiplier() -> bool {
@@ -2254,5 +2253,127 @@ card0, 1073741824, 4294967296\n";
         let alias_json = r#"{"max_chunk_lines":200,"default_excludes":[],"max_file_size_bytes":1000000,"max_chunk_bytes":24576,"max_chunk_chars":750}"#;
         let alias_cfg: IndexingConfig = serde_json::from_str(alias_json).unwrap();
         assert_eq!(alias_cfg.chunk_max_chars, 750);
+    }
+
+    #[test]
+    fn alias_precedence_parity() {
+        // Chunk aliases: default* vs effective* must have identical set/order.
+        run_env_test(
+            "config::tests::chunk_alias_precedence_probe",
+            &[
+                ("VERA_INDEXING_CHUNK_MAX_CHARS", Some("111")),
+                ("VERA_INDEXING_MAX_CHUNK_CHARS", Some("222")),
+                ("VERA_MAX_CHUNK_CHARS", Some("333")),
+                ("VERA_CHUNK_MAX_CHARS", Some("444")),
+            ],
+        );
+        run_env_test(
+            "config::tests::chunk_alias_second_precedence_probe",
+            &[
+                ("VERA_INDEXING_CHUNK_MAX_CHARS", None),
+                ("VERA_INDEXING_MAX_CHUNK_CHARS", Some("222")),
+                ("VERA_MAX_CHUNK_CHARS", Some("333")),
+                ("VERA_CHUNK_MAX_CHARS", Some("444")),
+            ],
+        );
+        // Penalty aliases: default* vs effective* must be identical.
+        run_env_test(
+            "config::tests::penalty_alias_precedence_probe",
+            &[
+                ("VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY", Some("0")),
+                ("VERA_RANKING_PATH_PENALTY", Some("1")),
+                ("VERA_RANKING_MULTIPLICATIVE_PENALTY", Some("1")),
+            ],
+        );
+        run_env_test(
+            "config::tests::penalty_alias_second_precedence_probe",
+            &[
+                ("VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY", None),
+                ("VERA_RANKING_PATH_PENALTY", Some("1")),
+                ("VERA_RANKING_MULTIPLICATIVE_PENALTY", Some("0")),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by alias_precedence_parity"]
+    fn chunk_alias_precedence_probe() {
+        // All four chunk aliases set; first in precedence must win for both helpers.
+        assert_eq!(
+            std::env::var("VERA_INDEXING_CHUNK_MAX_CHARS").unwrap(),
+            "111"
+        );
+        let cfg = VeraConfig::default();
+        assert_eq!(
+            cfg.indexing.chunk_max_chars, 111,
+            "default_chunk_max_chars must respect first alias"
+        );
+        assert_eq!(
+            cfg.indexing.chunk_max_chars_effective(),
+            111,
+            "chunk_max_chars_effective must respect same first alias"
+        );
+        // Verify with a distinct stored value that effective still prefers env first.
+        let stored = IndexingConfig {
+            chunk_max_chars: 999,
+            ..Default::default()
+        };
+        assert_eq!(
+            stored.chunk_max_chars_effective(),
+            111,
+            "effective must prefer env over stored value with same precedence"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by alias_precedence_parity"]
+    fn chunk_alias_second_precedence_probe() {
+        assert!(std::env::var("VERA_INDEXING_CHUNK_MAX_CHARS").is_err());
+        assert_eq!(
+            std::env::var("VERA_INDEXING_MAX_CHUNK_CHARS").unwrap(),
+            "222"
+        );
+        let cfg = VeraConfig::default();
+        assert_eq!(cfg.indexing.chunk_max_chars, 222);
+        assert_eq!(cfg.indexing.chunk_max_chars_effective(), 222);
+    }
+
+    #[test]
+    #[ignore = "driven by alias_precedence_parity"]
+    fn penalty_alias_precedence_probe() {
+        // All three penalty aliases set with conflicting values; first must win.
+        assert_eq!(
+            std::env::var("VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY").unwrap(),
+            "0"
+        );
+        let cfg = VeraConfig::default();
+        // default helper should be false (first alias 0 wins)
+        assert!(
+            !cfg.retrieval.ranking_multiplicative_path_penalty,
+            "default helper must respect first penalty alias (0=false)"
+        );
+        assert!(
+            !cfg.retrieval.ranking_multiplicative_path_penalty_enabled(),
+            "effective helper must respect same first alias (0=false)"
+        );
+        // With stored true, effective must still be false due to env first.
+        let rcfg = RetrievalConfig {
+            ranking_multiplicative_path_penalty: true,
+            ..Default::default()
+        };
+        assert!(
+            !rcfg.ranking_multiplicative_path_penalty_enabled(),
+            "effective must prefer env first alias even when stored:true"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by alias_precedence_parity"]
+    fn penalty_alias_second_precedence_probe() {
+        assert!(std::env::var("VERA_RANKING_MULTIPLICATIVE_PATH_PENALTY").is_err());
+        assert_eq!(std::env::var("VERA_RANKING_PATH_PENALTY").unwrap(), "1");
+        let cfg = VeraConfig::default();
+        assert!(cfg.retrieval.ranking_multiplicative_path_penalty);
+        assert!(cfg.retrieval.ranking_multiplicative_path_penalty_enabled());
     }
 }
