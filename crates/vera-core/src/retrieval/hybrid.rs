@@ -519,24 +519,41 @@ async fn search_hybrid_inner(
     // entire index so a low-ranking island is reachable independent of rank position.
     // The pool sizing never requests more candidates than the index holds, keeping
     // below-cap indexes quiet and preventing spurious truncation warnings.
+    // Regression bisect (issue #197 correction comment 5485896644): re-measured
+    // 072c725 mean p50 7.879 ms / p95 60.880 ms (same-host, 3 runs) vs fc20352
+    // 11.694 / 124.825 (+48%/+105%, nDCG parity). LRU thrashing hypothesis
+    // rejected by deterministic task-order simulation (1251 tasks, 63 repos,
+    // 62 switches, hit rate 95% at capacities 4/63 — grouped order, not
+    // round-robin). Dominant warm regression is per-query vector-store
+    // reopen: this function previously opened the vector store twice per
+    // query (once for is_flat/index_count sizing, once for the search), each
+    // doing a manifest JSON read + stamp check. Deduplicate to a single
+    // open per query to save the ~0.02–0.05 ms manifest stall and halve lock
+    // contention on large indexes.
     let vector_start = Instant::now();
 
-    // Determine backend and index size before sizing the fetch. This is used both
-    // to clamp the pool and to decide whether a vec0 truncation diagnostic is honest.
-    let (is_flat, index_count) = match &stores {
-        Some(s) => match s.vector_store(stored_dim) {
-            Ok(vs) => {
-                let guard = vs.lock().ok();
-                guard
-                    .map(|g| (g.is_flat(), g.count().unwrap_or(0) as usize))
-                    .unwrap_or((true, usize::MAX))
-            }
-            Err(_) => (true, usize::MAX),
-        },
-        None => match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
-            Ok(vs) => (vs.is_flat(), vs.count().unwrap_or(0) as usize),
-            Err(_) => (true, usize::MAX),
-        },
+    // Deduplicate vector-store open: single successful open supplies both
+    // backend detection (is_flat, index_count) and the later vector search.
+    // This halves manifest reads + Mutex contention per warm query while
+    // preserving stamp-guarded staleness (the single open already checked).
+    let vector_store_cached: Option<Arc<Mutex<VectorStore>>> = match &stores {
+        Some(s) => s.vector_store(stored_dim).ok(),
+        None => None,
+    };
+    let vector_store_direct: Option<VectorStore> = if stores.is_none() {
+        VectorStore::open(&index_dir.join("vectors.db"), stored_dim).ok()
+    } else {
+        None
+    };
+    let (is_flat, index_count) = match (&vector_store_cached, &vector_store_direct) {
+        (Some(vs), _) => {
+            let guard = vs.lock().ok();
+            guard
+                .map(|g| (g.is_flat(), g.count().unwrap_or(0) as usize))
+                .unwrap_or((true, usize::MAX))
+        }
+        (None, Some(vs)) => (vs.is_flat(), vs.count().unwrap_or(0) as usize),
+        _ => (true, usize::MAX),
     };
 
     let vector_fetch = if filters.is_empty() {
@@ -556,91 +573,89 @@ async fn search_hybrid_inner(
     let (clamped_requested, fetched_for_diag) =
         crate::retrieval::vector::candidate_pool(vector_fetch, index_count, is_flat);
 
-    let vector_outcome = match stores {
-        Some(stores) => match stores.vector_store(stored_dim) {
-            Ok(vector_store) => {
-                match search_vector_with_cached_stores_timed(
-                    vector_store.as_ref(),
-                    &stores.vector_metadata,
-                    provider,
-                    vector_query,
-                    vector_fetch,
-                )
-                .await
-                {
-                    Ok((mut results, embed_elapsed)) => {
-                        if !filters.is_empty() {
-                            results.retain(|result| filters.matches(result));
-                        }
-                        let has_matches = if filters.is_empty() {
-                            false
-                        } else {
-                            stores
-                                .vector_metadata
-                                .lock()
-                                .ok()
-                                .and_then(|m| m.has_filter_matches(filters).ok())
-                                .unwrap_or(false)
-                        };
-                        emit_vec0_truncation_warning(
-                            is_flat,
-                            index_count,
-                            clamped_requested,
-                            fetched_for_diag,
-                            filters.is_empty(),
-                            has_matches,
-                        );
-                        Ok((results, embed_elapsed))
+    let vector_outcome = match (stores, vector_store_cached, vector_store_direct) {
+        (Some(stores), Some(vector_store), _) => {
+            match search_vector_with_cached_stores_timed(
+                vector_store.as_ref(),
+                &stores.vector_metadata,
+                provider,
+                vector_query,
+                vector_fetch,
+            )
+            .await
+            {
+                Ok((mut results, embed_elapsed)) => {
+                    if !filters.is_empty() {
+                        results.retain(|result| filters.matches(result));
                     }
-                    Err(err) => Err(err),
+                    let has_matches = if filters.is_empty() {
+                        false
+                    } else {
+                        stores
+                            .vector_metadata
+                            .lock()
+                            .ok()
+                            .and_then(|m| m.has_filter_matches(filters).ok())
+                            .unwrap_or(false)
+                    };
+                    emit_vec0_truncation_warning(
+                        is_flat,
+                        index_count,
+                        clamped_requested,
+                        fetched_for_diag,
+                        filters.is_empty(),
+                        has_matches,
+                    );
+                    Ok((results, embed_elapsed))
                 }
+                Err(err) => Err(err),
             }
-            Err(err) => Err(VectorSearchError::StorageError(err)),
-        },
-        None => match VectorStore::open(&index_dir.join("vectors.db"), stored_dim) {
-            Ok(vector_store) => {
-                let vector_metadata_result = MetadataStore::open(&index_dir.join("metadata.db"))
-                    .context("failed to open metadata store");
-                match vector_metadata_result {
-                    Ok(vector_metadata) => {
-                        match search_vector_with_stores_timed(
-                            &vector_store,
-                            &vector_metadata,
-                            provider,
-                            vector_query,
-                            vector_fetch,
-                        )
-                        .await
-                        {
-                            Ok((mut results, embed_elapsed)) => {
-                                if !filters.is_empty() {
-                                    results.retain(|result| filters.matches(result));
-                                }
-                                let has_matches = if filters.is_empty() {
-                                    false
-                                } else {
-                                    vector_metadata.has_filter_matches(filters).unwrap_or(false)
-                                };
-                                emit_vec0_truncation_warning(
-                                    is_flat,
-                                    index_count,
-                                    clamped_requested,
-                                    fetched_for_diag,
-                                    filters.is_empty(),
-                                    has_matches,
-                                );
-                                Ok((results, embed_elapsed))
+        }
+        (Some(_), None, _) => Err(VectorSearchError::StorageError(anyhow::anyhow!(
+            "failed to open vector store"
+        ))),
+        (None, _, Some(vector_store)) => {
+            let vector_metadata_result = MetadataStore::open(&index_dir.join("metadata.db"))
+                .context("failed to open metadata store");
+            match vector_metadata_result {
+                Ok(vector_metadata) => {
+                    match search_vector_with_stores_timed(
+                        &vector_store,
+                        &vector_metadata,
+                        provider,
+                        vector_query,
+                        vector_fetch,
+                    )
+                    .await
+                    {
+                        Ok((mut results, embed_elapsed)) => {
+                            if !filters.is_empty() {
+                                results.retain(|result| filters.matches(result));
                             }
-                            Err(err) => Err(err),
+                            let has_matches = if filters.is_empty() {
+                                false
+                            } else {
+                                vector_metadata.has_filter_matches(filters).unwrap_or(false)
+                            };
+                            emit_vec0_truncation_warning(
+                                is_flat,
+                                index_count,
+                                clamped_requested,
+                                fetched_for_diag,
+                                filters.is_empty(),
+                                has_matches,
+                            );
+                            Ok((results, embed_elapsed))
                         }
+                        Err(err) => Err(err),
                     }
-                    Err(err) => Err(VectorSearchError::StorageError(err)),
                 }
+                Err(err) => Err(VectorSearchError::StorageError(err)),
             }
-            Err(err) => Err(VectorSearchError::StorageError(
-                err.context("failed to open vector store"),
-            )),
-        },
+        }
+        (None, _, None) => Err(VectorSearchError::StorageError(anyhow::anyhow!(
+            "failed to open vector store"
+        ))),
     };
     let embed_elapsed = vector_outcome
         .as_ref()
