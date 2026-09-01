@@ -911,21 +911,24 @@ fn multiplicative_path_penalty_is_toggleable() {
     );
 
     // Respects gating: when query explicitly wants tests, penalty must not fire.
-    let ranked_wants_tests = apply_query_ranking_with_filters_and_config(
-        "helper utility tests",
-        tests_first,
-        RankingStage::Initial,
-        &SearchFilters::default(),
-        &enabled,
-    );
-    // When query wants tests, the penalized path is not demoted — it may keep
-    // its base_rank advantage. We only assert it is not multiplicatively
-    // demoted below src/ in that mode. Since base_rank plus no additive,
-    // tests/ first should stay first.
-    assert_eq!(
-        ranked_wants_tests[0].file_path, "tests/fixtures/helper.rs",
-        "when query wants tests, penalty must respect gating and not demote"
-    );
+    // Directly verify the multiplicative penalty respects wants_test_paths
+    // gating — other ranking signals (Source bonus etc.) may still order src
+    // before tests, so we check the multiplicative layer alone.
+    {
+        let wants_features = QueryFeatures::from_query("helper utility tests");
+        assert!(
+            wants_features.wants_test_paths,
+            "query 'helper utility tests' should want test paths"
+        );
+        let mut gated_scores = vec![1.0, 1.0];
+        let gated_results = vec![tests_first[0].clone(), tests_first[1].clone()];
+        apply_multiplicative_path_penalty(&wants_features, &mut gated_scores, &gated_results);
+        assert_eq!(
+            gated_scores,
+            vec![1.0, 1.0],
+            "when query wants tests, multiplicative penalty must not apply"
+        );
+    }
 }
 
 #[test]
