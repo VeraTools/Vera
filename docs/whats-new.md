@@ -2,6 +2,39 @@
 
 Release highlights from v1.0 onward. For the current benchmark tables and methodology, see [benchmarks.md](benchmarks.md). For the full command surface, see [features.md](features.md).
 
+## v1.3.0
+
+### Search correctness
+
+- Split symbols keep their identity. The chunker stores the bare symbol name plus a distinct part index, so `vera structural definitions` finds split symbols by bare name, `vera references` resolves their single call site, `vera dead-code` deduplicates parts by (symbol, file), exact-name augmentation reaches split chunks, JSON carries bare name with part index and text display keeps `(part N)` with single-sourced formatting.
+- Filtered vector search above 4,096 candidates no longer truncates. Path, language and exact-path filters reach low-ranked island results that previously returned zero hits on the over-cap fixture, with deterministic ordering, batched hydration beyond 999 SQL parameters, and order preservation. Flat scan is now unbounded, the spurious below-cap truncation warning is gone, and vec0 diagnostics fire only when clamping could lose results with an actionable message naming the backend and remedy.
+- The per-query vector-store open is now deduplicated, halving manifest reads per query while preserving stamp-guarded staleness and the LRU-4 memory bound.
+
+### Indexing progress and reuse
+
+- The embedding progress bar is now honest. While parsing is still in progress it shows open-ended work so far with no percentage, then switches to a fixed total at `ParsingDone` and fills monotonically to 100 percent. Cancellation and mid-run failures no longer imply success, small single-window repos show a fixed total directly, and non-TTY, `--no-progress` and `--json` modes are unchanged.
+- Evaluation lanes can reuse a current index when identity gates pass. `reuse_index: true` skips indexing only when the on-disk index matches embedding model name (including `model_aliases` and `VERA_EMBEDDING_MODEL_ALIASES`), document prefix, staleness, embedding dimension, content-affecting indexing config, and format version, with correct size accounting and BM25 never reusing.
+
+### Ranking and retrieval
+
+- Three ranking signals for issue #196 are now toggleable with mechanism-first rationales: filename-stem boost, definition boost, and recall-pool expansion. Each has a config knob and `VERA_RANKING_*` env override, implemented separately from measurement and proven by dual-set ablations on the 320-task subset and 180-task independent set with full-suite confirmation before any quality claim.
+- Three additional hypotheses (multiplicative path penalties, candidate-pool multiplier, 750-char chunks) are implemented as default-off knobs with the same config and env pattern and correct index-identity wiring. Dual-set measurement on 320, 180 and full 1,251-task suites showed each below the 0.5 percent full-suite aggregate bar or with regression, so all three stay default off with honest negatives recorded. The chunk arm cites the prior 2048 window and cap negatives and reports its own index-time and storage cost.
+- Reranker protocol now cleanly separates generic (`top_n` / `results`) from Voyage (`top_k` / `data`) with explicit config override over hostname auto-detection, and resilience covers permanent 4xx no-retry, capped `Retry-After` and `X-RateLimit-Reset` waits, cancellation, and graceful degradation.
+
+### Setup and first-run
+
+- `vera setup` ships a Qwen OpenRouter preset and `vera setup --qwen` hardening, with `installation.md` and `models.md` updated in the same commits. The first-run flow is streamlined to a single key with auto protocol selection, and `README.md` plus both package READMEs move together for user-facing changes.
+- `vera doctor` now tolerates blank env values and probes DirectML more accurately, `vera uninstall` reports shim classification more precisely, and `retrieval.max_output_chars` help correctly shows `0 = unlimited`.
+
+### Evaluation and provenance
+
+- Result JSONs now record host CPU model from `/proc/cpuinfo` and the three `VERA_RANKING_*` env values in `version_info.environment`, so future hardware changes and signals arms are detectable from artifacts alone with a graceful non-Linux fallback.
+- `docs/197-profiling.md` now carries a hardware caveat: the 9.93 ms p50 and 73.26 ms p95 numbers were measured on Ryzen 7 7600X3D and are not comparable to post-2026-08-28 measurements on Ryzen 7 9800X3D without the same-host re-baseline (mean 7.88 ms p50 and 60.88 ms p95 on three `072c725` runs).
+
+### Compatibility
+
+No breaking CLI changes. Existing indexes open and search as before. New indexes carry split-symbol part indices and improved filtered-vector behavior, and the evaluation harness remains backward compatible with old result JSONs.
+
 ## v1.2.0
 
 ### Query latency
