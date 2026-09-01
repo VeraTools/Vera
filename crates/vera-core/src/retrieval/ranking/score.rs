@@ -690,19 +690,18 @@ pub(super) fn apply_multiplicative_path_penalty(
         // Test / fixture penalization: mirrors the additive penalty's
         // ContentClass gate plus the definition-boost directory gating so
         // both signals respect the same explicit-request logic.
-        if !features.wants_test_paths {
-            if matches!(role, ContentClass::Test)
-                || definition_site_role_blocked_is_test(features, result)
-            {
-                penalized = true;
-            }
+        if !features.wants_test_paths
+            && (matches!(role, ContentClass::Test)
+                || definition_site_role_blocked_is_test(features, result))
+        {
+            penalized = true;
         }
-        if !penalized && !features.wants_example_paths {
-            if matches!(role, ContentClass::Example | ContentClass::Bench)
-                || definition_site_role_blocked_is_example(features, result)
-            {
-                penalized = true;
-            }
+        if !penalized
+            && !features.wants_example_paths
+            && (matches!(role, ContentClass::Example | ContentClass::Bench)
+                || definition_site_role_blocked_is_example(features, result))
+        {
+            penalized = true;
         }
         if !penalized && !features.wants_compat_paths && is_compat_path(&lower) {
             penalized = true;

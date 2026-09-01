@@ -827,20 +827,6 @@ fn multiplicative_path_penalty_is_toggleable() {
     // enabled, the tests/ fixture must be demoted below src/ — multiplicative
     // 0.3× preserves ordering among non-penalized while demoting penalized.
     let neutral = "pub fn helper() {}";
-    let results = vec![
-        make_result(
-            "tests/fixtures/helper.rs",
-            Some("helper"),
-            Some(SymbolType::Function),
-            neutral,
-        ),
-        make_result(
-            "src/helper.rs",
-            Some("helper"),
-            Some(SymbolType::Function),
-            neutral,
-        ),
-    ];
 
     // DEFAULT OFF: first result (tests/) should stay first because scores are
     // base_rank + prior where prior's additive test penalty (-0.95) already

@@ -1166,9 +1166,8 @@ mod tests {
             "candidate-pool multiplier ON must inflate Config to at least 5×20=100, got {bare}"
         );
         assert_eq!(
-            bare,
-            100.max(20 + 50),
-            "bare 5× should be 100 (or 70 with +50) without recall duplication, got {bare}"
+            bare, 100,
+            "bare 5× should be 100 (max(5*20,20+50)) without recall duplication, got {bare}"
         );
         // NL query with multiplier ON should be at least 5×, distinct from recall's 3×/8×
         let nl_bare = compute_fetch_limit_with_config(

@@ -140,23 +140,14 @@ fn default_chunk_max_chars() -> usize {
         };
     }
     if let Ok(value) = std::env::var("VERA_MAX_CHUNK_CHARS") {
-        return match value.parse::<usize>() {
-            Ok(parsed) => parsed,
-            Err(_) => 0,
-        };
+        return value.parse::<usize>().unwrap_or_default();
     }
     if let Ok(value) = std::env::var("VERA_CHUNK_MAX_CHARS") {
-        return match value.parse::<usize>() {
-            Ok(parsed) => parsed,
-            Err(_) => 0,
-        };
+        return value.parse::<usize>().unwrap_or_default();
     }
     // Also handle VERA_INDEXING_MAX_CHUNK_CHARS alias if validator uses that order
     if let Ok(value) = std::env::var("VERA_INDEXING_MAX_CHUNK_CHARS") {
-        return match value.parse::<usize>() {
-            Ok(parsed) => parsed,
-            Err(_) => 0,
-        };
+        return value.parse::<usize>().unwrap_or_default();
     }
     0
 }
