@@ -63,28 +63,193 @@ impl LaunchEntry {
     }
 }
 
+/// The launcher the installers write, with the binary path left as a hole.
+///
+/// `packages/npm-cli/bin/vera.js` and `packages/python-cli/.../__main__.py`
+/// emit these two forms and nothing else, character for character. Matching
+/// them is the whole of shim recognition: uninstall never has to understand
+/// shell or batch, only to recognize what it wrote.
+const UNIX_SHIM: (&str, &str) = ("#!/bin/sh\nexec \"", "\" \"$@\"\n");
+const WINDOWS_SHIM: (&str, &str) = ("@echo off\r\n\"", "\" %*\r\n");
+
+/// The binary path a shim launches, if the file is one of the two templates.
+///
+/// A byte comparison with one hole, rather than a parse. Nothing about
+/// quoting, escaping, comments, separators or dialects can change the answer,
+/// because a file that is not exactly one of these shapes is not ours.
+fn shim_target(text: &str) -> Option<&str> {
+    [UNIX_SHIM, WINDOWS_SHIM]
+        .into_iter()
+        .find_map(|(head, tail)| {
+            text.strip_prefix(head)
+                .and_then(|rest| rest.strip_suffix(tail))
+                // Both ends are anchored, so whatever lies between them is the
+                // path, quote characters included: a unix path may contain one and
+                // the installer writes it through verbatim.
+                .filter(|target| !target.is_empty())
+        })
+}
+
+/// Whether a launcher path is one this installation put there.
+///
+/// Two ways to qualify, and either is enough. The recorded path is
+/// authoritative: `install.json` carries `binary_path`, which is what `upgrade`
+/// already uses to find the installed executable. Containment in the Vera home
+/// qualifies as well, and not only as a fallback when nothing was recorded.
+///
+/// That second arm carries weight: step 2 removes the Vera home before this
+/// runs, so a chain through an intermediate link inside it, such as
+/// `PATH/vera -> ~/.vera/current -> <recorded binary>`, resolves only as far as
+/// the link that has just been deleted. Requiring an exact match against the
+/// recorded path would leave that alias on PATH. A path inside our own
+/// directory is ours whether or not it is the one we wrote down.
+fn is_our_binary(target: &Path, recorded: Option<&Path>, vera_home: &Path) -> bool {
+    recorded.is_some_and(|recorded| lexically_normalize(target) == lexically_normalize(recorded))
+        || is_inside(target, vera_home)
+}
+
 /// Recognizes a candidate path as a removable Vera launcher, or leaves it
 /// unclassified so unrelated files stay untouched.
 ///
-/// A shim is UTF-8 text mentioning vera or a symlink pointing at one. The
+/// A shim is one of the two files the installers write, naming this
+/// installation's binary, or a symlink resolving to that binary. The
 /// cargo-installed binary is neither: it fails UTF-8 decoding by construction
 /// (#212), so only "unreadable as text plus a regular executable file with an
 /// exact Vera entry name" attributes it to cargo without grabbing anything
 /// else named `vera`.
-fn classify_launch_entry(entry: &Path) -> Option<LaunchEntry> {
+fn classify_launch_entry(
+    entry: &Path,
+    cargo_bin: &Path,
+    vera_home: &Path,
+    recorded: Option<&Path>,
+) -> Option<LaunchEntry> {
     let read_as_text = fs::read_to_string(entry);
-    if read_as_text
-        .as_ref()
-        .is_ok_and(|text| text.contains("vera"))
-        || fs::read_link(entry).is_ok_and(|target| target.to_string_lossy().contains("vera"))
-    {
+    let launches_vera = read_as_text
+        .as_deref()
+        .ok()
+        .and_then(shim_target)
+        .is_some_and(|target| is_our_binary(Path::new(target), recorded, vera_home));
+    if launches_vera || symlink_points_at_vera(entry, vera_home, recorded) {
         return Some(LaunchEntry::Shim);
     }
-    // Decodable text that never mentions vera belongs to someone else.
-    let is_cargo_binary = read_as_text.is_err()
+    // Decodable text that is not one of our templates belongs to someone else.
+    //
+    // The cargo arm needs evidence of its own, and the only evidence available
+    // is where the file sits: `cargo install` writes to `~/.cargo/bin`, so an
+    // unreadable executable named `vera` there is a cargo artifact by
+    // construction. In the other candidate directories it is just somebody
+    // else's program with the same name. Checking the executable *format*
+    // would not help, because any binary named `vera` passes that too.
+    let is_cargo_binary = entry
+        .parent()
+        .is_some_and(|parent| is_cargo_bin_dir(parent, cargo_bin))
+        && read_as_text.is_err()
         && fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file())
         && is_executable(entry);
     is_cargo_binary.then_some(LaunchEntry::CargoBinary)
+}
+
+/// Resolves `.` and `..` textually. Used instead of `canonicalize` because the
+/// directories being compared may already have been deleted.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Whether `path` sits inside `root`, compared component-wise so that
+/// `/opt/vera-extra` is not read as being inside `/opt/vera`.
+fn is_inside(path: &Path, root: &Path) -> bool {
+    if root.as_os_str().is_empty() {
+        return false;
+    }
+    lexically_normalize(path).starts_with(lexically_normalize(root))
+}
+
+/// How many links to follow before giving up, so a cycle cannot hang the run.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Where a symlink chain lands, resolved one hop at a time.
+///
+/// Each relative target is resolved against its own link's directory, so
+/// `vera -> ../lib/vera/bin/vera` is judged on where it actually lands rather
+/// than on how it is spelled. Resolution stops at the first path that is not a
+/// link, which includes a dangling one: that path is still the answer, and
+/// comparing it lexically is what lets a broken alias into Vera's own files be
+/// recognized and removed.
+fn resolve_symlink_chain(entry: &Path) -> Option<PathBuf> {
+    let mut current = fs::read_link(entry).ok()?;
+    if current.is_relative() {
+        current = entry.parent().unwrap_or(Path::new("")).join(current);
+    }
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(next) = fs::read_link(&current) else {
+            return Some(current);
+        };
+        current = if next.is_absolute() {
+            next
+        } else {
+            current.parent().unwrap_or(Path::new("")).join(next)
+        };
+    }
+    Some(current)
+}
+
+/// Whether a symlink at `entry` resolves to this installation's binary.
+///
+/// The whole chain is followed, so an alias that reaches Vera through another
+/// link is still ours. Stopping at the first hop left such an alias on PATH
+/// while the run reported a complete uninstall.
+fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path>) -> bool {
+    resolve_symlink_chain(entry)
+        .is_some_and(|resolved| is_our_binary(&resolved, recorded, vera_home))
+}
+
+/// Where `cargo install` places binaries: `$CARGO_HOME/bin`, falling back to
+/// `~/.cargo/bin`.
+///
+/// Derived rather than pattern-matched. A configured `VERA_USER_BIN_DIR` that
+/// merely *ends* in `.cargo/bin` is not cargo's directory, and treating it as
+/// one would hand every unreadable executable there to the cargo arm.
+///
+/// The environment is read here, at the edge, and the answer is passed down.
+/// Reading it inside the classifier made the result depend on the machine: a
+/// host with `CARGO_HOME` set resolved somewhere other than the tree under
+/// test, which passed locally and failed on CI.
+fn cargo_bin_dir(home: &Path, cwd: &Path) -> PathBuf {
+    std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(|value| absolutize(cwd, PathBuf::from(value)))
+        .unwrap_or_else(|| home.join(".cargo"))
+        .join("bin")
+}
+
+/// Whether a directory is cargo's own bin directory.
+fn is_cargo_bin_dir(dir: &Path, cargo_bin: &Path) -> bool {
+    lexically_normalize(dir) == lexically_normalize(cargo_bin)
+}
+
+/// Makes a configured directory absolute against the working directory.
+///
+/// Every path this command compares is absolute, so a relative value from the
+/// environment has to be resolved before it reaches a comparison. Both
+/// `VERA_USER_BIN_DIR` and `CARGO_HOME` come through here.
+fn absolutize(cwd: &Path, dir: PathBuf) -> PathBuf {
+    if dir.is_absolute() {
+        dir
+    } else {
+        cwd.join(dir)
+    }
 }
 
 /// Executability where the platform tracks it. Windows has no file mode bit;
@@ -112,29 +277,62 @@ fn configured_user_bin_dir() -> Option<PathBuf> {
 pub fn run(json_output: bool) -> Result<()> {
     let home = state::user_home_dir()?;
     let vera_home = state::vera_dir()?;
+    // Read before step 2 removes the Vera home: this is the record of which
+    // binary the installer placed, and it lives inside the directory that is
+    // about to go.
+    let recorded_binary = state::load_install_provenance()
+        .ok()
+        .and_then(|provenance| provenance.binary_path)
+        .map(PathBuf::from);
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    let user_bin_dir = configured_user_bin_dir();
+    // A relative override would otherwise be compared against absolute paths
+    // when a symlink chain is resolved, so an owned relative link survives.
+    let user_bin_dir = configured_user_bin_dir().map(|dir| absolutize(&cwd, dir));
 
     run_at(
-        &home,
-        &vera_home,
-        &cwd,
-        user_bin_dir.as_deref(),
+        InstallLayout {
+            home: &home,
+            vera_home: &vera_home,
+            cwd: &cwd,
+            user_bin_dir: user_bin_dir.as_deref(),
+            recorded_binary: recorded_binary.as_deref(),
+            cargo_bin: &cargo_bin_dir(&home, &cwd),
+        },
         json_output,
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     )
 }
 
+/// Where this installation put its files, resolved once by the caller so the
+/// body never consults the environment.
+struct InstallLayout<'a> {
+    home: &'a Path,
+    vera_home: &'a Path,
+    cwd: &'a Path,
+    user_bin_dir: Option<&'a Path>,
+    /// The binary the installer recorded in `install.json`, read before the
+    /// Vera home is removed.
+    recorded_binary: Option<&'a Path>,
+    /// Cargo's own bin directory, resolved by the caller so classification
+    /// never consults the environment.
+    cargo_bin: &'a Path,
+}
+
 fn run_at(
-    home: &Path,
-    vera_home: &Path,
-    cwd: &Path,
-    user_bin_dir: Option<&Path>,
+    layout: InstallLayout<'_>,
     json_output: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
+    let InstallLayout {
+        home,
+        vera_home,
+        cwd,
+        user_bin_dir,
+        recorded_binary,
+        cargo_bin,
+    } = layout;
     let mut removed = Vec::new();
 
     // 1. Remove agent skill files (all clients, all scopes).
@@ -176,10 +374,14 @@ fn run_at(
     for dir in shim_candidates(home, user_bin_dir) {
         for name in entry_names() {
             let entry = dir.join(name);
-            if !entry.exists() {
+            // `exists` follows the link and so reports `false` for a broken
+            // one, which left a dangling Vera symlink on PATH while the run
+            // still claimed a complete uninstall. Ask about the link itself.
+            if entry.symlink_metadata().is_err() {
                 continue;
             }
-            let Some(kind) = classify_launch_entry(&entry) else {
+            let Some(kind) = classify_launch_entry(&entry, cargo_bin, vera_home, recorded_binary)
+            else {
                 // Not ours: leave it alone silently, as before.
                 continue;
             };
@@ -317,10 +519,14 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         run_at(
-            &roots.home,
-            &roots.vera_home,
-            &roots.cwd,
-            Some(roots.user_bin_dir.as_path()),
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(roots.user_bin_dir.as_path()),
+                recorded_binary: None,
+                cargo_bin: &roots.home.join(".cargo").join("bin"),
+            },
             json_output,
             &mut stdout,
             &mut stderr,
@@ -339,10 +545,14 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let error = run_at(
-            &roots.home,
-            &roots.vera_home,
-            &roots.cwd,
-            Some(roots.user_bin_dir.as_path()),
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(roots.user_bin_dir.as_path()),
+                recorded_binary: None,
+                cargo_bin: &roots.home.join(".cargo").join("bin"),
+            },
             json_output,
             &mut stdout,
             &mut stderr,
@@ -659,6 +869,377 @@ mod tests {
     /// Two lookalikes that are not ours: a readable script that never mentions
     /// vera, and unreadable data without an executable bit. Neither may be
     /// deleted, and skipping them silently keeps the run complete (#212).
+    #[cfg(unix)]
+    fn install_shim(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join("vera");
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The exact file `packages/npm-cli/bin/vera.js` and the Python wrapper
+    /// write, built from the same Vera home the uninstall resolves.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_the_shim_the_installers_write() {
+        for template in [
+            "#!/bin/sh\nexec \"{bin}\" \"$@\"\n",
+            "@echo off\r\n\"{bin}\" %*\r\n",
+        ] {
+            let roots = roots();
+            let binary = roots
+                .vera_home
+                .join("bin")
+                .join("1.3.0")
+                .join("aarch64-apple-darwin")
+                .join("vera");
+            let body = template.replace("{bin}", &binary.display().to_string());
+            let shim = install_shim(&roots.home.join(".local").join("bin"), &body);
+
+            let (_, stderr) = uninstall(&roots, false);
+
+            assert!(!shim.exists(), "our own shim survived: {body:?} / {stderr}");
+            assert!(stderr.contains("Removed PATH shim"), "{stderr}");
+        }
+    }
+
+    /// A symlink resolving to the installed binary is ours; one resolving
+    /// anywhere else is not, however it is spelled.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_judged_by_where_it_resolves() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ours = bin.join("vera");
+        std::os::unix::fs::symlink(roots.vera_home.join("bin").join("vera"), &ours).unwrap();
+        // Dangling by construction: the target does not exist.
+        assert!(!ours.exists());
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            ours.symlink_metadata().is_err(),
+            "a dangling Vera symlink stayed on PATH: {stderr}"
+        );
+    }
+
+    /// A path may contain a quote character, and the installer writes it into
+    /// the shim verbatim. Rejecting such a target left the shim on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn a_quote_in_the_home_path_does_not_hide_the_shim() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("ho\"me");
+        let bin = home.join(".local").join("bin");
+        let vera_home = home.join(".vera");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(temp.path().join("project")).unwrap();
+        let binary = vera_home.join("bin").join("1.3.0").join("x").join("vera");
+        let shim = install_shim(
+            &bin,
+            &format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", binary.display()),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_at(
+            InstallLayout {
+                home: &home,
+                vera_home: &vera_home,
+                cwd: &temp.path().join("project"),
+                user_bin_dir: Some(bin.as_path()),
+                recorded_binary: None,
+                cargo_bin: &home.join(".cargo").join("bin"),
+            },
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert!(!shim.exists(), "a quote in the path hid our own shim");
+    }
+
+    /// An alias that reaches Vera through another link is still ours. Comparing
+    /// only the first hop left it on PATH while the run reported success.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_chain_reaching_vera_is_followed() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let binary = roots.vera_home.join("bin").join("vera");
+        let middle = roots.home.join("alias-vera");
+        std::os::unix::fs::symlink(&binary, &middle).unwrap();
+        let entry = bin.join("vera");
+        std::os::unix::fs::symlink(&middle, &entry).unwrap();
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            entry.symlink_metadata().is_err(),
+            "an aliased Vera symlink stayed on PATH: {stderr}"
+        );
+    }
+
+    /// The Vera home is removed before PATH entries are classified, so a chain
+    /// through an intermediate link inside it resolves only as far as a link
+    /// that no longer exists. That terminal path is still inside our own
+    /// directory, and the alias must still be removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_through_a_deleted_intermediate_is_still_ours() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        let recorded = roots
+            .vera_home
+            .join("bin")
+            .join("1.3.0")
+            .join("x")
+            .join("vera");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(recorded.parent().unwrap()).unwrap();
+        fs::write(&recorded, "binary").unwrap();
+        // PATH/vera -> <vera_home>/current -> <recorded binary>
+        let middle = roots.vera_home.join("current");
+        std::os::unix::fs::symlink(&recorded, &middle).unwrap();
+        let entry = bin.join("vera");
+        std::os::unix::fs::symlink(&middle, &entry).unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_at(
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(bin.as_path()),
+                recorded_binary: Some(recorded.as_path()),
+                cargo_bin: &roots.home.join(".cargo").join("bin"),
+            },
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(
+            entry.symlink_metadata().is_err(),
+            "an alias through a deleted intermediate stayed on PATH: {stderr}"
+        );
+    }
+
+    /// An unreadable executable named `vera` is only evidence of a cargo
+    /// install where cargo puts one. Elsewhere it is somebody else's program
+    /// with the same name, and deleting it is unrecoverable.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_executable_outside_the_cargo_bin_dir_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let roots = roots();
+        // Same bytes, same permissions, two locations.
+        let cargo_bin = roots.home.join(".cargo").join("bin");
+        let other_bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&cargo_bin).unwrap();
+        fs::create_dir_all(&other_bin).unwrap();
+        let ours = cargo_bin.join("vera");
+        let theirs = other_bin.join("vera");
+        for path in [&ours, &theirs] {
+            fs::write(path, [0x7f, b'E', b'L', b'F', 0xcf]).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            !ours.exists(),
+            "the cargo-installed binary stayed: {stderr}"
+        );
+        assert!(
+            theirs.exists(),
+            "deleted an unreadable executable that cargo never wrote: {stderr}"
+        );
+    }
+
+    /// A relative `VERA_USER_BIN_DIR` must be resolved against the working
+    /// directory, or a symlink chain resolved from it stays relative and never
+    /// matches the absolute Vera home.
+    ///
+    /// Asserts the resolution itself. The previous version of this test built
+    /// the absolute path in the fixture and handed that to `run_at`, so it
+    /// never touched the resolution and passed with the fix removed.
+    #[test]
+    fn a_relative_directory_from_the_environment_is_resolved_against_cwd() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            absolutize(cwd, PathBuf::from("vendor/bin")),
+            Path::new("/work/project/vendor/bin")
+        );
+        assert_eq!(
+            absolutize(cwd, PathBuf::from("../shared/bin")),
+            Path::new("/work/project/../shared/bin")
+        );
+        // An absolute override is already an answer and must not be rebased.
+        assert_eq!(
+            absolutize(cwd, PathBuf::from("/opt/bin")),
+            Path::new("/opt/bin")
+        );
+    }
+
+    /// `CARGO_HOME` goes through the same resolution, for the same reason: the
+    /// candidate paths it is compared against are absolute.
+    #[test]
+    fn a_relative_cargo_home_is_resolved_before_comparison() {
+        let home = Path::new("/home/u");
+        let cwd = Path::new("/work/project");
+        // SAFETY: single-threaded within this test, and the value is removed
+        // before returning. No other test reads CARGO_HOME.
+        unsafe { std::env::set_var("CARGO_HOME", "vendor/cargo") };
+        let resolved = cargo_bin_dir(home, cwd);
+        unsafe { std::env::remove_var("CARGO_HOME") };
+        assert_eq!(resolved, Path::new("/work/project/vendor/cargo/bin"));
+    }
+
+    /// Cargo's directory is derived from the cargo home, not matched by shape:
+    /// an override that merely ends in `.cargo/bin` is somebody else's.
+    #[test]
+    fn only_cargos_derived_bin_directory_counts_as_cargo() {
+        let home = Path::new("/home/u");
+        let cargo_bin = home.join(".cargo").join("bin");
+        assert!(is_cargo_bin_dir(&cargo_bin, &cargo_bin));
+        assert!(is_cargo_bin_dir(
+            &home.join(".cargo").join(".").join("bin"),
+            &cargo_bin
+        ));
+        for foreign in [
+            "/home/u/.local/bin",
+            "/home/u/cargo/bin",
+            // A configured override that ends in the same two segments.
+            "/opt/sandbox/.cargo/bin",
+        ] {
+            assert!(
+                !is_cargo_bin_dir(Path::new(foreign), &cargo_bin),
+                "{foreign} is not cargo's own bin directory"
+            );
+        }
+    }
+
+    /// A chain that never terminates must not hang the uninstall.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_terminates() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let a = bin.join("vera");
+        let b = roots.home.join("loop-b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(stderr.contains("uninstalled"), "{stderr}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_someone_elses_install_is_left_alone() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        let other = roots.home.join("veracrypt-bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let target = other.join("veracrypt");
+        fs::write(&target, "binary").unwrap();
+        let link = bin.join("vera");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(link.symlink_metadata().is_ok(), "deleted a foreign symlink");
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// The whole corpus of foreign launchers accumulated over ten review
+    /// rounds against the parser this replaces. Every one survives here by
+    /// construction rather than by a rule: none of these files is one of the
+    /// two templates, so none of them is ever a candidate.
+    #[cfg(unix)]
+    #[test]
+    fn no_foreign_launcher_is_claimed() {
+        for body in [
+            // Mentions Vera only in a comment.
+            "#!/bin/sh\n# drop-in replacement for vera\nexec /usr/bin/rg \"$@\"\n",
+            "@echo off\r\nREM wrapper around vera\r\n\"%~dp0\\rg.exe\" %*\r\n",
+            // Shares the letters but not the name.
+            "#!/bin/sh\nexec /opt/veracrypt/bin/veracrypt \"$@\"\n",
+            "#!/bin/sh\nexec /opt/vera-extra/bin/tool \"$@\"\n",
+            // A directory named vera holding someone else's program.
+            "#!/bin/sh\nexec /opt/vera/bin/rg \"$@\"\n",
+            // Another program that merely shares the launcher name.
+            "#!/bin/sh\nexec /opt/other/bin/vera \"$@\"\n",
+            // A Vera path in argument position rather than program position.
+            "#!/bin/sh\necho \"{home}/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
+            // Separators and quoting that each cost a review round.
+            "#!/bin/sh\necho \"see; {home}/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
+            "#!/bin/sh\necho a\\; {home}/bin/vera\nexec /usr/bin/rg \"$@\"\n",
+            "#!/bin/sh\necho safe # ; exec \"{home}/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
+            "#!/bin/sh\n\"if\" \"{home}/bin/vera\"\n",
+            "#!/bin/sh\necho \"case esac\"\necho a\\) {home}/bin/vera\nexec /usr/bin/rg \"$@\"\n",
+            "@echo off\r\necho ({home}/bin/vera)\r\n\"%~dp0\\rg.exe\" %*\r\n",
+            "@echo off\r\necho safe; \"{home}/bin/vera\"\r\n\"%~dp0\\rg.exe\" %*\r\n",
+            // The template with the wrong binary: right shape, not our install.
+            "#!/bin/sh\nexec \"/opt/elsewhere/bin/vera\" \"$@\"\n",
+        ] {
+            let roots = roots();
+            let body = body.replace("{home}", &roots.vera_home.display().to_string());
+            let foreign = install_shim(&roots.home.join(".local").join("bin"), &body);
+
+            let (_, stderr) = uninstall(&roots, false);
+
+            assert!(foreign.exists(), "claimed a foreign launcher: {body:?}");
+            assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+        }
+    }
+
+    /// The recorded path is authoritative when present: a template naming a
+    /// binary outside the Vera home is still ours if that is what was
+    /// installed, and one naming a different binary is not.
+    #[cfg(unix)]
+    #[test]
+    fn the_recorded_binary_path_decides_when_it_exists() {
+        let recorded = Path::new("/opt/custom/vera");
+        let vera_home = Path::new("/home/u/.vera");
+        assert!(is_our_binary(recorded, Some(recorded), vera_home));
+        assert!(!is_our_binary(
+            Path::new("/opt/other/vera"),
+            Some(recorded),
+            vera_home
+        ));
+        // Containment qualifies on its own, with or without a record: an
+        // intermediate link inside the Vera home has already been deleted by
+        // the time a chain is resolved, so it can never match the record.
+        assert!(is_our_binary(
+            &vera_home.join("bin/1.3.0/x/vera"),
+            None,
+            vera_home
+        ));
+        assert!(is_our_binary(
+            &vera_home.join("current"),
+            Some(recorded),
+            vera_home
+        ));
+        assert!(!is_our_binary(
+            Path::new("/opt/custom/vera"),
+            None,
+            vera_home
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn uninstall_leaves_foreign_lookalikes_in_place_without_failing() {
