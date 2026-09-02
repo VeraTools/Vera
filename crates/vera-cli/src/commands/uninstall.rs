@@ -69,12 +69,17 @@ impl LaunchEntry {
 /// with one of these names, from inside the Vera home.
 const VERA_LAUNCHER_NAMES: &[&str] = &["vera", "vera.exe", "vera.cmd"];
 
-/// Words that stand in front of the program on a launch line without being it:
-/// the launcher-wrappers, and the shell keywords and grouping tokens that put a
-/// launch somewhere other than the start of a command.
-const LAUNCH_PREFIXES: &[&str] = &[
-    "exec", "command", "builtin", "nohup", "env", "then", "else", "elif", "do", "done", "fi", "{",
-    "}",
+/// Wrappers that stand in front of the program without being it, in either
+/// family.
+const LAUNCH_PREFIXES: &[&str] = &["exec", "command", "builtin", "nohup", "env"];
+
+/// Shell keywords and grouping tokens that can precede a program. `if` belongs
+/// here because a shell `if` takes a *command list* as its condition, so
+/// `if exec vera; then` is a launch. Batch `if` takes a comparison instead, so
+/// applying this list there would step over the condition and read the wrong
+/// token as the program.
+const SHELL_KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "while", "until", "do", "done", "fi", "{", "}", "!",
 ];
 
 /// Whether a line of a shim is a comment rather than something that runs.
@@ -160,6 +165,7 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
     // Tracked separately from `token`, which stays empty for a quoted empty
     // word: `""#` is a `#` inside a word, not the start of a comment.
     let mut word_started = false;
+    let mut group_depth = 0usize;
     let mut quote: Option<char> = None;
     let mut chars = line.chars().peekable();
 
@@ -192,9 +198,29 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
                 // Command separators outside quotes. `;` separates commands in
                 // the shell only; `cmd` passes it through as argument text, so
                 // splitting on it there invents a command that never runs.
-                // Parentheses group commands in both families, so they bound a
-                // command the same way: `(exec vera)` is a launch of vera.
-                '|' | '&' | '(' | ')' => {
+                '|' | '&' => {
+                    if word_started {
+                        tokens.push(std::mem::take(&mut token));
+                    }
+                    word_started = false;
+                    programs.extend(program_of(&tokens, batch));
+                    tokens.clear();
+                }
+                // Parentheses group commands in both families, but only where
+                // they are group syntax: at the start of a command, or standing
+                // alone as their own word. Attached to text, as in an echoed
+                // `(path)`, they are argument characters, and splitting there
+                // invents a command out of somebody else's argument.
+                '(' if !word_started
+                    && (tokens.is_empty()
+                        || chars.peek().copied().is_some_and(char::is_whitespace)) =>
+                {
+                    group_depth += 1;
+                    programs.extend(program_of(&tokens, batch));
+                    tokens.clear();
+                }
+                ')' if group_depth > 0 => {
+                    group_depth -= 1;
                     if word_started {
                         tokens.push(std::mem::take(&mut token));
                     }
@@ -244,6 +270,10 @@ fn program_of(tokens: &[String], batch: bool) -> Option<String> {
                 && !LAUNCH_PREFIXES
                     .iter()
                     .any(|prefix| token.eq_ignore_ascii_case(prefix))
+                && !(!batch
+                    && SHELL_KEYWORDS
+                        .iter()
+                        .any(|keyword| token.eq_ignore_ascii_case(keyword)))
                 // `NAME=value` prefixes set the environment for what follows.
                 // Decided on the name, not on punctuation in the value: an
                 // assignment to a path is still an assignment, and the program
@@ -1336,6 +1366,48 @@ mod tests {
             let (_, stderr) = uninstall(&roots, false);
 
             assert!(!shim.exists(), "our own shim survived: {body:?} / {stderr}");
+        }
+    }
+
+    /// A shell `if` takes a command list as its condition, so the condition is
+    /// a launch. Reading `if` as the program left our own shim on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_condition_command_is_still_a_launch() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\nif exec \"{}/bin/1.3.0/x/vera\" \"$@\"; then :; fi\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(!shim.exists(), "our own shim survived: {stderr}");
+    }
+
+    /// Parentheses attached to text are argument characters, not group syntax.
+    /// Splitting on them invented a command out of somebody else's argument.
+    #[cfg(unix)]
+    #[test]
+    fn parentheses_around_an_argument_do_not_open_a_group() {
+        for template in [
+            "@echo off\r\necho ({home}/bin/vera)\r\n\"%~dp0\\rg.exe\" %*\r\n",
+            "#!/bin/sh\necho \"({home}/bin/vera)\"\nexec /usr/bin/rg \"$@\"\n",
+        ] {
+            let roots = roots();
+            let body = template.replace("{home}", &roots.vera_home.display().to_string());
+            let foreign = install_vera_shim(&roots.home.join(".local").join("bin"), &body);
+
+            let (_, stderr) = uninstall(&roots, false);
+
+            assert!(
+                foreign.exists(),
+                "a parenthesized argument was read as a command group: {body:?} / {stderr}"
+            );
+            assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
         }
     }
 
