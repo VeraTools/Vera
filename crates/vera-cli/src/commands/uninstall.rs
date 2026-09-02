@@ -69,8 +69,13 @@ impl LaunchEntry {
 /// with one of these names, from inside the Vera home.
 const VERA_LAUNCHER_NAMES: &[&str] = &["vera", "vera.exe", "vera.cmd"];
 
-/// Words that stand in front of the program on a launch line without being it.
-const LAUNCH_PREFIXES: &[&str] = &["exec", "command", "builtin", "nohup", "env"];
+/// Words that stand in front of the program on a launch line without being it:
+/// the launcher-wrappers, and the shell keywords and grouping tokens that put a
+/// launch somewhere other than the start of a command.
+const LAUNCH_PREFIXES: &[&str] = &[
+    "exec", "command", "builtin", "nohup", "env", "then", "else", "elif", "do", "done", "fi", "{",
+    "}",
+];
 
 /// Whether a line of a shim is a comment rather than something that runs.
 ///
@@ -187,7 +192,9 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
                 // Command separators outside quotes. `;` separates commands in
                 // the shell only; `cmd` passes it through as argument text, so
                 // splitting on it there invents a command that never runs.
-                '|' | '&' => {
+                // Parentheses group commands in both families, so they bound a
+                // command the same way: `(exec vera)` is a launch of vera.
+                '|' | '&' | '(' | ')' => {
                     if word_started {
                         tokens.push(std::mem::take(&mut token));
                     }
@@ -1304,6 +1311,32 @@ mod tests {
             "a batch line was read as a shell assignment and the next token taken as the program"
         );
         assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// Grouping and conditionals put a launch somewhere other than the start
+    /// of a line. Missing them leaves Vera's own shim on PATH while the run
+    /// reports a clean uninstall, which is the #212 failure again.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_inside_grouping_or_a_conditional_is_still_ours() {
+        for template in [
+            // Subshell.
+            "#!/bin/sh\n(exec \"{home}/bin/1.3.0/x/vera\" \"$@\")\n",
+            // Brace group.
+            "#!/bin/sh\n{ exec \"{home}/bin/1.3.0/x/vera\" \"$@\"; }\n",
+            // Conditional.
+            "#!/bin/sh\nif true; then exec \"{home}/bin/1.3.0/x/vera\" \"$@\"; fi\n",
+            // Batch block.
+            "@echo off\r\nif 1==1 ( \"{home}/bin/1.3.0/x/vera\" %* )\r\n",
+        ] {
+            let roots = roots();
+            let body = template.replace("{home}", &roots.vera_home.display().to_string());
+            let shim = install_vera_shim(&roots.home.join(".local").join("bin"), &body);
+
+            let (_, stderr) = uninstall(&roots, false);
+
+            assert!(!shim.exists(), "our own shim survived: {body:?} / {stderr}");
+        }
     }
 
     /// `;` separates commands in the shell but is ordinary argument text in
