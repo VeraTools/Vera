@@ -5,24 +5,22 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use std::sync::Mutex;
 use tempfile::tempdir;
 
-static ELIGIBILITY_SERIAL: Mutex<()> = Mutex::new(());
-
-/// Serializes every test that can move the process-global eligibility build
-/// counter, which is any test that builds a map directly, reads the counter,
-/// or runs a search with filter-during-scan enabled — that path builds a map
-/// too, in `hybrid`.
-///
-/// Poison is stepped over deliberately. The guard exists only to keep these
-/// tests off each other's counter, so when one fails while holding it the
-/// useful signal is that one failure, not four more tests panicking on
-/// `PoisonError` and burying it.
+/// Serializes every test that can move the process-global counters
+/// (`ELIGIBILITY_BUILD_COUNT` and `LAST_HYDRATION_COUNT`). Any test that
+/// builds a map, reads a counter, or runs a search (which hydrates) must
+/// hold this guard — the two counters share the same global state and the
+/// same `ELIGIBILITY_SERIAL` history showed that an allow-list of "which
+/// test touches which counter" fails twice. One lock for all counter
+/// tests is structural, not maintained.
 fn eligibility_guard() -> std::sync::MutexGuard<'static, ()> {
-    ELIGIBILITY_SERIAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::test_serial::counter_guard()
+}
+
+#[allow(dead_code)]
+fn hydration_guard() -> std::sync::MutexGuard<'static, ()> {
+    crate::test_serial::counter_guard()
 }
 
 use crate::config::VeraConfig;

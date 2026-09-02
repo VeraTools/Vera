@@ -46,3 +46,14 @@ pub mod stats;
 
 #[cfg(test)]
 mod test_env;
+
+#[cfg(test)]
+pub(crate) mod test_serial {
+    use std::sync::Mutex;
+    pub static COUNTER_SERIAL: Mutex<()> = Mutex::new(());
+    pub fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
