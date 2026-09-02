@@ -280,8 +280,17 @@ fn program_of(tokens: &[(String, bool)], batch: bool) -> Option<String> {
         .map(|(token, quoted)| (token.strip_prefix('@').unwrap_or(token), *quoted))
         .find(|(token, quoted)| {
             !token.is_empty()
-                // A quoted word is a name, never syntax. `"if" "<vera path>"`
-                // runs a program called `if` and does not launch Vera.
+                // `NAME=value` prefixes set the environment for what follows.
+                // Decided on the name, which is unquoted even when the value is
+                // not, so `NAME="v" exec vera` is still a launch of vera. Shell
+                // only: `cmd` has no such form, so there a leading `NAME=...`
+                // is the program.
+                && !(!batch
+                    && token
+                        .split_once('=')
+                        .is_some_and(|(name, _)| is_variable_name(name)))
+                // Past that, a quoted word is a name and never syntax:
+                // `"if" "<vera path>"` runs a program called `if`.
                 && (*quoted
                     || (!LAUNCH_PREFIXES
                         .iter()
@@ -290,15 +299,7 @@ fn program_of(tokens: &[(String, bool)], batch: bool) -> Option<String> {
                             && SHELL_KEYWORDS
                                 .iter()
                                 .any(|keyword| token.eq_ignore_ascii_case(keyword)))
-                        // `NAME=value` prefixes set the environment for what
-                        // follows, decided on the name rather than on
-                        // punctuation in the value. Shell only: `cmd` has no
-                        // such form, so there a leading `NAME=...` is the
-                        // program.
-                        && !(!batch
-                            && token
-                                .split_once('=')
-                                .is_some_and(|(name, _)| is_variable_name(name)))))
+))
         })
         .map(|(token, _)| token.to_string())
 }
@@ -354,13 +355,31 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path) -> bool {
 /// word such as `coverage` satisfies (#249).
 fn script_launches_vera(text: &str, vera_home: &Path) -> bool {
     let batch = looks_like_batch(text);
-    // `)` terminates a `case` pattern, so it bounds a command wherever that
-    // construct is in play.
-    let case_arms = !batch && text.contains("case") && text.contains("esac");
+    // `)` terminates a `case` pattern, so it bounds a command, but only inside
+    // an actual `case ... in` block. Presence of the words anywhere in the file
+    // is not the construct: a comment or a string mentioning them would
+    // otherwise make every `)` in the script a command boundary.
+    let mut in_case = false;
     text.lines()
         .filter(|line| !is_comment_line(line))
-        .flat_map(|line| launched_programs(line, batch, case_arms))
+        .flat_map(|line| {
+            if !batch && opens_case_block(line) {
+                in_case = true;
+            }
+            let case_arms = in_case;
+            if !batch && line.split_whitespace().any(|word| word == "esac") {
+                in_case = false;
+            }
+            launched_programs(line, batch, case_arms)
+        })
         .any(|program| token_belongs_to_vera(&program, vera_home))
+}
+
+/// Whether a line opens a `case ... in` block, which is the only place a bare
+/// `)` terminates a pattern.
+fn opens_case_block(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    words.next().is_some_and(|word| word == "case") && words.any(|word| word == "in")
 }
 
 /// Whether a word is a shell variable name, and so the left side of an
@@ -1473,6 +1492,50 @@ mod tests {
             );
             assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
         }
+    }
+
+    /// The words `case` and `esac` appearing as data do not make a script a
+    /// `case` statement. Treating them as one turned every `)` into a command
+    /// boundary and deleted a foreign launcher.
+    #[cfg(unix)]
+    #[test]
+    fn the_words_case_and_esac_as_data_do_not_open_a_case_block() {
+        let roots = roots();
+        let foreign = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\necho \"case esac\"\necho a\\) {}/bin/vera\nexec /usr/bin/rg \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            foreign.exists(),
+            "the words as data were read as a case block"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// An assignment is recognized by its name, which is unquoted even when the
+    /// value is quoted. Reading the whole word as a quoted name made it the
+    /// program and left our own shim on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn an_assignment_with_a_quoted_value_is_still_a_prefix() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\nVERA_LOG=\"/var/log/v.log\" exec \"{}/bin/1.3.0/x/vera\" \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(!shim.exists(), "our own shim survived: {stderr}");
     }
 
     /// `;` separates commands in the shell but is ordinary argument text in
