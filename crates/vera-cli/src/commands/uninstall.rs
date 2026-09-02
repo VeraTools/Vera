@@ -120,12 +120,16 @@ fn token_belongs_to_vera(token: &str, vera_home: &Path) -> bool {
 /// `packages/npm-cli/bin/vera.js` writes `@echo off` and `%*` on Windows, so
 /// both markers identify our own shim as well as anyone else's.
 fn looks_like_batch(text: &str) -> bool {
-    text.contains("%*")
-        || text.contains("%~dp0")
-        || text.lines().next().is_some_and(|line| {
-            let line = line.trim_start().to_ascii_lowercase();
-            line.starts_with("@echo") || line.starts_with("echo off")
-        })
+    let first = text.lines().next().unwrap_or("").trim_start();
+    // A shebang settles it: the kernel will run this through a shell, whatever
+    // else the file happens to contain. Without this, a unix script carrying a
+    // literal `%*` anywhere read as batch, which swaps the escape character
+    // and so stops honouring `\;` — turning an escaped separator back into a
+    // command boundary.
+    if first.starts_with("#!") {
+        return false;
+    }
+    first.to_ascii_lowercase().starts_with("@echo") || text.contains("%*") || text.contains("%~dp0")
 }
 
 /// Characters whose special meaning an escape suppresses. Escaping anything
@@ -179,7 +183,7 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
                         tokens.push(std::mem::take(&mut token));
                     }
                     word_started = false;
-                    programs.extend(program_of(&tokens));
+                    programs.extend(program_of(&tokens, batch));
                     tokens.clear();
                 }
                 _ if ch.is_whitespace() => {
@@ -198,7 +202,7 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
     if word_started {
         tokens.push(token);
     }
-    programs.extend(program_of(&tokens));
+    programs.extend(program_of(&tokens, batch));
     programs
 }
 
@@ -207,7 +211,7 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
 ///
 /// Only this position decides ownership. An argument is not a launch: a script
 /// that prints a Vera path and then runs something else has not run Vera.
-fn program_of(tokens: &[String]) -> Option<String> {
+fn program_of(tokens: &[String], batch: bool) -> Option<String> {
     tokens
         .iter()
         .map(|token| token.strip_prefix('@').unwrap_or(token))
@@ -219,8 +223,12 @@ fn program_of(tokens: &[String]) -> Option<String> {
                 // `NAME=value` prefixes set the environment for what follows.
                 // Decided on the name, not on punctuation in the value: an
                 // assignment to a path is still an assignment, and the program
-                // is whatever comes after it.
-                && !token.split_once('=').is_some_and(|(name, _)| is_variable_name(name))
+                // is whatever comes after it. Shell only — `cmd` has no such
+                // prefix form, so there a leading `NAME=...` is the program.
+                && !(!batch
+                    && token
+                        .split_once('=')
+                        .is_some_and(|(name, _)| is_variable_name(name)))
         })
         .map(str::to_string)
 }
@@ -1231,6 +1239,54 @@ mod tests {
             !shim.exists(),
             "a batch shim was truncated at a hash: {stderr}"
         );
+    }
+
+    /// A shebang decides the family whatever else the file contains. A unix
+    /// script that merely mentions `%*` used to read as batch, which swaps the
+    /// escape character and so stopped honouring `\;`, turning an escaped
+    /// separator back into a command boundary.
+    #[cfg(unix)]
+    #[test]
+    fn a_shebang_settles_the_family_against_a_stray_batch_marker() {
+        let roots = roots();
+        let foreign = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\n# prints %* like a batch file would\necho a\\; {}/bin/vera\nexec /usr/bin/rg \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            foreign.exists(),
+            "a shell script was parsed as batch and its escape ignored"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// `cmd` has no `NAME=value` prefix form, so a batch line starting with one
+    /// is running that token, not setting a variable and running the next.
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_line_has_no_environment_assignment_prefix() {
+        let roots = roots();
+        let foreign = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "@echo off\r\nNAME=C:\\tmp \"{}/bin/vera\" %*\r\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            foreign.exists(),
+            "a batch line was read as a shell assignment and the next token taken as the program"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
     }
 
     /// A separator inside a quoted argument is data, not a command boundary.
