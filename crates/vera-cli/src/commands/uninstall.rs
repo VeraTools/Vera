@@ -117,7 +117,8 @@ fn token_belongs_to_vera(token: &str, vera_home: &Path) -> bool {
 /// The program each command on a line runs.
 ///
 /// Quoting is honoured, so neither a separator nor a space inside a quoted
-/// path can invent a command or cut a path in half. Both matter for real
+/// path can invent a command or cut a path in half, and an inline `#` comment
+/// ends the line rather than contributing commands. Both matter for real
 /// installs: `VERA_HOME` under a directory with a space produces a shim whose
 /// binary path is a single quoted token, and a naive split would fail to
 /// recognize Vera's own launcher and silently leave it on PATH.
@@ -132,6 +133,9 @@ fn launched_programs(line: &str) -> Vec<String> {
             Some(open) if ch == open => quote = None,
             Some(_) => token.push(ch),
             None => match ch {
+                // An unquoted `#` at a word boundary comments out the rest of
+                // the line, so nothing after it runs.
+                '#' if token.is_empty() => break,
                 '"' | '\'' | '`' => quote = Some(ch),
                 // Command separators, and only outside quotes.
                 '|' | '&' | ';' => {
@@ -1045,6 +1049,48 @@ mod tests {
             !shim.exists(),
             "a shim under a path with a space was left on PATH"
         );
+    }
+
+    /// An inline `#` comments out the rest of the line, separators included.
+    /// Parsing through it found a Vera path in what looked like program
+    /// position and deleted a foreign launcher the shell never ran.
+    #[cfg(unix)]
+    #[test]
+    fn an_inline_comment_ends_the_line() {
+        let roots = roots();
+        let foreign = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\necho safe # ; exec \"{}/bin/1.3.0/x/vera\"\nexec /usr/bin/rg \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            foreign.exists(),
+            "a commented-out launch line was read as a real one"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// A `#` inside a word is not a comment, so a launch is still a launch.
+    #[cfg(unix)]
+    #[test]
+    fn a_hash_inside_a_word_does_not_start_a_comment() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\nexec \"{}/bin/1.0#rc1/x/vera\" \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(!shim.exists(), "our own shim survived: {stderr}");
     }
 
     /// A separator inside a quoted argument is data, not a command boundary.
