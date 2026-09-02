@@ -63,24 +63,129 @@ impl LaunchEntry {
     }
 }
 
+/// Path components that mark a path as Vera's own: the launcher names the
+/// installers write, and the directory names the payload lives under. Matched
+/// whole and case-insensitively, never as a substring (#249).
+const VERA_PATH_COMPONENTS: &[&str] = &["vera", ".vera", "vera.exe", "vera.cmd"];
+
+/// Whether a line of a shim is a comment rather than something that runs.
+///
+/// A comment naming Vera is not a launch of Vera, so ownership must not be
+/// read out of one (#249). Covers the shell family (`#`, including the
+/// shebang, which names the interpreter and not the program) and the batch
+/// family (`rem`, `@rem`, `::`) that Windows `.cmd` shims are written in.
+fn is_comment_line(line: &str) -> bool {
+    let line = line.trim_start();
+    let unprefixed = line.strip_prefix('@').unwrap_or(line);
+    line.starts_with('#')
+        || unprefixed.starts_with("::")
+        || unprefixed
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("rem"))
+}
+
+/// Strips the punctuation a shell line wraps a path in, leaving the path.
+fn unquote(token: &str) -> &str {
+    token.trim_matches(|c| matches!(c, '"' | '\'' | '`' | '(' | ')' | ';' | ','))
+}
+
+/// Whether a token on a launch line names Vera's own program or a path under
+/// Vera's payload.
+///
+/// The test is component-wise: `/opt/veracrypt/bin/tool` shares four letters
+/// with `vera` and belongs to someone else, so a substring test would delete
+/// it. Containment in `vera_home` is lexical because the data directory has
+/// already been removed by the time the launcher is classified, which makes
+/// `canonicalize` unavailable.
+fn token_belongs_to_vera(token: &str, vera_home: &Path) -> bool {
+    let path = Path::new(unquote(token));
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    let names_vera = path.components().any(|component| {
+        let text = component.as_os_str().to_string_lossy();
+        VERA_PATH_COMPONENTS
+            .iter()
+            .any(|known| text.eq_ignore_ascii_case(known))
+    });
+    names_vera || is_inside(path, vera_home)
+}
+
+/// Resolves `.` and `..` textually. Used instead of `canonicalize` because the
+/// directories being compared may already have been deleted.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Whether `path` sits inside `root`, compared component-wise so that
+/// `/opt/vera-extra` is not read as being inside `/opt/vera`.
+fn is_inside(path: &Path, root: &Path) -> bool {
+    if root.as_os_str().is_empty() {
+        return false;
+    }
+    lexically_normalize(path).starts_with(lexically_normalize(root))
+}
+
+/// Whether a symlink at `entry` points into Vera's own files.
+///
+/// A relative target is resolved against the link's own directory first, so
+/// `vera -> ../lib/vera/bin/vera` is judged on where it actually lands.
+fn symlink_points_at_vera(entry: &Path, vera_home: &Path) -> bool {
+    let Ok(target) = fs::read_link(entry) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        entry.parent().unwrap_or(Path::new("")).join(target)
+    };
+    token_belongs_to_vera(&resolved.to_string_lossy(), vera_home)
+}
+
+/// Whether the text of a launcher script actually launches Vera.
+///
+/// Ownership is decided from the lines that run, and from path tokens on them
+/// judged component-wise — not from the file containing the four letters
+/// `vera` anywhere, which a comment or an unrelated word such as `coverage`
+/// satisfies (#249).
+fn script_launches_vera(text: &str, vera_home: &Path) -> bool {
+    text.lines()
+        .filter(|line| !is_comment_line(line))
+        .flat_map(str::split_whitespace)
+        .any(|token| token_belongs_to_vera(token, vera_home))
+}
+
 /// Recognizes a candidate path as a removable Vera launcher, or leaves it
 /// unclassified so unrelated files stay untouched.
 ///
-/// A shim is UTF-8 text mentioning vera or a symlink pointing at one. The
+/// A shim is a script that launches Vera or a symlink that points at one. The
 /// cargo-installed binary is neither: it fails UTF-8 decoding by construction
 /// (#212), so only "unreadable as text plus a regular executable file with an
 /// exact Vera entry name" attributes it to cargo without grabbing anything
 /// else named `vera`.
-fn classify_launch_entry(entry: &Path) -> Option<LaunchEntry> {
+fn classify_launch_entry(entry: &Path, vera_home: &Path) -> Option<LaunchEntry> {
     let read_as_text = fs::read_to_string(entry);
     if read_as_text
         .as_ref()
-        .is_ok_and(|text| text.contains("vera"))
-        || fs::read_link(entry).is_ok_and(|target| target.to_string_lossy().contains("vera"))
+        .is_ok_and(|text| script_launches_vera(text, vera_home))
+        || symlink_points_at_vera(entry, vera_home)
     {
         return Some(LaunchEntry::Shim);
     }
-    // Decodable text that never mentions vera belongs to someone else.
+    // Decodable text that never launches vera belongs to someone else.
     let is_cargo_binary = read_as_text.is_err()
         && fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file())
         && is_executable(entry);
@@ -176,10 +281,14 @@ fn run_at(
     for dir in shim_candidates(home, user_bin_dir) {
         for name in entry_names() {
             let entry = dir.join(name);
-            if !entry.exists() {
+            // `exists` follows the link and so reports `false` for a broken
+            // one, which left a dangling Vera symlink on PATH while the run
+            // still claimed a complete uninstall (#249). Ask about the link
+            // itself instead.
+            if entry.symlink_metadata().is_err() {
                 continue;
             }
-            let Some(kind) = classify_launch_entry(&entry) else {
+            let Some(kind) = classify_launch_entry(&entry, vera_home) else {
                 // Not ours: leave it alone silently, as before.
                 continue;
             };
@@ -667,8 +776,6 @@ mod tests {
         let script_dir = roots.home.join(".local").join("bin");
         fs::create_dir_all(&script_dir).unwrap();
         let foreign_script = script_dir.join("vera");
-        // The content must not contain the string "vera", or it would look
-        // like our shim by today's matching rule.
         fs::write(&foreign_script, "#!/bin/sh\necho hello\n").unwrap();
         fs::set_permissions(&foreign_script, fs::Permissions::from_mode(0o755)).unwrap();
         let data_dir = roots.home.join("bin");
@@ -681,6 +788,126 @@ mod tests {
         assert!(foreign_script.exists(), "deleted someone else's script");
         assert!(foreign_data.exists(), "deleted someone else's data file");
         assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// The shim the installers write. Kept next to the foreign fixtures so the
+    /// suite proves the classifier separates them rather than only proving it
+    /// declines things.
+    #[cfg(unix)]
+    fn install_vera_shim(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join("vera");
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_a_shim_that_launches_vera() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            "#!/bin/sh\nexec \"$HOME/.vera/bin/vera\" \"$@\"\n",
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(!shim.exists(), "our own shim survived");
+        assert!(stderr.contains("Removed PATH shim"), "{stderr}");
+    }
+
+    /// #249: ownership is read from what the script runs, not from the four
+    /// letters `vera` appearing anywhere in it. A foreign launcher that only
+    /// mentions Vera in a comment, and one whose path merely starts with the
+    /// same letters, must both survive.
+    #[cfg(unix)]
+    #[test]
+    fn a_mention_of_vera_outside_the_launch_line_does_not_make_a_script_ours() {
+        for body in [
+            // Named in a shell comment.
+            "#!/bin/sh\n# drop-in replacement for vera\nexec /usr/bin/rg \"$@\"\n",
+            // Named in a batch comment, which `.cmd` shims are written in.
+            "@echo off\nREM wrapper around vera\n\"%~dp0\\rg.exe\" %*\n",
+            // Not named at all: a longer word that contains the letters.
+            "#!/bin/sh\nexec /opt/veracrypt/bin/veracrypt \"$@\"\n",
+            // A directory that starts with the same letters but is not ours.
+            "#!/bin/sh\nexec /opt/vera-extra/bin/tool \"$@\"\n",
+        ] {
+            let roots = roots();
+            let foreign = install_vera_shim(&roots.home.join(".local").join("bin"), body);
+
+            let (_, stderr) = uninstall(&roots, false);
+
+            assert!(
+                foreign.exists(),
+                "deleted a script that never launches vera: {body:?}"
+            );
+            assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+        }
+    }
+
+    /// #249: the symlink arm gets the same component-wise treatment. A link
+    /// named `vera` that points at somebody else's binary is not ours.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_judged_by_where_it_lands_not_by_its_target_spelling() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let elsewhere = roots.home.join("veracrypt-bin");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let foreign_target = elsewhere.join("veracrypt");
+        fs::write(&foreign_target, "binary").unwrap();
+        let link = bin.join("vera");
+        std::os::unix::fs::symlink(&foreign_target, &link).unwrap();
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "deleted a symlink into someone else's install"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// #249: a Vera symlink whose target is already gone still occupies the
+    /// name on PATH. `exists()` follows the link and reported `false`, so the
+    /// entry was skipped and the run claimed a clean uninstall over it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_vera_symlink_is_removed_rather_than_skipped() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let link = bin.join("vera");
+        std::os::unix::fs::symlink(roots.vera_home.join("bin").join("vera"), &link).unwrap();
+        assert!(
+            !link.exists(),
+            "fixture does not discriminate: the target must be missing"
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            link.symlink_metadata().is_err(),
+            "the dangling shim stayed on PATH"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// `..` has to be resolved before the containment test, or a path that
+    /// climbs back out of Vera's home would still read as inside it.
+    #[test]
+    fn containment_resolves_parent_segments_and_respects_component_boundaries() {
+        let home = Path::new("/opt/vera");
+        assert!(is_inside(Path::new("/opt/vera/bin/vera"), home));
+        assert!(is_inside(Path::new("/opt/vera/bin/../bin/vera"), home));
+        assert!(!is_inside(Path::new("/opt/vera/../other/vera"), home));
+        assert!(!is_inside(Path::new("/opt/vera-extra/bin"), home));
+        // An empty root would otherwise make every path "inside" it.
+        assert!(!is_inside(Path::new("/opt/vera"), Path::new("")));
     }
 
     /// #212: when a recognized launcher cannot be removed, the JSON document
