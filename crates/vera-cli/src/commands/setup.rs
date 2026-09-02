@@ -568,7 +568,7 @@ fn directml_provider_for_d3d12(has_d3d12_device: bool) -> Option<OnnxExecutionPr
 /// gate admits `test` as well as `windows`.
 #[cfg(any(windows, test))]
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Iid {
     data1: u32,
     data2: u16,
@@ -1262,10 +1262,12 @@ mod tests {
         assert_eq!(model.document_text("fn main() {}"), "fn main() {}");
     }
 
-    /// #213: the Windows auto-detect must earn DirectML the way the CUDA,
-    /// ROCm, and OpenVINO branches do, by asking the machine a question.
+    /// Pins only the mapping from the probe's answer to the provider. The
+    /// probe itself is covered by the tests below; the Windows-only symbol
+    /// lookup in `has_directx12_adapter` is covered by neither, and cannot be
+    /// from a non-Windows host.
     #[test]
-    fn windows_auto_detect_earns_directml_only_from_a_d3d12_device() {
+    fn a_d3d12_answer_maps_to_the_directml_provider() {
         assert_eq!(
             directml_provider_for_d3d12(true),
             Some(OnnxExecutionProvider::DirectMl)
@@ -1320,9 +1322,15 @@ mod tests {
     /// asserted about the source.
     #[test]
     fn the_probe_asks_for_a_feature_level_11_id3d12device_without_creating_one() {
+        const UNSET: Iid = Iid {
+            data1: 0,
+            data2: 0,
+            data3: 0,
+            data4: [0; 8],
+        };
         thread_local! {
-            static SEEN: std::cell::Cell<(i32, u32, bool)> = const {
-                std::cell::Cell::new((0, 0, false))
+            static SEEN: std::cell::Cell<(i32, Iid, bool)> = const {
+                std::cell::Cell::new((0, UNSET, false))
             };
         }
         unsafe extern "system" fn record(
@@ -1331,14 +1339,26 @@ mod tests {
             riid: *const Iid,
             device: *mut *mut std::ffi::c_void,
         ) -> i32 {
-            let data1 = unsafe { (*riid).data1 };
-            SEEN.with(|seen| seen.set((feature_level, data1, device.is_null())));
+            let riid = unsafe { *riid };
+            SEEN.with(|seen| seen.set((feature_level, riid, device.is_null())));
             1
         }
         assert!(d3d12_device_can_be_created(record));
-        let (feature_level, riid_data1, ppdevice_was_null) = SEEN.with(std::cell::Cell::get);
+        let (feature_level, riid, ppdevice_was_null) = SEEN.with(std::cell::Cell::get);
         assert_eq!(feature_level, 45056, "D3D_FEATURE_LEVEL_11_0");
-        assert_eq!(riid_data1, 0x189819f1, "IID_ID3D12Device");
+        // The whole GUID: a typo in any field would still name a real
+        // interface, and the probe would report "no Direct3D 12" on capable
+        // hardware while every partial assertion kept passing.
+        assert_eq!(
+            riid,
+            Iid {
+                data1: 0x189819f1,
+                data2: 0x1db6,
+                data3: 0x4b57,
+                data4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
+            },
+            "IID_ID3D12Device"
+        );
         assert!(ppdevice_was_null, "the probe must not create a device");
     }
 
