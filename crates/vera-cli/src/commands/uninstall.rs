@@ -63,28 +63,115 @@ impl LaunchEntry {
     }
 }
 
+/// The launcher the installers write, with the binary path left as a hole.
+///
+/// `packages/npm-cli/bin/vera.js` and `packages/python-cli/.../__main__.py`
+/// emit these two forms and nothing else, character for character. Matching
+/// them is the whole of shim recognition: uninstall never has to understand
+/// shell or batch, only to recognize what it wrote.
+const UNIX_SHIM: (&str, &str) = ("#!/bin/sh\nexec \"", "\" \"$@\"\n");
+const WINDOWS_SHIM: (&str, &str) = ("@echo off\r\n\"", "\" %*\r\n");
+
+/// The binary path a shim launches, if the file is one of the two templates.
+///
+/// A byte comparison with one hole, rather than a parse. Nothing about
+/// quoting, escaping, comments, separators or dialects can change the answer,
+/// because a file that is not exactly one of these shapes is not ours.
+fn shim_target(text: &str) -> Option<&str> {
+    [UNIX_SHIM, WINDOWS_SHIM]
+        .into_iter()
+        .find_map(|(head, tail)| {
+            text.strip_prefix(head)
+                .and_then(|rest| rest.strip_suffix(tail))
+                .filter(|target| !target.is_empty() && !target.contains('"'))
+        })
+}
+
+/// Whether a launcher path is the one this installation put there.
+///
+/// The recorded path is authoritative: `install.json` carries `binary_path`,
+/// which is what `upgrade` already uses to find the installed executable.
+/// Without a record, containment in the Vera home is the fallback, which is
+/// still an exact question about a path rather than a guess about a script.
+fn is_our_binary(target: &Path, recorded: Option<&Path>, vera_home: &Path) -> bool {
+    match recorded {
+        Some(recorded) => lexically_normalize(target) == lexically_normalize(recorded),
+        None => is_inside(target, vera_home),
+    }
+}
+
 /// Recognizes a candidate path as a removable Vera launcher, or leaves it
 /// unclassified so unrelated files stay untouched.
 ///
-/// A shim is UTF-8 text mentioning vera or a symlink pointing at one. The
+/// A shim is one of the two files the installers write, naming this
+/// installation's binary, or a symlink resolving to that binary. The
 /// cargo-installed binary is neither: it fails UTF-8 decoding by construction
 /// (#212), so only "unreadable as text plus a regular executable file with an
 /// exact Vera entry name" attributes it to cargo without grabbing anything
 /// else named `vera`.
-fn classify_launch_entry(entry: &Path) -> Option<LaunchEntry> {
+fn classify_launch_entry(
+    entry: &Path,
+    vera_home: &Path,
+    recorded: Option<&Path>,
+) -> Option<LaunchEntry> {
     let read_as_text = fs::read_to_string(entry);
-    if read_as_text
-        .as_ref()
-        .is_ok_and(|text| text.contains("vera"))
-        || fs::read_link(entry).is_ok_and(|target| target.to_string_lossy().contains("vera"))
-    {
+    let launches_vera = read_as_text
+        .as_deref()
+        .ok()
+        .and_then(shim_target)
+        .is_some_and(|target| is_our_binary(Path::new(target), recorded, vera_home));
+    if launches_vera || symlink_points_at_vera(entry, vera_home, recorded) {
         return Some(LaunchEntry::Shim);
     }
-    // Decodable text that never mentions vera belongs to someone else.
+    // Decodable text that is not one of our templates belongs to someone else.
     let is_cargo_binary = read_as_text.is_err()
         && fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file())
         && is_executable(entry);
     is_cargo_binary.then_some(LaunchEntry::CargoBinary)
+}
+
+/// Resolves `.` and `..` textually. Used instead of `canonicalize` because the
+/// directories being compared may already have been deleted.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Whether `path` sits inside `root`, compared component-wise so that
+/// `/opt/vera-extra` is not read as being inside `/opt/vera`.
+fn is_inside(path: &Path, root: &Path) -> bool {
+    if root.as_os_str().is_empty() {
+        return false;
+    }
+    lexically_normalize(path).starts_with(lexically_normalize(root))
+}
+
+/// Whether a symlink at `entry` resolves to this installation's binary.
+///
+/// A relative target is resolved against the link's own directory first, so
+/// `vera -> ../lib/vera/bin/vera` is judged on where it actually lands, not on
+/// how it is spelled.
+fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path>) -> bool {
+    let Ok(target) = fs::read_link(entry) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        entry.parent().unwrap_or(Path::new("")).join(target)
+    };
+    is_our_binary(&resolved, recorded, vera_home)
 }
 
 /// Executability where the platform tracks it. Windows has no file mode bit;
@@ -112,29 +199,55 @@ fn configured_user_bin_dir() -> Option<PathBuf> {
 pub fn run(json_output: bool) -> Result<()> {
     let home = state::user_home_dir()?;
     let vera_home = state::vera_dir()?;
+    // Read before step 2 removes the Vera home: this is the record of which
+    // binary the installer placed, and it lives inside the directory that is
+    // about to go.
+    let recorded_binary = state::load_install_provenance()
+        .ok()
+        .and_then(|provenance| provenance.binary_path)
+        .map(PathBuf::from);
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     let user_bin_dir = configured_user_bin_dir();
 
     run_at(
-        &home,
-        &vera_home,
-        &cwd,
-        user_bin_dir.as_deref(),
+        InstallLayout {
+            home: &home,
+            vera_home: &vera_home,
+            cwd: &cwd,
+            user_bin_dir: user_bin_dir.as_deref(),
+            recorded_binary: recorded_binary.as_deref(),
+        },
         json_output,
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     )
 }
 
+/// Where this installation put its files, resolved once by the caller so the
+/// body never consults the environment.
+struct InstallLayout<'a> {
+    home: &'a Path,
+    vera_home: &'a Path,
+    cwd: &'a Path,
+    user_bin_dir: Option<&'a Path>,
+    /// The binary the installer recorded in `install.json`, read before the
+    /// Vera home is removed.
+    recorded_binary: Option<&'a Path>,
+}
+
 fn run_at(
-    home: &Path,
-    vera_home: &Path,
-    cwd: &Path,
-    user_bin_dir: Option<&Path>,
+    layout: InstallLayout<'_>,
     json_output: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
+    let InstallLayout {
+        home,
+        vera_home,
+        cwd,
+        user_bin_dir,
+        recorded_binary,
+    } = layout;
     let mut removed = Vec::new();
 
     // 1. Remove agent skill files (all clients, all scopes).
@@ -176,10 +289,13 @@ fn run_at(
     for dir in shim_candidates(home, user_bin_dir) {
         for name in entry_names() {
             let entry = dir.join(name);
-            if !entry.exists() {
+            // `exists` follows the link and so reports `false` for a broken
+            // one, which left a dangling Vera symlink on PATH while the run
+            // still claimed a complete uninstall. Ask about the link itself.
+            if entry.symlink_metadata().is_err() {
                 continue;
             }
-            let Some(kind) = classify_launch_entry(&entry) else {
+            let Some(kind) = classify_launch_entry(&entry, vera_home, recorded_binary) else {
                 // Not ours: leave it alone silently, as before.
                 continue;
             };
@@ -317,10 +433,13 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         run_at(
-            &roots.home,
-            &roots.vera_home,
-            &roots.cwd,
-            Some(roots.user_bin_dir.as_path()),
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(roots.user_bin_dir.as_path()),
+                recorded_binary: None,
+            },
             json_output,
             &mut stdout,
             &mut stderr,
@@ -339,10 +458,13 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let error = run_at(
-            &roots.home,
-            &roots.vera_home,
-            &roots.cwd,
-            Some(roots.user_bin_dir.as_path()),
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(roots.user_bin_dir.as_path()),
+                recorded_binary: None,
+            },
             json_output,
             &mut stdout,
             &mut stderr,
@@ -659,6 +781,151 @@ mod tests {
     /// Two lookalikes that are not ours: a readable script that never mentions
     /// vera, and unreadable data without an executable bit. Neither may be
     /// deleted, and skipping them silently keeps the run complete (#212).
+    #[cfg(unix)]
+    fn install_shim(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join("vera");
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The exact file `packages/npm-cli/bin/vera.js` and the Python wrapper
+    /// write, built from the same Vera home the uninstall resolves.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_the_shim_the_installers_write() {
+        for template in [
+            "#!/bin/sh\nexec \"{bin}\" \"$@\"\n",
+            "@echo off\r\n\"{bin}\" %*\r\n",
+        ] {
+            let roots = roots();
+            let binary = roots
+                .vera_home
+                .join("bin")
+                .join("1.3.0")
+                .join("aarch64-apple-darwin")
+                .join("vera");
+            let body = template.replace("{bin}", &binary.display().to_string());
+            let shim = install_shim(&roots.home.join(".local").join("bin"), &body);
+
+            let (_, stderr) = uninstall(&roots, false);
+
+            assert!(!shim.exists(), "our own shim survived: {body:?} / {stderr}");
+            assert!(stderr.contains("Removed PATH shim"), "{stderr}");
+        }
+    }
+
+    /// A symlink resolving to the installed binary is ours; one resolving
+    /// anywhere else is not, however it is spelled.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_judged_by_where_it_resolves() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ours = bin.join("vera");
+        std::os::unix::fs::symlink(roots.vera_home.join("bin").join("vera"), &ours).unwrap();
+        // Dangling by construction: the target does not exist.
+        assert!(!ours.exists());
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            ours.symlink_metadata().is_err(),
+            "a dangling Vera symlink stayed on PATH: {stderr}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_someone_elses_install_is_left_alone() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        let other = roots.home.join("veracrypt-bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let target = other.join("veracrypt");
+        fs::write(&target, "binary").unwrap();
+        let link = bin.join("vera");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(link.symlink_metadata().is_ok(), "deleted a foreign symlink");
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// The whole corpus of foreign launchers accumulated over ten review
+    /// rounds against the parser this replaces. Every one survives here by
+    /// construction rather than by a rule: none of these files is one of the
+    /// two templates, so none of them is ever a candidate.
+    #[cfg(unix)]
+    #[test]
+    fn no_foreign_launcher_is_claimed() {
+        for body in [
+            // Mentions Vera only in a comment.
+            "#!/bin/sh\n# drop-in replacement for vera\nexec /usr/bin/rg \"$@\"\n",
+            "@echo off\r\nREM wrapper around vera\r\n\"%~dp0\\rg.exe\" %*\r\n",
+            // Shares the letters but not the name.
+            "#!/bin/sh\nexec /opt/veracrypt/bin/veracrypt \"$@\"\n",
+            "#!/bin/sh\nexec /opt/vera-extra/bin/tool \"$@\"\n",
+            // A directory named vera holding someone else's program.
+            "#!/bin/sh\nexec /opt/vera/bin/rg \"$@\"\n",
+            // Another program that merely shares the launcher name.
+            "#!/bin/sh\nexec /opt/other/bin/vera \"$@\"\n",
+            // A Vera path in argument position rather than program position.
+            "#!/bin/sh\necho \"{home}/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
+            // Separators and quoting that each cost a review round.
+            "#!/bin/sh\necho \"see; {home}/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
+            "#!/bin/sh\necho a\\; {home}/bin/vera\nexec /usr/bin/rg \"$@\"\n",
+            "#!/bin/sh\necho safe # ; exec \"{home}/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
+            "#!/bin/sh\n\"if\" \"{home}/bin/vera\"\n",
+            "#!/bin/sh\necho \"case esac\"\necho a\\) {home}/bin/vera\nexec /usr/bin/rg \"$@\"\n",
+            "@echo off\r\necho ({home}/bin/vera)\r\n\"%~dp0\\rg.exe\" %*\r\n",
+            "@echo off\r\necho safe; \"{home}/bin/vera\"\r\n\"%~dp0\\rg.exe\" %*\r\n",
+            // The template with the wrong binary: right shape, not our install.
+            "#!/bin/sh\nexec \"/opt/elsewhere/bin/vera\" \"$@\"\n",
+        ] {
+            let roots = roots();
+            let body = body.replace("{home}", &roots.vera_home.display().to_string());
+            let foreign = install_shim(&roots.home.join(".local").join("bin"), &body);
+
+            let (_, stderr) = uninstall(&roots, false);
+
+            assert!(foreign.exists(), "claimed a foreign launcher: {body:?}");
+            assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+        }
+    }
+
+    /// The recorded path is authoritative when present: a template naming a
+    /// binary outside the Vera home is still ours if that is what was
+    /// installed, and one naming a different binary is not.
+    #[cfg(unix)]
+    #[test]
+    fn the_recorded_binary_path_decides_when_it_exists() {
+        let recorded = Path::new("/opt/custom/vera");
+        let vera_home = Path::new("/home/u/.vera");
+        assert!(is_our_binary(recorded, Some(recorded), vera_home));
+        assert!(!is_our_binary(
+            Path::new("/opt/other/vera"),
+            Some(recorded),
+            vera_home
+        ));
+        // Without a record, containment in the Vera home is the fallback.
+        assert!(is_our_binary(
+            &vera_home.join("bin/1.3.0/x/vera"),
+            None,
+            vera_home
+        ));
+        assert!(!is_our_binary(
+            Path::new("/opt/custom/vera"),
+            None,
+            vera_home
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn uninstall_leaves_foreign_lookalikes_in_place_without_failing() {
