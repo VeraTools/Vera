@@ -1933,12 +1933,13 @@ card0, 1073741824, 4294967296\n";
 
     // ——— Issue #196 signals: toggleable ranking flags ———
 
+    static ENV_BOOL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn env_bool_parses_variants() {
+        let _guard = ENV_BOOL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let key = "VERA_TEST_BOOL_VARIANTS";
-        // Use a unique key not used elsewhere; direct set is safe as no other test touches it concurrently.
         let check = |value: &str, default: bool, expected: bool| {
-            // SAFETY: tests run sequentially for this key; single-threaded mutation is isolated.
             unsafe { std::env::set_var(key, value) };
             let got = env_bool(key, default);
             unsafe { std::env::remove_var(key) };
