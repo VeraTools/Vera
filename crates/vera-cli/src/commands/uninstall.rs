@@ -173,12 +173,29 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
                 // the line. Batch has no such rule, and truncating there would
                 // lose our own launcher.
                 '#' if !batch && !word_started => break,
-                '"' | '\'' | '`' => {
+                // `cmd` quotes with `"` alone; a bare apostrophe is ordinary
+                // text there, and treating it as a quote swallowed the rest of
+                // the line, hiding a launch after the next separator.
+                '"' => {
                     quote = Some(ch);
                     word_started = true;
                 }
-                // Command separators, and only outside quotes.
-                '|' | '&' | ';' => {
+                '\'' | '`' if !batch => {
+                    quote = Some(ch);
+                    word_started = true;
+                }
+                // Command separators outside quotes. `;` separates commands in
+                // the shell only; `cmd` passes it through as argument text, so
+                // splitting on it there invents a command that never runs.
+                '|' | '&' => {
+                    if word_started {
+                        tokens.push(std::mem::take(&mut token));
+                    }
+                    word_started = false;
+                    programs.extend(program_of(&tokens, batch));
+                    tokens.clear();
+                }
+                ';' if !batch => {
                     if word_started {
                         tokens.push(std::mem::take(&mut token));
                     }
@@ -1287,6 +1304,50 @@ mod tests {
             "a batch line was read as a shell assignment and the next token taken as the program"
         );
         assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// `;` separates commands in the shell but is ordinary argument text in
+    /// `cmd`. Splitting on it in a batch file invents a command that never
+    /// runs, and its first token was a Vera path.
+    #[cfg(unix)]
+    #[test]
+    fn a_semicolon_is_not_a_batch_command_separator() {
+        let roots = roots();
+        let foreign = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "@echo off\r\necho safe; \"{}/bin/vera\"\r\n\"%~dp0\\rg.exe\" %*\r\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            foreign.exists(),
+            "a batch line was split on `;` and a Vera path taken as a program"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// `cmd` quotes with `"` alone. Treating an apostrophe as a quote swallowed
+    /// the rest of the line, so a real launch after the next separator was
+    /// never seen and our own shim stayed on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn an_apostrophe_does_not_quote_in_a_batch_shim() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "@echo off\r\necho don't & \"{}/bin/1.3.0/x/vera\" %*\r\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(!shim.exists(), "our own batch shim survived: {stderr}");
     }
 
     /// A separator inside a quoted argument is data, not a command boundary.
