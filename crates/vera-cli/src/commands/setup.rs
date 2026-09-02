@@ -621,14 +621,23 @@ fn d3d12_device_can_be_created(create_device: D3d12CreateDevice) -> bool {
             std::ptr::null_mut(),
         )
     };
-    hresult >= 0
+    let supported = hresult >= 0;
+    if !supported {
+        // Keeps a wrong backend choice on user hardware diagnosable from a run,
+        // instead of collapsing every refusal into a bare `false`.
+        tracing::debug!(
+            hresult = format!("0x{hresult:08x}"),
+            "D3D12CreateDevice declined"
+        );
+    }
+    supported
 }
 
 /// Whether this machine has a Direct3D 12 capable adapter.
 ///
 /// `d3d12.dll` is resolved at run time rather than linked, so a Windows build
 /// still starts on an installation that does not ship it; its absence is a
-/// "no". The module is deliberately left loaded: the probe may have caused
+/// "no", and it is searched for in System32 only. The module is deliberately left loaded: the probe may have caused
 /// Direct3D to cache the per-adapter device singleton, and unloading the
 /// library underneath that is not worth one freed handle in a setup path.
 /// Non-Windows targets answer "no" so the shared `detect_gpu` body compiles
@@ -636,15 +645,30 @@ fn d3d12_device_can_be_created(create_device: D3d12CreateDevice) -> bool {
 fn has_directx12_adapter() -> bool {
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
+        };
 
-        let module = unsafe { LoadLibraryA(c"d3d12.dll".as_ptr().cast()) };
+        // `LOAD_LIBRARY_SEARCH_SYSTEM32` rather than a bare `LoadLibraryA`: the
+        // default search order reaches the current directory, and setup runs
+        // inside whatever project the user is standing in. `d3d12.dll` is not
+        // reliably a KnownDLL, so a copy checked into a repository would
+        // otherwise load ahead of the system one and run its `DllMain` here.
+        let module = unsafe {
+            LoadLibraryExA(
+                c"d3d12.dll".as_ptr().cast(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
         if module.is_null() {
+            tracing::debug!("d3d12.dll not present in System32; no DirectX 12 adapter");
             return false;
         }
         let Some(symbol) =
             (unsafe { GetProcAddress(module, c"D3D12CreateDevice".as_ptr().cast()) })
         else {
+            tracing::debug!("d3d12.dll exports no D3D12CreateDevice; no DirectX 12 adapter");
             return false;
         };
         let create_device: D3d12CreateDevice = unsafe { std::mem::transmute(symbol) };
