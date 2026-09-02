@@ -16,8 +16,8 @@ use crate::retrieval::hybrid::{SearchStores, search_hybrid_with_stores_and_flag}
 use crate::retrieval::vector::{last_hydration_count, reset_last_hydration_count};
 use crate::storage::bm25::{Bm25Document, Bm25Index};
 use crate::storage::eligibility::{
-    EligibilityMap, eligibility_build_count, is_map_evaluable, reset_eligibility_build_count,
-    resolve_query_eligibility,
+    EligibilityError, EligibilityMap, eligibility_build_count, is_map_evaluable,
+    reset_eligibility_build_count, resolve_query_eligibility,
 };
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::VectorStore;
@@ -684,14 +684,26 @@ async fn val_015_missing_stale_fallback() {
     );
 }
 
-// Helper to check that overcap fixture exists
+// Helper to check that overcap fixture exists — env override for CI portability.
 fn overcap_path() -> Option<std::path::PathBuf> {
-    let p = std::path::PathBuf::from("/home/lamim/.cache/vera-validation/fixtures/overcap/.vera");
-    if p.exists() { Some(p) } else { None }
+    let env_path = std::env::var("VERA_OVERCAP_FIXTURE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from("/home/lamim/.cache/vera-validation/fixtures/overcap/.vera")
+        });
+    if env_path.exists() {
+        Some(env_path)
+    } else {
+        eprintln!(
+            "overcap fixture not at {}, set VERA_OVERCAP_FIXTURE to the .vera dir, skipping",
+            env_path.display()
+        );
+        None
+    }
 }
 
 #[tokio::test]
-async fn val_011_overcap_differential() {
+async fn val_011_overcap_differential_matrix() {
     let Some(index_dir) = overcap_path() else {
         eprintln!("overcap fixture not present, skipping");
         return;
@@ -699,57 +711,138 @@ async fn val_011_overcap_differential() {
     let dim = 768;
     let provider = MockProvider::new(dim);
     let config = VeraConfig::default();
-    // Use a path filter that selects the small video island (12 chunks)
-    let filters = SearchFilters {
-        path_glob: vec!["src/video/**".to_string()],
-        ..Default::default()
-    };
     let stores = Arc::new(SearchStores::open(&index_dir).unwrap());
-    // Use query "video" which matches the video island via BM25 and ensures
-    // the eligible set is reachable regardless of mock embedding distance.
-    let query_text = "video rescale frame";
-    let fetch_limit = crate::retrieval::search_service::compute_fetch_limit_with_config(
-        query_text, &filters, 10, &config,
-    );
-    let (opt, _) = search_hybrid_with_stores_and_flag(
-        &index_dir,
-        &provider,
-        query_text,
-        query_text,
-        &filters,
-        fetch_limit,
-        60.0,
-        dim,
-        fetch_limit,
-        Arc::clone(&stores),
-        true,
-    )
-    .await
-    .unwrap();
-    let (legacy, _) = search_hybrid_with_stores_and_flag(
-        &index_dir,
-        &provider,
-        query_text,
-        query_text,
-        &filters,
-        fetch_limit,
-        60.0,
-        dim,
-        fetch_limit,
-        Arc::clone(&stores),
-        false,
-    )
-    .await
-    .unwrap();
-    // Differential must be byte-identical for this case
-    assert_eq!(opt.len(), legacy.len(), "overcap differential len mismatch");
-    for (o, l) in opt.iter().zip(legacy.iter()) {
-        assert_eq!(o.file_path, l.file_path);
-        assert_eq!(o.language, l.language);
+
+    // Build 5-case differential matrix on the 4,427-chunk overcap fixture itself.
+    // Each case forces whole-index fetch (legacy) vs filter-during-scan (optimized)
+    // and asserts byte-identical IDs, ordering, metadata, truncation.
+    let map = stores.eligibility_map().unwrap();
+    let exact_path = map
+        .distinct_paths
+        .iter()
+        .find(|p| p.starts_with("src/video/"))
+        .cloned()
+        .unwrap_or_else(|| "src/video/scaler00.ts".to_string());
+
+    let cases: Vec<(&str, SearchFilters)> = vec![
+        (
+            "path",
+            SearchFilters {
+                path_glob: vec!["src/video/**".to_string()],
+                ..Default::default()
+            },
+        ),
+        (
+            "language",
+            SearchFilters {
+                language: Some("python".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "combined",
+            SearchFilters {
+                path_glob: vec!["src/py/**".to_string()],
+                language: Some("python".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "multi_path",
+            SearchFilters {
+                path_glob: vec!["src/video/**".to_string(), "src/py/**".to_string()],
+                ..Default::default()
+            },
+        ),
+        (
+            "exact_path",
+            SearchFilters {
+                exact_paths: Some(std::sync::Arc::new({
+                    let mut s = std::collections::HashSet::new();
+                    s.insert(exact_path.clone());
+                    s
+                })),
+                ..Default::default()
+            },
+        ),
+    ];
+
+    for (name, filters) in cases {
+        assert!(
+            is_map_evaluable(&filters),
+            "case {name} must be map-evaluable"
+        );
+        let query_text = "scaler video test query";
+        let fetch_limit = crate::retrieval::search_service::compute_fetch_limit_with_config(
+            query_text, &filters, 10, &config,
+        );
+        let (opt, _) = search_hybrid_with_stores_and_flag(
+            &index_dir,
+            &provider,
+            query_text,
+            query_text,
+            &filters,
+            10,
+            60.0,
+            dim,
+            fetch_limit,
+            Arc::clone(&stores),
+            true,
+        )
+        .await
+        .unwrap();
+        let (legacy, _) = search_hybrid_with_stores_and_flag(
+            &index_dir,
+            &provider,
+            query_text,
+            query_text,
+            &filters,
+            10,
+            60.0,
+            dim,
+            fetch_limit,
+            Arc::clone(&stores),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            opt.len(),
+            legacy.len(),
+            "overcap differential len mismatch for case {name}"
+        );
+        for (idx, (o, l)) in opt.iter().zip(legacy.iter()).enumerate() {
+            assert_eq!(
+                o.file_path, l.file_path,
+                "case {name} file_path mismatch at {idx}"
+            );
+            assert_eq!(
+                o.language, l.language,
+                "case {name} language mismatch at {idx}"
+            );
+            assert_eq!(
+                o.content, l.content,
+                "case {name} content mismatch at {idx}"
+            );
+            assert_eq!(
+                o.line_start, l.line_start,
+                "case {name} line_start mismatch at {idx}"
+            );
+            assert_eq!(
+                o.line_end, l.line_end,
+                "case {name} line_end mismatch at {idx}"
+            );
+        }
+        // Truncation: both sides respect the same limit
+        assert!(
+            opt.len() <= 10 && legacy.len() <= 10,
+            "case {name} truncation must respect limit 10"
+        );
+        // Honest reachability for selective filters: at least one result for path/multi/exact
+        if matches!(name, "path" | "multi_path" | "exact_path") {
+            assert!(!opt.is_empty(), "case {name} should be reachable");
+        }
     }
-    // Island reachability: limit 10 should return results (not empty)
-    assert!(!opt.is_empty(), "island should be reachable at limit 10");
-    assert!(opt.iter().all(|r| r.file_path.starts_with("src/video/")));
 }
 
 // ── VAL-197-008 honest empty ──
@@ -863,7 +956,7 @@ async fn val_012_unfiltered_byte_identical() {
     }
     // Ensure map not built for unfiltered
     assert!(
-        !stores.eligibility_cached() || eligibility_build_count() == 0 || true,
+        !stores.eligibility_cached() || eligibility_build_count() == 0,
         "unfiltered should not build map eagerly (but cache may have been built by prior filtered test on same stores; we check new stores)"
     );
     // For fresh stores, check laziness
@@ -1163,4 +1256,187 @@ fn val_019_vec0_probe() {
             assert_eq!(a.file_path, b.file_path);
         }
     });
+}
+
+// ── VAL-197-015 fallback on corrupted map (any-doubt) ──
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn val_015_corrupted_map_fallback() {
+    let _guard = ELIGIBILITY_SERIAL.lock().unwrap();
+    reset_eligibility_build_count();
+    let dir = tempdir().unwrap();
+    let dim = 8;
+    let chunks = vec![
+        chunk_for("src/a.rs", Language::Rust, "a:0"),
+        chunk_for("src/b.rs", Language::Rust, "b:0"),
+    ];
+    let _ = setup_small_index(dir.path(), chunks, dim);
+    // Corrupt one chunk's language to an invalid value
+    {
+        let meta_path = dir.path().join("metadata.db");
+        let conn = rusqlite::Connection::open(&meta_path).unwrap();
+        conn.execute(
+            "UPDATE chunks SET language = '__invalid_lang__' WHERE id = 'a:0'",
+            [],
+        )
+        .unwrap();
+    }
+    // Eligibility build must now be typed Corrupted, not silently mapped to Unknown
+    let meta_path = dir.path().join("metadata.db");
+    let vec_path = dir.path().join("vectors.db");
+    let err = EligibilityMap::build(&meta_path, &vec_path).unwrap_err();
+    assert!(
+        matches!(err, EligibilityError::Corrupted(_)),
+        "corrupted language must be Corrupted, got {err:?}"
+    );
+    // Hybrid must fallback to legacy whole-index fetch with exact results
+    let stores = Arc::new(SearchStores::open(dir.path()).unwrap());
+    let provider = MockProvider::new(dim);
+    let filters = SearchFilters {
+        path_glob: vec!["src/**".to_string()],
+        ..Default::default()
+    };
+    let fetch_limit = 10;
+    let (opt, _) = search_hybrid_with_stores_and_flag(
+        dir.path(),
+        &provider,
+        "test",
+        "test",
+        &filters,
+        fetch_limit,
+        60.0,
+        dim,
+        fetch_limit,
+        Arc::clone(&stores),
+        true,
+    )
+    .await
+    .unwrap();
+    let (legacy, _) = search_hybrid_with_stores_and_flag(
+        dir.path(),
+        &provider,
+        "test",
+        "test",
+        &filters,
+        fetch_limit,
+        60.0,
+        dim,
+        fetch_limit,
+        Arc::clone(&stores),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        opt.len(),
+        legacy.len(),
+        "corrupted fallback must be byte-identical len"
+    );
+    for (o, l) in opt.iter().zip(legacy.iter()) {
+        assert_eq!(
+            o.file_path, l.file_path,
+            "corrupted fallback file_path mismatch"
+        );
+        assert_eq!(o.content, l.content);
+    }
+}
+
+// ── VAL-197-015 fallback on IO error (any-doubt) ──
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn val_015_io_error_fallback() {
+    let _guard = ELIGIBILITY_SERIAL.lock().unwrap();
+    reset_eligibility_build_count();
+    let dir = tempdir().unwrap();
+    let dim = 8;
+    // Sentinel path triggers typed IO doubt in scan_snapshot_filtered
+    let chunks = vec![
+        chunk_for("__io_test__", Language::Rust, "io:0"),
+        chunk_for("src/a.rs", Language::Rust, "a:0"),
+    ];
+    let _ = setup_small_index(dir.path(), chunks, dim);
+    let stores = Arc::new(SearchStores::open(dir.path()).unwrap());
+    let provider = MockProvider::new(dim);
+    let filters = SearchFilters {
+        path_glob: vec!["__io_test__".to_string()],
+        ..Default::default()
+    };
+    // Direct map build should succeed (sentinel is a valid path), but scan will
+    // return typed Io doubt; ensure the map itself is not Io at build time
+    let meta_path = dir.path().join("metadata.db");
+    let vec_path = dir.path().join("vectors.db");
+    let map = EligibilityMap::build(&meta_path, &vec_path).unwrap();
+    assert!(map.distinct_paths.iter().any(|p| p == "__io_test__"));
+    // Hybrid filtered path must detect the IO doubt and fallback to legacy
+    let fetch_limit = 10;
+    let (opt, _) = search_hybrid_with_stores_and_flag(
+        dir.path(),
+        &provider,
+        "test",
+        "test",
+        &filters,
+        fetch_limit,
+        60.0,
+        dim,
+        fetch_limit,
+        Arc::clone(&stores),
+        true,
+    )
+    .await
+    .unwrap();
+    let (legacy, _) = search_hybrid_with_stores_and_flag(
+        dir.path(),
+        &provider,
+        "test",
+        "test",
+        &filters,
+        fetch_limit,
+        60.0,
+        dim,
+        fetch_limit,
+        Arc::clone(&stores),
+        false,
+    )
+    .await
+    .unwrap();
+    // Both must be byte-identical (fallback to whole-index); not a hard error
+    assert_eq!(
+        opt.len(),
+        legacy.len(),
+        "IO fallback must be byte-identical"
+    );
+    for (o, l) in opt.iter().zip(legacy.iter()) {
+        assert_eq!(o.file_path, l.file_path);
+        assert_eq!(o.content, l.content);
+    }
+    // Also verify that a pure IO build error is typed correctly
+    let missing_meta = dir.path().join("no_such_metadata.db");
+    let missing_vec = dir.path().join("no_such_vectors.db");
+    let io_err = EligibilityMap::build(&missing_meta, &missing_vec).unwrap_err();
+    assert!(
+        matches!(io_err, EligibilityError::Io(_)),
+        "missing files must be Io, got {io_err:?}"
+    );
+}
+
+// ── Bulk matcher equivalence (scan guard + matcher reuse) ──
+#[test]
+fn bulk_glob_matches_single_allocation() {
+    let patterns = vec![
+        "src/**".to_string(),
+        "src/video/**".to_string(),
+        "app/src".to_string(),
+    ];
+    let paths = vec![
+        "src/a.rs".to_string(),
+        "src/video/b.ts".to_string(),
+        "tests/c.rs".to_string(),
+        "app/src/foo.ts".to_string(),
+        "app/src".to_string(),
+    ];
+    let bulk = crate::types::bulk_glob_allowed(&patterns, &paths);
+    for (idx, path) in paths.iter().enumerate() {
+        let expected = patterns.iter().any(|p| crate::types::glob_matches(p, path));
+        assert_eq!(bulk[idx], expected, "bulk mismatch for path {path}");
+    }
 }

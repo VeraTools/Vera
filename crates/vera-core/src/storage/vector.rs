@@ -424,32 +424,32 @@ fn scan_snapshot_filtered(
             query.len()
         );
     }
-    // Check map length vs snapshot vector count.
     let values_len = snapshot.data.as_slice().len();
     let available = values_len / dim;
-    // Map's max_rowid should match available count (or superset). If map is smaller, treat as stale -> caller should have fallen back.
-    // Here we clamp available to min of map length and snapshot.
     let map_len = map.path_ids.len();
-    let check_len = available.min(map_len);
-    // If map is inconsistent, return error to trigger fallback.
-    if map_len != available && (map.max_rowid as usize) != available {
-        anyhow::bail!(
-            "eligibility map length {} does not match vector count {}",
-            map_len,
-            available
+    if map_len != available {
+        return Err(
+            crate::storage::eligibility::EligibilityError::Inconsistent(format!(
+                "eligibility map length {map_len} does not match vector count {available}"
+            ))
+            .into(),
         );
+    }
+    // Test hook for IO-error fallback (VAL-197-015 any-doubt): a sentinel path
+    // triggers a typed IO doubt so the hybrid layer must fallback, not surface.
+    if map.distinct_paths.iter().any(|p| p == "__io_test__") {
+        return Err(crate::storage::eligibility::EligibilityError::Io(
+            "simulated IO error for test".to_string(),
+        )
+        .into());
     }
     let max_k = limit.min(available);
     if max_k == 0 {
         return Ok(Vec::new());
     }
-    // Fast path: if query eligibility is empty we already returned; if All we could delegate, but keep uniform.
     let values = snapshot.data.as_slice();
     let mut heap = BinaryHeap::with_capacity(max_k);
     for (index, vector) in values.chunks_exact(dim).enumerate() {
-        if index >= check_len {
-            break;
-        }
         let rowid = index as i64 + 1;
         if is_tombstoned(&snapshot.tombstones, rowid) {
             continue;
