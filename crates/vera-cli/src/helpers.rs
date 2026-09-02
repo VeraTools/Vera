@@ -786,7 +786,7 @@ pub fn path_filter_hint(
                 if last.contains('.') {
                     // Strip extension to derive a directory candidate, e.g.
                     // `src/auth.rs` -> `src/auth`, `a/b/c.rs` -> `a/b/c`.
-                    let stem = last.split('.').next().unwrap_or(last);
+                    let stem = last.rsplit_once('.').map_or(last, |(stem, _)| stem);
                     let dir_candidate = if let Some(slash) = trimmed.rfind(['/', '\\']) {
                         let parent = &trimmed[..slash];
                         if parent.is_empty() {
@@ -820,7 +820,7 @@ pub fn path_filter_hint(
     );
     if !suggestions.is_empty() {
         hint.push_str(&format!(
-            "\n      a directory pattern containing a wildcard matches no file on its own; try {}",
+            "\n      try a directory pattern: {}",
             suggestions.join(", ")
         ));
     }
