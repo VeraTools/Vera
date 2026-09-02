@@ -10,6 +10,21 @@ use tempfile::tempdir;
 
 static ELIGIBILITY_SERIAL: Mutex<()> = Mutex::new(());
 
+/// Serializes every test that can move the process-global eligibility build
+/// counter, which is any test that builds a map directly, reads the counter,
+/// or runs a search with filter-during-scan enabled — that path builds a map
+/// too, in `hybrid`.
+///
+/// Poison is stepped over deliberately. The guard exists only to keep these
+/// tests off each other's counter, so when one fails while holding it the
+/// useful signal is that one failure, not four more tests panicking on
+/// `PoisonError` and burying it.
+fn eligibility_guard() -> std::sync::MutexGuard<'static, ()> {
+    ELIGIBILITY_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
 use crate::retrieval::hybrid::{SearchStores, search_hybrid_with_stores_and_flag};
@@ -83,7 +98,7 @@ fn setup_small_index(dir: &Path, chunks: Vec<Chunk>, dim: usize) -> (MetadataSto
 // ── VAL-197-001 ──
 #[test]
 fn val_001_lazy_per_store_generation() {
-    let _guard = ELIGIBILITY_SERIAL.lock().unwrap();
+    let _guard = eligibility_guard();
     reset_eligibility_build_count();
     let dir_a = tempdir().unwrap();
     let dir_b = tempdir().unwrap();
@@ -281,7 +296,7 @@ fn val_002_metadata_agreement_and_globmatcher() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn val_010_filter_before_hydration() {
-    let _guard = ELIGIBILITY_SERIAL.lock().unwrap();
+    let _guard = eligibility_guard();
     reset_last_hydration_count();
     reset_eligibility_build_count();
     let dir = tempdir().unwrap();
@@ -394,6 +409,7 @@ async fn val_010_filter_before_hydration() {
 // Test differential across small synthetic cases; overcap fixture is tested separately in next test.
 #[tokio::test]
 async fn val_011_differential_small() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -534,7 +550,7 @@ async fn val_013_tombstone_exclusion() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn val_014_staleness_invalidation() {
-    let _guard = ELIGIBILITY_SERIAL.lock().unwrap();
+    let _guard = eligibility_guard();
     reset_eligibility_build_count();
     let dir = tempdir().unwrap();
     let dim = 8;
@@ -614,6 +630,7 @@ async fn val_014_staleness_invalidation() {
 // ── VAL-197-015 missing/stale fallback ──
 #[tokio::test]
 async fn val_015_missing_stale_fallback() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -704,6 +721,7 @@ fn overcap_path() -> Option<std::path::PathBuf> {
 
 #[tokio::test]
 async fn val_011_overcap_differential_matrix() {
+    let _guard = eligibility_guard();
     let Some(index_dir) = overcap_path() else {
         eprintln!("overcap fixture not present, skipping");
         return;
@@ -848,6 +866,7 @@ async fn val_011_overcap_differential_matrix() {
 // ── VAL-197-008 honest empty ──
 #[tokio::test]
 async fn val_008_honest_empty() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -907,6 +926,7 @@ async fn val_008_honest_empty() {
 // ── VAL-197-012 unfiltered byte-identical ──
 #[tokio::test]
 async fn val_012_unfiltered_byte_identical() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -1017,6 +1037,7 @@ async fn val_012_unfiltered_byte_identical() {
 // ── VAL-197-016 scope fallback ──
 #[tokio::test]
 async fn val_016_scope_fallback() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -1078,6 +1099,7 @@ async fn val_016_scope_fallback() {
 // ── VAL-197-017 include_generated fallback ──
 #[tokio::test]
 async fn val_017_include_generated_fallback() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -1132,6 +1154,7 @@ async fn val_017_include_generated_fallback() {
 // ── VAL-197-018 mixed fallback ──
 #[tokio::test]
 async fn val_018_mixed_fallback() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -1205,6 +1228,7 @@ fn val_019_vec0_flag_ignored() {
 #[test]
 #[ignore]
 fn val_019_vec0_probe() {
+    let _guard = eligibility_guard();
     let dir = tempfile::tempdir().unwrap();
     let dim = 8;
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1262,7 +1286,7 @@ fn val_019_vec0_probe() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn val_015_corrupted_map_fallback() {
-    let _guard = ELIGIBILITY_SERIAL.lock().unwrap();
+    let _guard = eligibility_guard();
     reset_eligibility_build_count();
     let dir = tempdir().unwrap();
     let dim = 8;
@@ -1345,7 +1369,7 @@ async fn val_015_corrupted_map_fallback() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn val_015_io_error_fallback() {
-    let _guard = ELIGIBILITY_SERIAL.lock().unwrap();
+    let _guard = eligibility_guard();
     reset_eligibility_build_count();
     let dir = tempdir().unwrap();
     let dim = 8;
