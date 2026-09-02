@@ -541,60 +541,142 @@ fn detect_gpu() -> InferenceBackend {
         }
     }
 
-    // Windows: probe the video-controller list like every other platform's
-    // branch asks the machine a question (#213). Only a real display adapter
-    // earns DirectML; Basic Display fallbacks and an unanswerable probe fall
-    // through to the common Potion Code fallback below.
-    if cfg!(target_os = "windows")
-        && let Some(provider) =
-            directml_provider_for_adapters(list_windows_video_controllers().as_deref())
-    {
+    // Windows: ask Direct3D 12 itself whether a device can be created, the way
+    // every other branch asks the machine a question (#213, #248). A driver
+    // that answers yes is the whole of DirectML's hardware requirement; anything
+    // else falls through to the common Potion Code fallback below.
+    if let Some(provider) = directml_provider_for_d3d12(has_directx12_adapter()) {
         return InferenceBackend::OnnxJina(provider);
     }
 
     InferenceBackend::PotionCode
 }
 
-/// Maps a video-controller name listing onto the DirectML execution provider.
+/// Maps "this machine has a Direct3D 12 device" onto the DirectML provider.
 ///
-/// `None` means no usable DirectX 12 GPU: the probe produced nothing, or
-/// every adapter is one of Microsoft's software-only fallbacks, whose names
-/// contain "Basic" (#213). Pure over its input so non-Windows tests exercise
-/// both the selection and the fallthrough.
-fn directml_provider_for_adapters(adapters: Option<&str>) -> Option<OnnxExecutionProvider> {
-    let has_directx12_gpu = adapters
-        .into_iter()
-        .flat_map(|names| names.lines())
-        .map(str::trim)
-        .any(|name| !name.is_empty() && !name.to_ascii_lowercase().contains("basic"));
-    has_directx12_gpu.then_some(OnnxExecutionProvider::DirectMl)
+/// DirectML's documented hardware requirement is a DirectX 12 capable device
+/// and nothing more, so the answer to the probe is the answer for the backend.
+/// Pure over its input so non-Windows tests exercise both arms.
+fn directml_provider_for_d3d12(has_d3d12_device: bool) -> Option<OnnxExecutionProvider> {
+    has_d3d12_device.then_some(OnnxExecutionProvider::DirectMl)
 }
 
-/// The installed video-controller names. `wmic` is gone from current Windows
-/// builds, so ask CIM instead; a missing tool or any other query failure
-/// reads as no GPU. Non-Windows targets compile an always-absent answer so
-/// the shared `detect_gpu` body stays referenced on every platform.
-fn list_windows_video_controllers() -> Option<String> {
+/// COM interface identifier, laid out as the Windows `GUID` struct.
+///
+/// This and the items below exist for the Windows probe; the tests drive them
+/// on every platform through a stand-in `D3D12CreateDevice`, which is why the
+/// gate admits `test` as well as `windows`.
+#[cfg(any(windows, test))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Iid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+#[cfg(any(windows, test))]
+/// `ID3D12Device`, `189819f1-1db6-4b57-be54-1821339b85f7`. Taken from the
+/// Windows metadata projection (`windows` crate, `Win32/Graphics/Direct3D12`),
+/// not from a header transcribed by hand.
+const IID_ID3D12_DEVICE: Iid = Iid {
+    data1: 0x189819f1,
+    data2: 0x1db6,
+    data3: 0x4b57,
+    data4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
+};
+
+#[cfg(any(windows, test))]
+/// `D3D_FEATURE_LEVEL_11_0`, the floor for a Direct3D 12 device.
+const D3D_FEATURE_LEVEL_11_0: i32 = 45056;
+
+#[cfg(any(windows, test))]
+/// The `d3d12.dll` export, as the raw ABI rather than a safe wrapper. Naming
+/// the type lets the probe body be checked by the compiler and driven by a
+/// stand-in function on every platform, so only the symbol lookup is
+/// Windows-only.
+type D3d12CreateDevice = unsafe extern "system" fn(
+    adapter: *mut std::ffi::c_void,
+    minimum_feature_level: i32,
+    riid: *const Iid,
+    device: *mut *mut std::ffi::c_void,
+) -> i32;
+
+#[cfg(any(windows, test))]
+/// Whether `D3D12CreateDevice` reports that a device could be created.
+///
+/// The call passes a null `ppDevice`, which is the documented way to test
+/// device creation without performing it, and a null adapter, which selects
+/// the default adapter — the same adapter ONNX Runtime's DirectML provider
+/// uses at its default `device_id` of 0. **Under a null `ppDevice` a success
+/// is `S_FALSE` (1), not `S_OK` (0)**, so the verdict is the sign bit of the
+/// `HRESULT` and never an equality against zero.
+fn d3d12_device_can_be_created(create_device: D3d12CreateDevice) -> bool {
+    let hresult = unsafe {
+        create_device(
+            std::ptr::null_mut(),
+            D3D_FEATURE_LEVEL_11_0,
+            &IID_ID3D12_DEVICE,
+            std::ptr::null_mut(),
+        )
+    };
+    let supported = hresult >= 0;
+    if !supported {
+        // Keeps a wrong backend choice on user hardware diagnosable from a run,
+        // instead of collapsing every refusal into a bare `false`.
+        tracing::debug!(
+            hresult = format!("0x{hresult:08x}"),
+            "D3D12CreateDevice declined"
+        );
+    }
+    supported
+}
+
+/// Whether this machine has a Direct3D 12 capable adapter.
+///
+/// `d3d12.dll` is resolved at run time rather than linked, so a Windows build
+/// still starts on an installation that does not ship it; its absence is a
+/// "no", and it is searched for in System32 only. The module is deliberately left loaded: the probe may have caused
+/// Direct3D to cache the per-adapter device singleton, and unloading the
+/// library underneath that is not worth one freed handle in a setup path.
+/// Non-Windows targets answer "no" so the shared `detect_gpu` body compiles
+/// and runs everywhere.
+fn has_directx12_adapter() -> bool {
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "(Get-CimInstance Win32_VideoController).Name",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
+        };
+
+        // `LOAD_LIBRARY_SEARCH_SYSTEM32` rather than a bare `LoadLibraryA`: the
+        // default search order reaches the current directory, and setup runs
+        // inside whatever project the user is standing in. `d3d12.dll` is not
+        // reliably a KnownDLL, so a copy checked into a repository would
+        // otherwise load ahead of the system one and run its `DllMain` here.
+        let module = unsafe {
+            LoadLibraryExA(
+                c"d3d12.dll".as_ptr().cast(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            tracing::debug!("d3d12.dll not present in System32; no DirectX 12 adapter");
+            return false;
+        }
+        let Some(symbol) =
+            (unsafe { GetProcAddress(module, c"D3D12CreateDevice".as_ptr().cast()) })
+        else {
+            tracing::debug!("d3d12.dll exports no D3D12CreateDevice; no DirectX 12 adapter");
+            return false;
+        };
+        let create_device: D3d12CreateDevice = unsafe { std::mem::transmute(symbol) };
+        d3d12_device_can_be_created(create_device)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        None
+        false
     }
 }
 
@@ -1180,37 +1262,122 @@ mod tests {
         assert_eq!(model.document_text("fn main() {}"), "fn main() {}");
     }
 
-    /// #213: the Windows auto-detect must earn DirectML the way the CUDA,
-    /// ROCm, and OpenVINO branches do, by finding a real adapter. Microsoft's
-    /// software-only fallbacks, an empty list, and a failed probe all fall
-    /// through to Potion Code instead of selecting a backend that cannot run.
+    /// Pins only the mapping from the probe's answer to the provider. The
+    /// probe itself is covered by the tests below; the Windows-only symbol
+    /// lookup in `has_directx12_adapter` is covered by neither, and cannot be
+    /// from a non-Windows host.
     #[test]
-    fn windows_auto_detect_earns_directml_only_with_a_real_display_adapter() {
+    fn a_d3d12_answer_maps_to_the_directml_provider() {
         assert_eq!(
-            directml_provider_for_adapters(Some(
-                "NVIDIA GeForce RTX 5090\nIntel(R) Arc(TM) B580\n"
-            )),
+            directml_provider_for_d3d12(true),
             Some(OnnxExecutionProvider::DirectMl)
         );
-        // One qualifying adapter is enough even next to Basic ones.
-        assert_eq!(
-            directml_provider_for_adapters(Some(
-                "Microsoft Basic Display Adapter\nAMD Radeon RX 7900 XT"
-            )),
-            Some(OnnxExecutionProvider::DirectMl)
-        );
-        for unusable in [
-            None,
-            Some(""),
-            Some("Microsoft Basic Display Adapter"),
-            Some("Microsoft Basic Render Driver"),
-        ] {
-            assert_eq!(
-                directml_provider_for_adapters(unusable),
-                None,
-                "no usable DirectX 12 GPU here: {unusable:?}"
-            );
+        assert_eq!(directml_provider_for_d3d12(false), None);
+    }
+
+    /// `S_FALSE`, not `S_OK`, is what `D3D12CreateDevice` returns when it
+    /// succeeds under a null `ppDevice` (#248). A probe that tested for zero
+    /// would call every Direct3D 12 machine in existence unsupported, so this
+    /// pins the success arm on the value the API actually returns.
+    #[test]
+    fn a_null_ppdevice_success_is_s_false_and_still_counts_as_supported() {
+        unsafe extern "system" fn returns_s_false(
+            _adapter: *mut std::ffi::c_void,
+            _feature_level: i32,
+            _riid: *const Iid,
+            _device: *mut *mut std::ffi::c_void,
+        ) -> i32 {
+            1 // S_FALSE
         }
+        assert!(d3d12_device_can_be_created(returns_s_false));
+    }
+
+    /// The other side: real failure HRESULTs are negative, and each must read
+    /// as "no Direct3D 12 here" rather than being mistaken for a status code.
+    #[test]
+    fn failing_hresults_report_no_d3d12_device() {
+        unsafe extern "system" fn returns_e_fail(
+            _adapter: *mut std::ffi::c_void,
+            _feature_level: i32,
+            _riid: *const Iid,
+            _device: *mut *mut std::ffi::c_void,
+        ) -> i32 {
+            0x8000_4005_u32 as i32 // E_FAIL
+        }
+        unsafe extern "system" fn returns_dxgi_not_found(
+            _adapter: *mut std::ffi::c_void,
+            _feature_level: i32,
+            _riid: *const Iid,
+            _device: *mut *mut std::ffi::c_void,
+        ) -> i32 {
+            0x887A_0002_u32 as i32 // DXGI_ERROR_NOT_FOUND
+        }
+        assert!(!d3d12_device_can_be_created(returns_e_fail));
+        assert!(!d3d12_device_can_be_created(returns_dxgi_not_found));
+    }
+
+    /// The call must ask for a device it would actually be able to use: the
+    /// default adapter, the Direct3D 12 floor feature level, `ID3D12Device`,
+    /// and a null `ppDevice` so nothing is created. Recorded from inside the call rather than
+    /// asserted about the source.
+    #[test]
+    fn the_probe_asks_for_a_feature_level_11_id3d12device_without_creating_one() {
+        const UNSET: Iid = Iid {
+            data1: 0,
+            data2: 0,
+            data3: 0,
+            data4: [0; 8],
+        };
+        thread_local! {
+            static SEEN: std::cell::Cell<(i32, Iid, bool, bool)> = const {
+                std::cell::Cell::new((0, UNSET, false, false))
+            };
+        }
+        unsafe extern "system" fn record(
+            adapter: *mut std::ffi::c_void,
+            feature_level: i32,
+            riid: *const Iid,
+            device: *mut *mut std::ffi::c_void,
+        ) -> i32 {
+            let riid = unsafe { *riid };
+            SEEN.with(|seen| seen.set((feature_level, riid, device.is_null(), adapter.is_null())));
+            1
+        }
+        assert!(d3d12_device_can_be_created(record));
+        let (feature_level, riid, ppdevice_was_null, adapter_was_null) =
+            SEEN.with(std::cell::Cell::get);
+        assert_eq!(feature_level, 45056, "D3D_FEATURE_LEVEL_11_0");
+        // The whole GUID: a typo in any field would still name a real
+        // interface, and the probe would report "no Direct3D 12" on capable
+        // hardware while every partial assertion kept passing.
+        assert_eq!(
+            riid,
+            Iid {
+                data1: 0x189819f1,
+                data2: 0x1db6,
+                data3: 0x4b57,
+                data4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
+            },
+            "IID_ID3D12Device"
+        );
+        assert!(ppdevice_was_null, "the probe must not create a device");
+        // The null adapter is the default adapter, which is the one ONNX
+        // Runtime's DirectML provider uses at its default `device_id` of 0.
+        // Probing any other adapter would answer a different question.
+        assert!(
+            adapter_was_null,
+            "the probe must ask about the default adapter"
+        );
+    }
+
+    /// Every non-Windows target answers "no" without a probe, so auto-detect
+    /// reaches the shared Potion Code fallback rather than a backend that
+    /// cannot load.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_targets_never_report_a_directx12_adapter() {
+        assert!(!has_directx12_adapter());
+        assert_eq!(directml_provider_for_d3d12(has_directx12_adapter()), None);
     }
 
     /// Qwen optimizations must trigger on preset identity (ApiPresetId::Qwen),
