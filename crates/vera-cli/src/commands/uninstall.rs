@@ -157,14 +157,17 @@ fn is_special(ch: char) -> bool {
 /// command or cut a path in half — a `VERA_HOME` under a directory with a
 /// space produces exactly that shim, and failing to recognize it leaves Vera's
 /// own launcher on PATH.
-fn launched_programs(line: &str, batch: bool) -> Vec<String> {
+fn launched_programs(line: &str, batch: bool, case_arms: bool) -> Vec<String> {
     let escape = if batch { '^' } else { '\\' };
     let mut programs = Vec::new();
-    let mut tokens: Vec<String> = Vec::new();
+    // Each token remembers whether any of it was quoted: a quoted word is a
+    // name, never syntax, so `"if"` is a program called `if`.
+    let mut tokens: Vec<(String, bool)> = Vec::new();
     let mut token = String::new();
     // Tracked separately from `token`, which stays empty for a quoted empty
     // word: `""#` is a `#` inside a word, not the start of a comment.
     let mut word_started = false;
+    let mut word_quoted = false;
     let mut group_depth = 0usize;
     let mut quote: Option<char> = None;
     let mut chars = line.chars().peekable();
@@ -190,19 +193,22 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
                 '"' => {
                     quote = Some(ch);
                     word_started = true;
+                    word_quoted = true;
                 }
                 '\'' | '`' if !batch => {
                     quote = Some(ch);
                     word_started = true;
+                    word_quoted = true;
                 }
                 // Command separators outside quotes. `;` separates commands in
                 // the shell only; `cmd` passes it through as argument text, so
                 // splitting on it there invents a command that never runs.
                 '|' | '&' => {
                     if word_started {
-                        tokens.push(std::mem::take(&mut token));
+                        tokens.push((std::mem::take(&mut token), word_quoted));
                     }
                     word_started = false;
+                    word_quoted = false;
                     programs.extend(program_of(&tokens, batch));
                     tokens.clear();
                 }
@@ -219,28 +225,35 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
                     programs.extend(program_of(&tokens, batch));
                     tokens.clear();
                 }
-                ')' if group_depth > 0 => {
-                    group_depth -= 1;
+                // A `case` arm ends its pattern with `)` and no opening paren,
+                // so inside a script that uses `case` a bare `)` also bounds a
+                // command. Gated on the construct being present, because
+                // outside it a lone `)` is argument text.
+                ')' if group_depth > 0 || case_arms => {
+                    group_depth = group_depth.saturating_sub(1);
                     if word_started {
-                        tokens.push(std::mem::take(&mut token));
+                        tokens.push((std::mem::take(&mut token), word_quoted));
                     }
                     word_started = false;
+                    word_quoted = false;
                     programs.extend(program_of(&tokens, batch));
                     tokens.clear();
                 }
                 ';' if !batch => {
                     if word_started {
-                        tokens.push(std::mem::take(&mut token));
+                        tokens.push((std::mem::take(&mut token), word_quoted));
                     }
                     word_started = false;
+                    word_quoted = false;
                     programs.extend(program_of(&tokens, batch));
                     tokens.clear();
                 }
                 _ if ch.is_whitespace() => {
                     if word_started {
-                        tokens.push(std::mem::take(&mut token));
+                        tokens.push((std::mem::take(&mut token), word_quoted));
                     }
                     word_started = false;
+                    word_quoted = false;
                 }
                 _ => {
                     token.push(ch);
@@ -250,7 +263,7 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
         }
     }
     if word_started {
-        tokens.push(token);
+        tokens.push((token, word_quoted));
     }
     programs.extend(program_of(&tokens, batch));
     programs
@@ -261,30 +274,33 @@ fn launched_programs(line: &str, batch: bool) -> Vec<String> {
 ///
 /// Only this position decides ownership. An argument is not a launch: a script
 /// that prints a Vera path and then runs something else has not run Vera.
-fn program_of(tokens: &[String], batch: bool) -> Option<String> {
+fn program_of(tokens: &[(String, bool)], batch: bool) -> Option<String> {
     tokens
         .iter()
-        .map(|token| token.strip_prefix('@').unwrap_or(token))
-        .find(|token| {
+        .map(|(token, quoted)| (token.strip_prefix('@').unwrap_or(token), *quoted))
+        .find(|(token, quoted)| {
             !token.is_empty()
-                && !LAUNCH_PREFIXES
-                    .iter()
-                    .any(|prefix| token.eq_ignore_ascii_case(prefix))
-                && !(!batch
-                    && SHELL_KEYWORDS
+                // A quoted word is a name, never syntax. `"if" "<vera path>"`
+                // runs a program called `if` and does not launch Vera.
+                && (*quoted
+                    || (!LAUNCH_PREFIXES
                         .iter()
-                        .any(|keyword| token.eq_ignore_ascii_case(keyword)))
-                // `NAME=value` prefixes set the environment for what follows.
-                // Decided on the name, not on punctuation in the value: an
-                // assignment to a path is still an assignment, and the program
-                // is whatever comes after it. Shell only — `cmd` has no such
-                // prefix form, so there a leading `NAME=...` is the program.
-                && !(!batch
-                    && token
-                        .split_once('=')
-                        .is_some_and(|(name, _)| is_variable_name(name)))
+                        .any(|prefix| token.eq_ignore_ascii_case(prefix))
+                        && !(!batch
+                            && SHELL_KEYWORDS
+                                .iter()
+                                .any(|keyword| token.eq_ignore_ascii_case(keyword)))
+                        // `NAME=value` prefixes set the environment for what
+                        // follows, decided on the name rather than on
+                        // punctuation in the value. Shell only: `cmd` has no
+                        // such form, so there a leading `NAME=...` is the
+                        // program.
+                        && !(!batch
+                            && token
+                                .split_once('=')
+                                .is_some_and(|(name, _)| is_variable_name(name)))))
         })
-        .map(str::to_string)
+        .map(|(token, _)| token.to_string())
 }
 
 /// Resolves `.` and `..` textually. Used instead of `canonicalize` because the
@@ -338,9 +354,12 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path) -> bool {
 /// word such as `coverage` satisfies (#249).
 fn script_launches_vera(text: &str, vera_home: &Path) -> bool {
     let batch = looks_like_batch(text);
+    // `)` terminates a `case` pattern, so it bounds a command wherever that
+    // construct is in play.
+    let case_arms = !batch && text.contains("case") && text.contains("esac");
     text.lines()
         .filter(|line| !is_comment_line(line))
-        .flat_map(|line| launched_programs(line, batch))
+        .flat_map(|line| launched_programs(line, batch, case_arms))
         .any(|program| token_belongs_to_vera(&program, vera_home))
 }
 
@@ -1406,6 +1425,51 @@ mod tests {
             assert!(
                 foreign.exists(),
                 "a parenthesized argument was read as a command group: {body:?} / {stderr}"
+            );
+            assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+        }
+    }
+
+    /// A `case` arm terminates its pattern with `)` and never opens one, so a
+    /// launch in an arm sits behind a paren no group accounts for.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_in_a_case_arm_is_still_ours() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  *) exec \"{}/bin/1.3.0/x/vera\" \"$@\" ;;\nesac\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(!shim.exists(), "our own shim survived: {stderr}");
+    }
+
+    /// A quoted word is a name, never syntax. Stepping over a quoted keyword
+    /// handed the program slot to its argument, which deleted a foreign shim.
+    #[cfg(unix)]
+    #[test]
+    fn a_quoted_keyword_is_a_program_name_not_syntax() {
+        for keyword in ["if", "while", "until", "!", "exec"] {
+            let roots = roots();
+            let foreign = install_vera_shim(
+                &roots.home.join(".local").join("bin"),
+                &format!(
+                    "#!/bin/sh\n\"{}\" \"{}/bin/vera\"\n",
+                    keyword,
+                    roots.vera_home.display()
+                ),
+            );
+
+            let (_, stderr) = uninstall(&roots, false);
+
+            assert!(
+                foreign.exists(),
+                "a quoted `{keyword}` was read as syntax and its argument taken as the program"
             );
             assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
         }
