@@ -226,10 +226,10 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path
 /// Reading it inside the classifier made the result depend on the machine: a
 /// host with `CARGO_HOME` set resolved somewhere other than the tree under
 /// test, which passed locally and failed on CI.
-fn cargo_bin_dir(home: &Path) -> PathBuf {
+fn cargo_bin_dir(home: &Path, cwd: &Path) -> PathBuf {
     std::env::var_os("CARGO_HOME")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+        .map(|value| absolutize(cwd, PathBuf::from(value)))
         .unwrap_or_else(|| home.join(".cargo"))
         .join("bin")
 }
@@ -239,11 +239,12 @@ fn is_cargo_bin_dir(dir: &Path, cargo_bin: &Path) -> bool {
     lexically_normalize(dir) == lexically_normalize(cargo_bin)
 }
 
-/// Resolves a configured bin-directory override against the working directory.
+/// Makes a configured directory absolute against the working directory.
 ///
-/// A relative override would otherwise be compared against absolute paths when
-/// a symlink chain is resolved, so an owned relative link survives the run.
-fn resolve_user_bin_dir(cwd: &Path, dir: PathBuf) -> PathBuf {
+/// Every path this command compares is absolute, so a relative value from the
+/// environment has to be resolved before it reaches a comparison. Both
+/// `VERA_USER_BIN_DIR` and `CARGO_HOME` come through here.
+fn absolutize(cwd: &Path, dir: PathBuf) -> PathBuf {
     if dir.is_absolute() {
         dir
     } else {
@@ -286,7 +287,7 @@ pub fn run(json_output: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     // A relative override would otherwise be compared against absolute paths
     // when a symlink chain is resolved, so an owned relative link survives.
-    let user_bin_dir = configured_user_bin_dir().map(|dir| resolve_user_bin_dir(&cwd, dir));
+    let user_bin_dir = configured_user_bin_dir().map(|dir| absolutize(&cwd, dir));
 
     run_at(
         InstallLayout {
@@ -295,7 +296,7 @@ pub fn run(json_output: bool) -> Result<()> {
             cwd: &cwd,
             user_bin_dir: user_bin_dir.as_deref(),
             recorded_binary: recorded_binary.as_deref(),
-            cargo_bin: &cargo_bin_dir(&home),
+            cargo_bin: &cargo_bin_dir(&home, &cwd),
         },
         json_output,
         &mut std::io::stdout().lock(),
@@ -1072,21 +1073,35 @@ mod tests {
     /// the absolute path in the fixture and handed that to `run_at`, so it
     /// never touched the resolution and passed with the fix removed.
     #[test]
-    fn a_relative_user_bin_dir_is_resolved_against_cwd() {
+    fn a_relative_directory_from_the_environment_is_resolved_against_cwd() {
         let cwd = Path::new("/work/project");
         assert_eq!(
-            resolve_user_bin_dir(cwd, PathBuf::from("vendor/bin")),
+            absolutize(cwd, PathBuf::from("vendor/bin")),
             Path::new("/work/project/vendor/bin")
         );
         assert_eq!(
-            resolve_user_bin_dir(cwd, PathBuf::from("../shared/bin")),
+            absolutize(cwd, PathBuf::from("../shared/bin")),
             Path::new("/work/project/../shared/bin")
         );
         // An absolute override is already an answer and must not be rebased.
         assert_eq!(
-            resolve_user_bin_dir(cwd, PathBuf::from("/opt/bin")),
+            absolutize(cwd, PathBuf::from("/opt/bin")),
             Path::new("/opt/bin")
         );
+    }
+
+    /// `CARGO_HOME` goes through the same resolution, for the same reason: the
+    /// candidate paths it is compared against are absolute.
+    #[test]
+    fn a_relative_cargo_home_is_resolved_before_comparison() {
+        let home = Path::new("/home/u");
+        let cwd = Path::new("/work/project");
+        // SAFETY: single-threaded within this test, and the value is removed
+        // before returning. No other test reads CARGO_HOME.
+        unsafe { std::env::set_var("CARGO_HOME", "vendor/cargo") };
+        let resolved = cargo_bin_dir(home, cwd);
+        unsafe { std::env::remove_var("CARGO_HOME") };
+        assert_eq!(resolved, Path::new("/work/project/vendor/cargo/bin"));
     }
 
     /// Cargo's directory is derived from the cargo home, not matched by shape:
