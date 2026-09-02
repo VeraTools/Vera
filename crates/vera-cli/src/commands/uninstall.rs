@@ -89,21 +89,19 @@ fn is_comment_line(line: &str) -> bool {
             .is_some_and(|word| word.eq_ignore_ascii_case("rem"))
 }
 
-/// Strips the punctuation a shell line wraps a path in, leaving the path.
-fn unquote(token: &str) -> &str {
-    token.trim_matches(|c| matches!(c, '"' | '\'' | '`' | '(' | ')' | ';' | ','))
-}
-
-/// Whether a token on a launch line names Vera's own program or a path under
-/// Vera's payload.
+/// Whether a token on a launch line names Vera's own launcher.
 ///
-/// The test is on the file name and on containment, never a substring and
-/// never a bare directory name: `/opt/veracrypt/bin/tool` and `/opt/vera/bin/rg`
-/// both belong to someone else. Containment in `vera_home` is lexical because the data directory has
-/// already been removed by the time the launcher is classified, which makes
-/// `canonicalize` unavailable.
+/// Both halves are required. The file name alone is not ownership: somebody
+/// else's `/opt/other/bin/vera` is named the same and is not ours. Containment
+/// alone is not either. The installers only ever write a launcher that
+/// satisfies both, so requiring both costs no real coverage.
+///
+/// Containment is lexical because the data directory has already been removed
+/// by the time the launcher is classified, which makes `canonicalize`
+/// unavailable, and it is component-wise so `/opt/vera-extra` is not read as
+/// being inside `/opt/vera`.
 fn token_belongs_to_vera(token: &str, vera_home: &Path) -> bool {
-    let path = Path::new(unquote(token));
+    let path = Path::new(token);
     if path.as_os_str().is_empty() {
         return false;
     }
@@ -113,31 +111,70 @@ fn token_belongs_to_vera(token: &str, vera_home: &Path) -> bool {
             .iter()
             .any(|known| text.eq_ignore_ascii_case(known))
     });
-    is_launcher || is_inside(path, vera_home)
+    is_launcher && is_inside(path, vera_home)
 }
 
-/// The program a single command runs, or `None` if the command is empty.
+/// The program each command on a line runs.
+///
+/// Quoting is honoured, so neither a separator nor a space inside a quoted
+/// path can invent a command or cut a path in half. Both matter for real
+/// installs: `VERA_HOME` under a directory with a space produces a shim whose
+/// binary path is a single quoted token, and a naive split would fail to
+/// recognize Vera's own launcher and silently leave it on PATH.
+fn launched_programs(line: &str) -> Vec<String> {
+    let mut programs = Vec::new();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut token = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in line.chars() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => token.push(ch),
+            None => match ch {
+                '"' | '\'' | '`' => quote = Some(ch),
+                // Command separators, and only outside quotes.
+                '|' | '&' | ';' => {
+                    if !token.is_empty() {
+                        tokens.push(std::mem::take(&mut token));
+                    }
+                    programs.extend(program_of(&tokens));
+                    tokens.clear();
+                }
+                _ if ch.is_whitespace() => {
+                    if !token.is_empty() {
+                        tokens.push(std::mem::take(&mut token));
+                    }
+                }
+                _ => token.push(ch),
+            },
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    programs.extend(program_of(&tokens));
+    programs
+}
+
+/// The program among one command's tokens, stepping over the words that stand
+/// in front of it without being it.
 ///
 /// Only this position decides ownership. An argument is not a launch: a script
 /// that prints a Vera path and then runs something else has not run Vera.
-fn launched_program(command: &str) -> Option<&str> {
-    let mut tokens = command.split_whitespace();
-    loop {
-        let token = tokens.next()?;
-        let token = unquote(token.strip_prefix('@').unwrap_or(token));
-        if token.is_empty()
-            || LAUNCH_PREFIXES
-                .iter()
-                .any(|p| token.eq_ignore_ascii_case(p))
-        {
-            continue;
-        }
-        // `NAME=value` prefixes set the environment for the program that follows.
-        if token.contains('=') && !token.contains('/') && !token.contains('\\') {
-            continue;
-        }
-        return Some(token);
-    }
+fn program_of(tokens: &[String]) -> Option<String> {
+    tokens
+        .iter()
+        .map(|token| token.strip_prefix('@').unwrap_or(token))
+        .find(|token| {
+            !token.is_empty()
+                && !LAUNCH_PREFIXES
+                    .iter()
+                    .any(|prefix| token.eq_ignore_ascii_case(prefix))
+                // `NAME=value` prefixes set the environment for what follows.
+                && !(token.contains('=') && !token.contains('/') && !token.contains('\\'))
+        })
+        .map(str::to_string)
 }
 
 /// Resolves `.` and `..` textually. Used instead of `canonicalize` because the
@@ -192,10 +229,8 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path) -> bool {
 fn script_launches_vera(text: &str, vera_home: &Path) -> bool {
     text.lines()
         .filter(|line| !is_comment_line(line))
-        // A line can chain several commands; each one has its own program.
-        .flat_map(|line| line.split(['|', '&', ';']))
-        .filter_map(launched_program)
-        .any(|program| token_belongs_to_vera(program, vera_home))
+        .flat_map(launched_programs)
+        .any(|program| token_belongs_to_vera(&program, vera_home))
 }
 
 /// Recognizes a candidate path as a removable Vera launcher, or leaves it
@@ -865,7 +900,10 @@ mod tests {
         let roots = roots();
         let shim = install_vera_shim(
             &roots.home.join(".local").join("bin"),
-            "#!/bin/sh\ncd /tmp && exec \"$HOME/.vera/bin/vera\" \"$@\"\n",
+            &format!(
+                "#!/bin/sh\ncd /tmp && exec \"{}/bin/1.3.0/aarch64-apple-darwin/vera\" \"$@\"\n",
+                roots.vera_home.display()
+            ),
         );
 
         let (_, stderr) = uninstall(&roots, false);
@@ -896,11 +934,17 @@ mod tests {
             // A directory literally named `vera` that holds someone else's
             // program: the launcher is `rg`, so the entry is not ours.
             "#!/bin/sh\nexec /opt/vera/bin/rg \"$@\"\n",
-            // A Vera path in an argument rather than in program position.
-            // Printing a path is not launching it.
-            "#!/bin/sh\necho \"$HOME/.vera/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
+            // A foreign executable that merely shares the launcher name.
+            "#!/bin/sh\nexec /opt/other/bin/vera \"$@\"\n",
+            // A real Vera path, but in an argument rather than in program
+            // position. Printing a path is not launching it.
+            "#!/bin/sh\necho \"{home}/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
         ] {
             let roots = roots();
+            // `{home}` stands for the resolved Vera home: the classifier does
+            // not expand shell variables, so a `$HOME` fixture would be
+            // rejected for the wrong reason.
+            let body = &body.replace("{home}", &roots.vera_home.display().to_string());
             let foreign = install_vera_shim(&roots.home.join(".local").join("bin"), body);
 
             let (_, stderr) = uninstall(&roots, false);
@@ -958,6 +1002,71 @@ mod tests {
         assert!(
             link.symlink_metadata().is_err(),
             "the dangling shim stayed on PATH"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// A Vera home under a directory with a space produces a shim whose binary
+    /// path is one quoted token. Splitting on whitespace cut it in half, so the
+    /// launcher went unrecognized and stayed on PATH while the run reported a
+    /// complete uninstall — the same dishonesty as #212, from a different
+    /// direction.
+    #[cfg(unix)]
+    #[test]
+    fn a_vera_home_containing_a_space_is_still_recognized() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("My Home");
+        let bin = home.join(".local").join("bin");
+        let vera_home = home.join(".vera");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(temp.path().join("project")).unwrap();
+        let shim = install_vera_shim(
+            &bin,
+            &format!(
+                "#!/bin/sh\nexec \"{}/bin/1.3.0/x/vera\" \"$@\"\n",
+                vera_home.display()
+            ),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_at(
+            &home,
+            &vera_home,
+            &temp.path().join("project"),
+            Some(bin.as_path()),
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert!(
+            !shim.exists(),
+            "a shim under a path with a space was left on PATH"
+        );
+    }
+
+    /// A separator inside a quoted argument is data, not a command boundary.
+    /// Splitting on it invented a second command whose first token was a Vera
+    /// path, and the foreign launcher was deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_separator_inside_quotes_does_not_invent_a_command() {
+        let roots = roots();
+        let foreign = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\necho \"see; {}/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            foreign.exists(),
+            "a quoted argument was read as a second command and the entry deleted"
         );
         assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
     }
