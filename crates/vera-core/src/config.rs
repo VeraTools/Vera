@@ -86,6 +86,36 @@ fn env_usize(key: &str, default: usize) -> usize {
     }
 }
 
+/// Read an `f64` config override from an environment variable, falling back
+/// to `default` when unset or unparseable.
+fn env_f64(key: &str, default: f64) -> f64 {
+    match std::env::var(key) {
+        Ok(value) => match value.parse::<f64>() {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::warn!(
+                    key,
+                    value = %value,
+                    default,
+                    error = %error,
+                    "invalid float environment override; using default"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            tracing::warn!(
+                key,
+                default,
+                error = %error,
+                "could not read float environment override; using default"
+            );
+            default
+        }
+    }
+}
+
 /// Read a `bool` config override from an environment variable, falling back
 /// to `default` when unset or unparseable. Recognizes `1`/`0`, `true`/`false`,
 /// `yes`/`no`, `on`/`off` case-insensitively.
@@ -319,6 +349,29 @@ pub struct RetrievalConfig {
     /// source file.
     #[serde(default = "default_ranking_filename_stem_boost")]
     pub ranking_filename_stem_boost: bool,
+    /// Minimum match ratio for the filename-stem boost (issue #196 gating knob).
+    ///
+    /// Controls the firing threshold for the filename-stem boost: a file must
+    /// match at least this fraction of the query's keywords (ratio >= threshold,
+    /// inclusive) to receive the boost. Mechanism: raising the threshold from
+    /// the historical 0.05 filters single-token coincidences (e.g. a repo
+    /// literally named `json` matching one generic word) while preserving
+    /// genuine multi-keyword file-name signals.
+    /// Default 0.05 (env `VERA_RANKING_FILENAME_STEM_MIN_RATIO` authoritative).
+    #[serde(default = "default_ranking_filename_stem_min_ratio")]
+    pub ranking_filename_stem_min_ratio: f64,
+    /// Skip the filename-stem boost for symbol queries (issue #196 gating knob).
+    ///
+    /// When enabled, suppresses the filename-stem boost whenever the exact-
+    /// identifier machinery is engaged (the query carries embedded symbols or
+    /// an exact identifier). Mechanism: symbol lookups already route through
+    /// exact-identifier, exact-filename and content-symbol boosts; the
+    /// filename-keyword inference double-counts there and hurts the independent
+    /// set. A NaturalLanguage query without an exact identifier still gets the
+    /// boost when this knob is on.
+    /// Default false (env `VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES` authoritative).
+    #[serde(default = "default_ranking_filename_stem_skip_symbol_queries")]
+    pub ranking_filename_stem_skip_symbol_queries: bool,
     /// Definition-content boost for natural-language queries.
     ///
     /// When enabled, chunks whose content defines a queried concept (e.g.
@@ -453,6 +506,30 @@ fn default_ranking_filename_stem_boost() -> bool {
     env_bool("VERA_RANKING_FILENAME_STEM_BOOST", true)
 }
 
+fn default_ranking_filename_stem_min_ratio() -> f64 {
+    // Default 0.05 preserves pre-knob behavior. Env authoritative.
+    // Alias set and precedence match `ranking_filename_stem_min_ratio_effective`
+    // (per alias-discipline convention): first wins, identical order.
+    for key in ["VERA_RANKING_FILENAME_STEM_MIN_RATIO"] {
+        if std::env::var(key).is_ok() {
+            return env_f64(key, 0.05);
+        }
+    }
+    0.05
+}
+
+fn default_ranking_filename_stem_skip_symbol_queries() -> bool {
+    // Default false preserves pre-knob behavior. Env authoritative.
+    // Alias set and precedence match `ranking_filename_stem_skip_symbol_queries_enabled`
+    // (per alias-discipline convention): first wins, identical order.
+    for key in ["VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES"] {
+        if std::env::var(key).is_ok() {
+            return env_bool(key, false);
+        }
+    }
+    false
+}
+
 fn default_ranking_definition_boost() -> bool {
     env_bool("VERA_RANKING_DEFINITION_BOOST", true)
 }
@@ -539,6 +616,9 @@ impl Default for RetrievalConfig {
             reranker_rate_limit_wait_secs: default_reranker_rate_limit_wait_secs(),
             reranker_return_documents: default_reranker_return_documents(),
             ranking_filename_stem_boost: default_ranking_filename_stem_boost(),
+            ranking_filename_stem_min_ratio: default_ranking_filename_stem_min_ratio(),
+            ranking_filename_stem_skip_symbol_queries:
+                default_ranking_filename_stem_skip_symbol_queries(),
             ranking_definition_boost: default_ranking_definition_boost(),
             ranking_recall_pool_expansion: default_ranking_recall_pool_expansion(),
             ranking_multiplicative_path_penalty: default_ranking_multiplicative_path_penalty(),
@@ -559,6 +639,30 @@ impl RetrievalConfig {
         } else {
             self.ranking_filename_stem_boost
         }
+    }
+
+    /// Minimum ratio for filename-stem boost, with env-var override.
+    /// Default 0.05; env `VERA_RANKING_FILENAME_STEM_MIN_RATIO` authoritative.
+    /// Alias set and precedence identical to `default_ranking_filename_stem_min_ratio`.
+    pub fn ranking_filename_stem_min_ratio_effective(&self) -> f64 {
+        for key in ["VERA_RANKING_FILENAME_STEM_MIN_RATIO"] {
+            if std::env::var(key).is_ok() {
+                return env_f64(key, self.ranking_filename_stem_min_ratio);
+            }
+        }
+        self.ranking_filename_stem_min_ratio
+    }
+
+    /// Whether to skip filename-stem boost for symbol queries, with env-var override.
+    /// Default false; env `VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES` authoritative.
+    /// Alias set and precedence identical to `default_ranking_filename_stem_skip_symbol_queries`.
+    pub fn ranking_filename_stem_skip_symbol_queries_enabled(&self) -> bool {
+        for key in ["VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES"] {
+            if std::env::var(key).is_ok() {
+                return env_bool(key, self.ranking_filename_stem_skip_symbol_queries);
+            }
+        }
+        self.ranking_filename_stem_skip_symbol_queries
     }
 
     /// Definition-content boost enabled, with env-var override.
@@ -2605,5 +2709,275 @@ card0, 1073741824, 4294967296\n";
             ..Default::default()
         };
         assert!(!cfg.vector_filter_during_scan_enabled());
+    }
+
+    // ── Stem-boost gating knobs (#196) ──
+
+    #[test]
+    fn stem_gating_default_preserving() {
+        run_env_test(
+            "config::tests::stem_gating_default_preserving_probe",
+            &[
+                ("VERA_RANKING_FILENAME_STEM_MIN_RATIO", None),
+                ("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES", None),
+                ("VERA_RANKING_FILENAME_STEM_BOOST", None),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_default_preserving"]
+    fn stem_gating_default_preserving_probe() {
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_MIN_RATIO").is_err());
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES").is_err());
+        assert_eq!(default_ranking_filename_stem_min_ratio(), 0.05);
+        assert!(!default_ranking_filename_stem_skip_symbol_queries());
+        let cfg = RetrievalConfig::default();
+        assert!((cfg.ranking_filename_stem_min_ratio - 0.05).abs() < 1e-9);
+        assert!(!cfg.ranking_filename_stem_skip_symbol_queries);
+        assert!((cfg.ranking_filename_stem_min_ratio_effective() - 0.05).abs() < 1e-9);
+        assert!(!cfg.ranking_filename_stem_skip_symbol_queries_enabled());
+        assert!(
+            cfg.ranking_filename_stem_boost,
+            "existing boost default true preserved"
+        );
+        assert!(cfg.ranking_filename_stem_boost_enabled());
+        // Legacy JSON without new fields must deserialize to defaults
+        let legacy = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0}"#;
+        let rcfg: RetrievalConfig = serde_json::from_str(legacy).unwrap();
+        assert!((rcfg.ranking_filename_stem_min_ratio - 0.05).abs() < 1e-9);
+        assert!(!rcfg.ranking_filename_stem_skip_symbol_queries);
+    }
+
+    #[test]
+    fn stem_gating_config_deserialization() {
+        run_env_test(
+            "config::tests::stem_gating_config_omitted_probe",
+            &[
+                ("VERA_RANKING_FILENAME_STEM_MIN_RATIO", None),
+                ("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES", None),
+            ],
+        );
+        run_env_test(
+            "config::tests::stem_gating_config_explicit_probe",
+            &[
+                ("VERA_RANKING_FILENAME_STEM_MIN_RATIO", None),
+                ("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES", None),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_config_deserialization"]
+    fn stem_gating_config_omitted_probe() {
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_MIN_RATIO").is_err());
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES").is_err());
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            (cfg.ranking_filename_stem_min_ratio - 0.05).abs() < 1e-9,
+            "omitted min_ratio must be 0.05"
+        );
+        assert!(
+            !cfg.ranking_filename_stem_skip_symbol_queries,
+            "omitted skip must be false"
+        );
+        // effective helpers without env should mirror stored values
+        assert!((cfg.ranking_filename_stem_min_ratio_effective() - 0.05).abs() < 1e-9);
+        assert!(!cfg.ranking_filename_stem_skip_symbol_queries_enabled());
+        // Ensure unrelated fields unchanged
+        assert!(cfg.ranking_filename_stem_boost);
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_config_deserialization"]
+    fn stem_gating_config_explicit_probe() {
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_MIN_RATIO").is_err());
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES").is_err());
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"ranking_filename_stem_min_ratio":0.5,"ranking_filename_stem_skip_symbol_queries":true}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!((cfg.ranking_filename_stem_min_ratio - 0.5).abs() < 1e-9);
+        assert!(cfg.ranking_filename_stem_skip_symbol_queries);
+        assert!((cfg.ranking_filename_stem_min_ratio_effective() - 0.5).abs() < 1e-9);
+        assert!(cfg.ranking_filename_stem_skip_symbol_queries_enabled());
+    }
+
+    #[test]
+    fn stem_gating_env_precedence() {
+        run_env_test(
+            "config::tests::stem_gating_env_overrides_file_and_default_min_ratio_probe",
+            &[("VERA_RANKING_FILENAME_STEM_MIN_RATIO", Some("0.75"))],
+        );
+        run_env_test(
+            "config::tests::stem_gating_env_overrides_file_and_default_skip_probe",
+            &[("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES", Some("1"))],
+        );
+        run_env_test(
+            "config::tests::stem_gating_env_unset_fallback_probe",
+            &[
+                ("VERA_RANKING_FILENAME_STEM_MIN_RATIO", None),
+                ("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES", None),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_env_precedence"]
+    fn stem_gating_env_overrides_file_and_default_min_ratio_probe() {
+        assert_eq!(
+            std::env::var("VERA_RANKING_FILENAME_STEM_MIN_RATIO").unwrap(),
+            "0.75"
+        );
+        // env should make default helper return 0.75 even when no file
+        assert!((default_ranking_filename_stem_min_ratio() - 0.75).abs() < 1e-9);
+        // stored false/0.05 vs env 0.75 -> env wins
+        let cfg = RetrievalConfig {
+            ranking_filename_stem_min_ratio: 0.05,
+            ..Default::default()
+        };
+        assert!(
+            (cfg.ranking_filename_stem_min_ratio_effective() - 0.75).abs() < 1e-9,
+            "env 0.75 must override stored 0.05"
+        );
+        // file says 0.5 but env 0.75 still wins
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"ranking_filename_stem_min_ratio":0.5}"#;
+        let file_cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!((file_cfg.ranking_filename_stem_min_ratio - 0.5).abs() < 1e-9);
+        assert!(
+            (file_cfg.ranking_filename_stem_min_ratio_effective() - 0.75).abs() < 1e-9,
+            "env must beat file 0.5"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_env_precedence"]
+    fn stem_gating_env_overrides_file_and_default_skip_probe() {
+        assert_eq!(
+            std::env::var("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES").unwrap(),
+            "1"
+        );
+        assert!(default_ranking_filename_stem_skip_symbol_queries());
+        let cfg = RetrievalConfig {
+            ranking_filename_stem_skip_symbol_queries: false,
+            ..Default::default()
+        };
+        assert!(
+            cfg.ranking_filename_stem_skip_symbol_queries_enabled(),
+            "env 1 must override stored false"
+        );
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"ranking_filename_stem_skip_symbol_queries":false}"#;
+        let file_cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(!file_cfg.ranking_filename_stem_skip_symbol_queries);
+        assert!(
+            file_cfg.ranking_filename_stem_skip_symbol_queries_enabled(),
+            "env must beat file false"
+        );
+        // Also verify env false overrides file true
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_env_precedence"]
+    fn stem_gating_env_unset_fallback_probe() {
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_MIN_RATIO").is_err());
+        assert!(std::env::var("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES").is_err());
+        assert!((default_ranking_filename_stem_min_ratio() - 0.05).abs() < 1e-9);
+        assert!(!default_ranking_filename_stem_skip_symbol_queries());
+        let cfg = RetrievalConfig::default();
+        assert!((cfg.ranking_filename_stem_min_ratio - 0.05).abs() < 1e-9);
+        assert!(!cfg.ranking_filename_stem_skip_symbol_queries);
+        // explicit file values survive when env unset
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"ranking_filename_stem_min_ratio":0.5,"ranking_filename_stem_skip_symbol_queries":true}"#;
+        let file_cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!((file_cfg.ranking_filename_stem_min_ratio_effective() - 0.5).abs() < 1e-9);
+        assert!(file_cfg.ranking_filename_stem_skip_symbol_queries_enabled());
+    }
+
+    #[test]
+    fn stem_gating_alias_parity() {
+        run_env_test(
+            "config::tests::stem_gating_min_ratio_alias_parity_probe",
+            &[("VERA_RANKING_FILENAME_STEM_MIN_RATIO", Some("0.5"))],
+        );
+        run_env_test(
+            "config::tests::stem_gating_min_ratio_alias_parity_off_probe",
+            &[("VERA_RANKING_FILENAME_STEM_MIN_RATIO", Some("0.25"))],
+        );
+        run_env_test(
+            "config::tests::stem_gating_skip_alias_parity_probe",
+            &[("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES", Some("1"))],
+        );
+        run_env_test(
+            "config::tests::stem_gating_skip_alias_parity_off_probe",
+            &[("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES", Some("0"))],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_alias_parity"]
+    fn stem_gating_min_ratio_alias_parity_probe() {
+        assert_eq!(
+            std::env::var("VERA_RANKING_FILENAME_STEM_MIN_RATIO").unwrap(),
+            "0.5"
+        );
+        assert!((default_ranking_filename_stem_min_ratio() - 0.5).abs() < 1e-9);
+        let cfg = RetrievalConfig {
+            ranking_filename_stem_min_ratio: 0.05,
+            ..Default::default()
+        };
+        assert!(
+            (cfg.ranking_filename_stem_min_ratio_effective() - 0.5).abs() < 1e-9,
+            "effective must match default helper's env resolution"
+        );
+        // stored 0.9 must be ignored when env present
+        let cfg2 = RetrievalConfig {
+            ranking_filename_stem_min_ratio: 0.9,
+            ..Default::default()
+        };
+        assert!((cfg2.ranking_filename_stem_min_ratio_effective() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_alias_parity"]
+    fn stem_gating_min_ratio_alias_parity_off_probe() {
+        assert_eq!(
+            std::env::var("VERA_RANKING_FILENAME_STEM_MIN_RATIO").unwrap(),
+            "0.25"
+        );
+        assert!((default_ranking_filename_stem_min_ratio() - 0.25).abs() < 1e-9);
+        let cfg = RetrievalConfig {
+            ranking_filename_stem_min_ratio: 0.8,
+            ..Default::default()
+        };
+        assert!((cfg.ranking_filename_stem_min_ratio_effective() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_alias_parity"]
+    fn stem_gating_skip_alias_parity_probe() {
+        assert_eq!(
+            std::env::var("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES").unwrap(),
+            "1"
+        );
+        assert!(default_ranking_filename_stem_skip_symbol_queries());
+        let cfg = RetrievalConfig {
+            ranking_filename_stem_skip_symbol_queries: false,
+            ..Default::default()
+        };
+        assert!(cfg.ranking_filename_stem_skip_symbol_queries_enabled());
+    }
+
+    #[test]
+    #[ignore = "driven by stem_gating_alias_parity"]
+    fn stem_gating_skip_alias_parity_off_probe() {
+        assert_eq!(
+            std::env::var("VERA_RANKING_FILENAME_STEM_SKIP_SYMBOL_QUERIES").unwrap(),
+            "0"
+        );
+        assert!(!default_ranking_filename_stem_skip_symbol_queries());
+        let cfg = RetrievalConfig {
+            ranking_filename_stem_skip_symbol_queries: true,
+            ..Default::default()
+        };
+        assert!(!cfg.ranking_filename_stem_skip_symbol_queries_enabled());
     }
 }

@@ -528,6 +528,7 @@ pub(super) fn apply_keyword_path_boost(
     scores: &mut [f64],
     results: &[SearchResult],
     max_score: f64,
+    retrieval: &RetrievalConfig,
 ) {
     // Explicit runtime intent overrides filename keyword inference: a user
     // asking for the runtime extract does not want the like-named source file
@@ -537,6 +538,14 @@ pub(super) fn apply_keyword_path_boost(
     if features.query_type != QueryType::NaturalLanguage
         || features.wants_config_paths
         || features.wants_runtime_paths
+    {
+        return;
+    }
+    // Gating knob: skip symbol queries when the exact-identifier machinery
+    // is engaged. This suppresses the filename inference for symbol lookups
+    // which already have dedicated boosts.
+    if retrieval.ranking_filename_stem_skip_symbol_queries_enabled()
+        && (features.exact_identifier.is_some() || !features.embedded_symbols.is_empty())
     {
         return;
     }
@@ -553,6 +562,7 @@ pub(super) fn apply_keyword_path_boost(
         return;
     }
 
+    let min_ratio = retrieval.ranking_filename_stem_min_ratio_effective();
     let mut bonuses = Vec::with_capacity(results.len());
     {
         let mut bonus_cache: HashMap<&str, f64> = HashMap::new();
@@ -569,7 +579,7 @@ pub(super) fn apply_keyword_path_boost(
                         return 0.0;
                     }
                     let ratio = keyword_path_match_ratio(&keywords, &result.file_path);
-                    if ratio >= 0.05 {
+                    if ratio >= min_ratio {
                         KEYWORD_PATH_WEIGHT * max_score * ratio
                     } else {
                         0.0
@@ -581,6 +591,23 @@ pub(super) fn apply_keyword_path_boost(
     for (score, bonus) in scores.iter_mut().zip(bonuses) {
         *score += bonus;
     }
+}
+
+/// Backward-compatible wrapper for tests that don't pass config (defaults preserved).
+#[allow(dead_code)]
+pub(super) fn apply_keyword_path_boost_legacy(
+    features: &QueryFeatures,
+    scores: &mut [f64],
+    results: &[SearchResult],
+    max_score: f64,
+) {
+    apply_keyword_path_boost(
+        features,
+        scores,
+        results,
+        max_score,
+        &RetrievalConfig::default(),
+    )
 }
 
 /// Pool-relative content-based symbol definition boost. A chunk whose
@@ -966,7 +993,7 @@ fn rest_starts_with_symbol(rest: &str, symbol: &str, case_insensitive: bool) -> 
 
 /// Fraction of query keywords that match the file stem's or immediate parent
 /// directory's sub-tokens (exact, or prefix with a 3-char minimum).
-fn keyword_path_match_ratio(keywords: &[&str], file_path: &str) -> f64 {
+pub(crate) fn keyword_path_match_ratio(keywords: &[&str], file_path: &str) -> f64 {
     if keywords.is_empty() {
         return 0.0;
     }
