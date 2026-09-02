@@ -119,6 +119,7 @@ fn is_our_binary(target: &Path, recorded: Option<&Path>, vera_home: &Path) -> bo
 /// else named `vera`.
 fn classify_launch_entry(
     entry: &Path,
+    home: &Path,
     vera_home: &Path,
     recorded: Option<&Path>,
 ) -> Option<LaunchEntry> {
@@ -139,7 +140,9 @@ fn classify_launch_entry(
     // construction. In the other candidate directories it is just somebody
     // else's program with the same name. Checking the executable *format*
     // would not help, because any binary named `vera` passes that too.
-    let is_cargo_binary = entry.parent().is_some_and(is_cargo_bin_dir)
+    let is_cargo_binary = entry
+        .parent()
+        .is_some_and(|parent| is_cargo_bin_dir(parent, &cargo_bin_dir(home)))
         && read_as_text.is_err()
         && fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file())
         && is_executable(entry);
@@ -212,15 +215,35 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path
         .is_some_and(|resolved| is_our_binary(&resolved, recorded, vera_home))
 }
 
-/// Whether a directory is where `cargo install` places binaries.
-fn is_cargo_bin_dir(dir: &Path) -> bool {
-    let normalized = lexically_normalize(dir);
-    let mut components = normalized
-        .components()
-        .rev()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned());
-    components.next().is_some_and(|last| last == "bin")
-        && components.next().is_some_and(|parent| parent == ".cargo")
+/// Where `cargo install` places binaries: `$CARGO_HOME/bin`, falling back to
+/// `~/.cargo/bin`.
+///
+/// Derived rather than pattern-matched. A configured `VERA_USER_BIN_DIR` that
+/// merely *ends* in `.cargo/bin` is not cargo's directory, and treating it as
+/// one would hand every unreadable executable there to the cargo arm.
+fn cargo_bin_dir(home: &Path) -> PathBuf {
+    std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cargo"))
+        .join("bin")
+}
+
+/// Whether a directory is cargo's own bin directory.
+fn is_cargo_bin_dir(dir: &Path, cargo_bin: &Path) -> bool {
+    lexically_normalize(dir) == lexically_normalize(cargo_bin)
+}
+
+/// Resolves a configured bin-directory override against the working directory.
+///
+/// A relative override would otherwise be compared against absolute paths when
+/// a symlink chain is resolved, so an owned relative link survives the run.
+fn resolve_user_bin_dir(cwd: &Path, dir: PathBuf) -> PathBuf {
+    if dir.is_absolute() {
+        dir
+    } else {
+        cwd.join(dir)
+    }
 }
 
 /// Executability where the platform tracks it. Windows has no file mode bit;
@@ -258,13 +281,7 @@ pub fn run(json_output: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     // A relative override would otherwise be compared against absolute paths
     // when a symlink chain is resolved, so an owned relative link survives.
-    let user_bin_dir = configured_user_bin_dir().map(|dir| {
-        if dir.is_absolute() {
-            dir
-        } else {
-            cwd.join(dir)
-        }
-    });
+    let user_bin_dir = configured_user_bin_dir().map(|dir| resolve_user_bin_dir(&cwd, dir));
 
     run_at(
         InstallLayout {
@@ -352,7 +369,7 @@ fn run_at(
             if entry.symlink_metadata().is_err() {
                 continue;
             }
-            let Some(kind) = classify_launch_entry(&entry, vera_home, recorded_binary) else {
+            let Some(kind) = classify_launch_entry(&entry, home, vera_home, recorded_binary) else {
                 // Not ours: leave it alone silently, as before.
                 continue;
             };
@@ -1032,59 +1049,53 @@ mod tests {
         );
     }
 
+    /// A relative `VERA_USER_BIN_DIR` must be resolved against the working
+    /// directory, or a symlink chain resolved from it stays relative and never
+    /// matches the absolute Vera home.
+    ///
+    /// Asserts the resolution itself. The previous version of this test built
+    /// the absolute path in the fixture and handed that to `run_at`, so it
+    /// never touched the resolution and passed with the fix removed.
     #[test]
-    fn only_cargos_own_bin_directory_counts_as_cargo() {
-        assert!(is_cargo_bin_dir(Path::new("/home/u/.cargo/bin")));
-        assert!(is_cargo_bin_dir(Path::new("/home/u/.cargo/./bin")));
-        assert!(!is_cargo_bin_dir(Path::new("/home/u/.local/bin")));
-        assert!(!is_cargo_bin_dir(Path::new("/home/u/cargo/bin")));
-        assert!(!is_cargo_bin_dir(Path::new("/home/u/.cargo/bin/nested")));
-    }
-
-    /// A relative `VERA_USER_BIN_DIR` leaves a resolved symlink target relative
-    /// too, so comparing it against the absolute Vera home fails and an owned
-    /// link survives.
-    #[cfg(unix)]
-    #[test]
-    fn a_relative_user_bin_dir_is_resolved_before_comparison() {
-        let roots = roots();
-        let bin = roots.home.join(".local").join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let entry = bin.join("vera");
-        std::os::unix::fs::symlink(roots.vera_home.join("bin").join("vera"), &entry).unwrap();
-
-        // The override arrives relative; `run` must resolve it against cwd.
-        let relative = pathdiff_from(&roots.cwd, &bin);
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        run_at(
-            InstallLayout {
-                home: &roots.home,
-                vera_home: &roots.vera_home,
-                cwd: &roots.cwd,
-                user_bin_dir: Some(&roots.cwd.join(&relative)),
-                recorded_binary: None,
-            },
-            false,
-            &mut stdout,
-            &mut stderr,
-        )
-        .unwrap();
-
-        assert!(
-            entry.symlink_metadata().is_err(),
-            "an owned link under a relative bin dir stayed on PATH"
+    fn a_relative_user_bin_dir_is_resolved_against_cwd() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            resolve_user_bin_dir(cwd, PathBuf::from("vendor/bin")),
+            Path::new("/work/project/vendor/bin")
+        );
+        assert_eq!(
+            resolve_user_bin_dir(cwd, PathBuf::from("../shared/bin")),
+            Path::new("/work/project/../shared/bin")
+        );
+        // An absolute override is already an answer and must not be rebased.
+        assert_eq!(
+            resolve_user_bin_dir(cwd, PathBuf::from("/opt/bin")),
+            Path::new("/opt/bin")
         );
     }
 
-    /// Naive relative path from `base` to `target`, enough for the fixture.
-    #[cfg(unix)]
-    fn pathdiff_from(base: &Path, target: &Path) -> PathBuf {
-        let mut up = PathBuf::new();
-        for _ in base.components().skip(1) {
-            up.push("..");
+    /// Cargo's directory is derived from the cargo home, not matched by shape:
+    /// an override that merely ends in `.cargo/bin` is somebody else's.
+    #[test]
+    fn only_cargos_derived_bin_directory_counts_as_cargo() {
+        let home = Path::new("/home/u");
+        let cargo_bin = home.join(".cargo").join("bin");
+        assert!(is_cargo_bin_dir(&cargo_bin, &cargo_bin));
+        assert!(is_cargo_bin_dir(
+            &home.join(".cargo").join(".").join("bin"),
+            &cargo_bin
+        ));
+        for foreign in [
+            "/home/u/.local/bin",
+            "/home/u/cargo/bin",
+            // A configured override that ends in the same two segments.
+            "/opt/sandbox/.cargo/bin",
+        ] {
+            assert!(
+                !is_cargo_bin_dir(Path::new(foreign), &cargo_bin),
+                "{foreign} is not cargo's own bin directory"
+            );
         }
-        up.join(target.strip_prefix("/").unwrap_or(target))
     }
 
     /// A chain that never terminates must not hang the uninstall.
