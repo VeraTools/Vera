@@ -145,7 +145,7 @@ fn score_pool_with_config(
     let max_score = scores.iter().copied().fold(0.0_f64, f64::max).max(1e-6);
     apply_coherence_boost(features, &mut scores, results, max_score);
     if retrieval.ranking_filename_stem_boost_enabled() {
-        apply_keyword_path_boost(features, &mut scores, results, max_score);
+        apply_keyword_path_boost(features, &mut scores, results, max_score, retrieval);
     }
     if retrieval.ranking_definition_boost_enabled() {
         apply_content_symbol_boost(features, &mut scores, results, max_score);
