@@ -1317,8 +1317,8 @@ mod tests {
     }
 
     /// The call must ask for a device it would actually be able to use: the
-    /// Direct3D 12 floor feature level, `ID3D12Device`, and a null `ppDevice`
-    /// so nothing is created. Recorded from inside the call rather than
+    /// default adapter, the Direct3D 12 floor feature level, `ID3D12Device`,
+    /// and a null `ppDevice` so nothing is created. Recorded from inside the call rather than
     /// asserted about the source.
     #[test]
     fn the_probe_asks_for_a_feature_level_11_id3d12device_without_creating_one() {
@@ -1329,22 +1329,23 @@ mod tests {
             data4: [0; 8],
         };
         thread_local! {
-            static SEEN: std::cell::Cell<(i32, Iid, bool)> = const {
-                std::cell::Cell::new((0, UNSET, false))
+            static SEEN: std::cell::Cell<(i32, Iid, bool, bool)> = const {
+                std::cell::Cell::new((0, UNSET, false, false))
             };
         }
         unsafe extern "system" fn record(
-            _adapter: *mut std::ffi::c_void,
+            adapter: *mut std::ffi::c_void,
             feature_level: i32,
             riid: *const Iid,
             device: *mut *mut std::ffi::c_void,
         ) -> i32 {
             let riid = unsafe { *riid };
-            SEEN.with(|seen| seen.set((feature_level, riid, device.is_null())));
+            SEEN.with(|seen| seen.set((feature_level, riid, device.is_null(), adapter.is_null())));
             1
         }
         assert!(d3d12_device_can_be_created(record));
-        let (feature_level, riid, ppdevice_was_null) = SEEN.with(std::cell::Cell::get);
+        let (feature_level, riid, ppdevice_was_null, adapter_was_null) =
+            SEEN.with(std::cell::Cell::get);
         assert_eq!(feature_level, 45056, "D3D_FEATURE_LEVEL_11_0");
         // The whole GUID: a typo in any field would still name a real
         // interface, and the probe would report "no Direct3D 12" on capable
@@ -1360,6 +1361,13 @@ mod tests {
             "IID_ID3D12Device"
         );
         assert!(ppdevice_was_null, "the probe must not create a device");
+        // The null adapter is the default adapter, which is the one ONNX
+        // Runtime's DirectML provider uses at its default `device_id` of 0.
+        // Probing any other adapter would answer a different question.
+        assert!(
+            adapter_was_null,
+            "the probe must ask about the default adapter"
+        );
     }
 
     /// Every non-Windows target answers "no" without a probe, so auto-detect
