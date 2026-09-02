@@ -63,10 +63,14 @@ impl LaunchEntry {
     }
 }
 
-/// Path components that mark a path as Vera's own: the launcher names the
-/// installers write, and the directory names the payload lives under. Matched
-/// whole and case-insensitively, never as a substring (#249).
-const VERA_PATH_COMPONENTS: &[&str] = &["vera", ".vera", "vera.exe", "vera.cmd"];
+/// The launcher file names the installers write. `packages/npm-cli/bin/vera.js`
+/// emits `exec "<vera_home>/bin/<version>/<target>/vera" "$@"` on unix and the
+/// `.exe` equivalent on Windows, so a genuine shim always launches a program
+/// with one of these names, from inside the Vera home.
+const VERA_LAUNCHER_NAMES: &[&str] = &["vera", "vera.exe", "vera.cmd"];
+
+/// Words that stand in front of the program on a launch line without being it.
+const LAUNCH_PREFIXES: &[&str] = &["exec", "command", "builtin", "nohup", "env"];
 
 /// Whether a line of a shim is a comment rather than something that runs.
 ///
@@ -93,9 +97,9 @@ fn unquote(token: &str) -> &str {
 /// Whether a token on a launch line names Vera's own program or a path under
 /// Vera's payload.
 ///
-/// The test is component-wise: `/opt/veracrypt/bin/tool` shares four letters
-/// with `vera` and belongs to someone else, so a substring test would delete
-/// it. Containment in `vera_home` is lexical because the data directory has
+/// The test is on the file name and on containment, never a substring and
+/// never a bare directory name: `/opt/veracrypt/bin/tool` and `/opt/vera/bin/rg`
+/// both belong to someone else. Containment in `vera_home` is lexical because the data directory has
 /// already been removed by the time the launcher is classified, which makes
 /// `canonicalize` unavailable.
 fn token_belongs_to_vera(token: &str, vera_home: &Path) -> bool {
@@ -103,13 +107,37 @@ fn token_belongs_to_vera(token: &str, vera_home: &Path) -> bool {
     if path.as_os_str().is_empty() {
         return false;
     }
-    let names_vera = path.components().any(|component| {
-        let text = component.as_os_str().to_string_lossy();
-        VERA_PATH_COMPONENTS
+    let is_launcher = path.file_name().is_some_and(|name| {
+        let text = name.to_string_lossy();
+        VERA_LAUNCHER_NAMES
             .iter()
             .any(|known| text.eq_ignore_ascii_case(known))
     });
-    names_vera || is_inside(path, vera_home)
+    is_launcher || is_inside(path, vera_home)
+}
+
+/// The program a single command runs, or `None` if the command is empty.
+///
+/// Only this position decides ownership. An argument is not a launch: a script
+/// that prints a Vera path and then runs something else has not run Vera.
+fn launched_program(command: &str) -> Option<&str> {
+    let mut tokens = command.split_whitespace();
+    loop {
+        let token = tokens.next()?;
+        let token = unquote(token.strip_prefix('@').unwrap_or(token));
+        if token.is_empty()
+            || LAUNCH_PREFIXES
+                .iter()
+                .any(|p| token.eq_ignore_ascii_case(p))
+        {
+            continue;
+        }
+        // `NAME=value` prefixes set the environment for the program that follows.
+        if token.contains('=') && !token.contains('/') && !token.contains('\\') {
+            continue;
+        }
+        return Some(token);
+    }
 }
 
 /// Resolves `.` and `..` textually. Used instead of `canonicalize` because the
@@ -157,15 +185,17 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path) -> bool {
 
 /// Whether the text of a launcher script actually launches Vera.
 ///
-/// Ownership is decided from the lines that run, and from path tokens on them
-/// judged component-wise — not from the file containing the four letters
-/// `vera` anywhere, which a comment or an unrelated word such as `coverage`
-/// satisfies (#249).
+/// Ownership is decided from the program each command runs, judged by file
+/// name and by containment in the Vera home — not from the file containing the
+/// four letters `vera` anywhere, which a comment, an argument, or an unrelated
+/// word such as `coverage` satisfies (#249).
 fn script_launches_vera(text: &str, vera_home: &Path) -> bool {
     text.lines()
         .filter(|line| !is_comment_line(line))
-        .flat_map(str::split_whitespace)
-        .any(|token| token_belongs_to_vera(token, vera_home))
+        // A line can chain several commands; each one has its own program.
+        .flat_map(|line| line.split(['|', '&', ';']))
+        .filter_map(launched_program)
+        .any(|program| token_belongs_to_vera(program, vera_home))
 }
 
 /// Recognizes a candidate path as a removable Vera launcher, or leaves it
@@ -803,18 +833,47 @@ mod tests {
         path
     }
 
+    /// The exact shape `packages/npm-cli/bin/vera.js` writes, built from the
+    /// same `vera_home` the uninstall resolves, so the positive case is the
+    /// real installer output rather than an invented one.
     #[cfg(unix)]
     #[test]
-    fn uninstall_removes_a_shim_that_launches_vera() {
+    fn uninstall_removes_the_shim_the_installer_writes() {
         let roots = roots();
+        let binary = roots
+            .vera_home
+            .join("bin")
+            .join("1.3.0")
+            .join("aarch64-apple-darwin")
+            .join("vera");
         let shim = install_vera_shim(
             &roots.home.join(".local").join("bin"),
-            "#!/bin/sh\nexec \"$HOME/.vera/bin/vera\" \"$@\"\n",
+            &format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", binary.display()),
         );
 
         let (_, stderr) = uninstall(&roots, false);
 
         assert!(!shim.exists(), "our own shim survived");
+        assert!(stderr.contains("Removed PATH shim"), "{stderr}");
+    }
+
+    /// Ownership survives a chained command: the program still has to be Vera,
+    /// but it does not have to be the first thing on the line.
+    #[cfg(unix)]
+    #[test]
+    fn a_chained_command_that_ends_in_vera_is_still_ours() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            "#!/bin/sh\ncd /tmp && exec \"$HOME/.vera/bin/vera\" \"$@\"\n",
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            !shim.exists(),
+            "our own shim survived a chained launch line"
+        );
         assert!(stderr.contains("Removed PATH shim"), "{stderr}");
     }
 
@@ -834,6 +893,12 @@ mod tests {
             "#!/bin/sh\nexec /opt/veracrypt/bin/veracrypt \"$@\"\n",
             // A directory that starts with the same letters but is not ours.
             "#!/bin/sh\nexec /opt/vera-extra/bin/tool \"$@\"\n",
+            // A directory literally named `vera` that holds someone else's
+            // program: the launcher is `rg`, so the entry is not ours.
+            "#!/bin/sh\nexec /opt/vera/bin/rg \"$@\"\n",
+            // A Vera path in an argument rather than in program position.
+            // Printing a path is not launching it.
+            "#!/bin/sh\necho \"$HOME/.vera/bin/vera\"\nexec /usr/bin/rg \"$@\"\n",
         ] {
             let roots = roots();
             let foreign = install_vera_shim(&roots.home.join(".local").join("bin"), body);
