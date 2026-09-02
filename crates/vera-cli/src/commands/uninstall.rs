@@ -114,47 +114,88 @@ fn token_belongs_to_vera(token: &str, vera_home: &Path) -> bool {
     is_launcher && is_inside(path, vera_home)
 }
 
+/// Whether a launcher is written in the batch family rather than the shell
+/// family. Decides which character escapes, and whether `#` comments.
+///
+/// `packages/npm-cli/bin/vera.js` writes `@echo off` and `%*` on Windows, so
+/// both markers identify our own shim as well as anyone else's.
+fn looks_like_batch(text: &str) -> bool {
+    text.contains("%*")
+        || text.contains("%~dp0")
+        || text.lines().next().is_some_and(|line| {
+            let line = line.trim_start().to_ascii_lowercase();
+            line.starts_with("@echo") || line.starts_with("echo off")
+        })
+}
+
+/// Characters whose special meaning an escape suppresses. Escaping anything
+/// else leaves the escape character in place, so a Windows path keeps its
+/// backslashes and a unix path keeps a literal caret.
+fn is_special(ch: char) -> bool {
+    matches!(ch, '|' | '&' | ';' | '"' | '\'' | '`' | '#' | '\\' | '^') || ch.is_whitespace()
+}
+
 /// The program each command on a line runs.
 ///
-/// Quoting is honoured, so neither a separator nor a space inside a quoted
-/// path can invent a command or cut a path in half, and an inline `#` comment
-/// ends the line rather than contributing commands. Both matter for real
-/// installs: `VERA_HOME` under a directory with a space produces a shim whose
-/// binary path is a single quoted token, and a naive split would fail to
-/// recognize Vera's own launcher and silently leave it on PATH.
-fn launched_programs(line: &str) -> Vec<String> {
+/// Quoting, escaping and inline comments are all honoured, because each of
+/// them decides whether a Vera-looking path is something the shell would
+/// actually run. A separator or a space inside a quoted path must not invent a
+/// command or cut a path in half — a `VERA_HOME` under a directory with a
+/// space produces exactly that shim, and failing to recognize it leaves Vera's
+/// own launcher on PATH.
+fn launched_programs(line: &str, batch: bool) -> Vec<String> {
+    let escape = if batch { '^' } else { '\\' };
     let mut programs = Vec::new();
     let mut tokens: Vec<String> = Vec::new();
     let mut token = String::new();
+    // Tracked separately from `token`, which stays empty for a quoted empty
+    // word: `""#` is a `#` inside a word, not the start of a comment.
+    let mut word_started = false;
     let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
 
-    for ch in line.chars() {
+    while let Some(ch) = chars.next() {
+        // Single quotes suppress escaping in the shell.
+        if quote != Some('\'') && ch == escape && chars.peek().copied().is_some_and(is_special) {
+            token.push(chars.next().expect("peeked"));
+            word_started = true;
+            continue;
+        }
         match quote {
             Some(open) if ch == open => quote = None,
             Some(_) => token.push(ch),
             None => match ch {
                 // An unquoted `#` at a word boundary comments out the rest of
-                // the line, so nothing after it runs.
-                '#' if token.is_empty() => break,
-                '"' | '\'' | '`' => quote = Some(ch),
+                // the line. Batch has no such rule, and truncating there would
+                // lose our own launcher.
+                '#' if !batch && !word_started => break,
+                '"' | '\'' | '`' => {
+                    quote = Some(ch);
+                    word_started = true;
+                }
                 // Command separators, and only outside quotes.
                 '|' | '&' | ';' => {
-                    if !token.is_empty() {
+                    if word_started {
                         tokens.push(std::mem::take(&mut token));
                     }
+                    word_started = false;
                     programs.extend(program_of(&tokens));
                     tokens.clear();
                 }
                 _ if ch.is_whitespace() => {
-                    if !token.is_empty() {
+                    if word_started {
                         tokens.push(std::mem::take(&mut token));
                     }
+                    word_started = false;
                 }
-                _ => token.push(ch),
+                _ => {
+                    token.push(ch);
+                    word_started = true;
+                }
             },
         }
     }
-    if !token.is_empty() {
+    if word_started {
         tokens.push(token);
     }
     programs.extend(program_of(&tokens));
@@ -176,7 +217,10 @@ fn program_of(tokens: &[String]) -> Option<String> {
                     .iter()
                     .any(|prefix| token.eq_ignore_ascii_case(prefix))
                 // `NAME=value` prefixes set the environment for what follows.
-                && !(token.contains('=') && !token.contains('/') && !token.contains('\\'))
+                // Decided on the name, not on punctuation in the value: an
+                // assignment to a path is still an assignment, and the program
+                // is whatever comes after it.
+                && !token.split_once('=').is_some_and(|(name, _)| is_variable_name(name))
         })
         .map(str::to_string)
 }
@@ -231,10 +275,21 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path) -> bool {
 /// four letters `vera` anywhere, which a comment, an argument, or an unrelated
 /// word such as `coverage` satisfies (#249).
 fn script_launches_vera(text: &str, vera_home: &Path) -> bool {
+    let batch = looks_like_batch(text);
     text.lines()
         .filter(|line| !is_comment_line(line))
-        .flat_map(launched_programs)
+        .flat_map(|line| launched_programs(line, batch))
         .any(|program| token_belongs_to_vera(&program, vera_home))
+}
+
+/// Whether a word is a shell variable name, and so the left side of an
+/// environment assignment rather than a program.
+fn is_variable_name(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 /// Recognizes a candidate path as a removable Vera launcher, or leaves it
@@ -1091,6 +1146,91 @@ mod tests {
         let (_, stderr) = uninstall(&roots, false);
 
         assert!(!shim.exists(), "our own shim survived: {stderr}");
+    }
+
+    /// An escaped separator is literal text, not a command boundary. Splitting
+    /// on it invented a command whose first token was a Vera path.
+    #[cfg(unix)]
+    #[test]
+    fn an_escaped_separator_does_not_invent_a_command() {
+        let roots = roots();
+        let foreign = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\necho a\\; {}/bin/vera\nexec /usr/bin/rg \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            foreign.exists(),
+            "an escaped separator was read as a command boundary"
+        );
+        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+    }
+
+    /// `NAME=value` in front of the program is an assignment, whatever the
+    /// value looks like. Treating an assignment to a path as the program meant
+    /// the real program was never examined, so our own shim survived.
+    #[cfg(unix)]
+    #[test]
+    fn an_environment_assignment_is_not_the_program() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\nVERA_LOG=/var/log/vera.log exec \"{}/bin/1.3.0/x/vera\" \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(!shim.exists(), "our own shim survived: {stderr}");
+    }
+
+    /// A `#` after an empty quoted word is inside that word, so the line keeps
+    /// running. Reading it as a comment stopped the scan before the launch and
+    /// left Vera's own shim on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn a_hash_after_an_empty_quoted_word_is_not_a_comment() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "#!/bin/sh\necho \"\"# ; exec \"{}/bin/1.3.0/x/vera\" \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(!shim.exists(), "our own shim survived: {stderr}");
+    }
+
+    /// `#` is ordinary text in the batch family, so a `.cmd` shim that launches
+    /// Vera after one is still ours. The shell rule must not reach it.
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_shim_is_not_truncated_at_a_hash() {
+        let roots = roots();
+        let shim = install_vera_shim(
+            &roots.home.join(".local").join("bin"),
+            &format!(
+                "@echo off\r\necho # && \"{}/bin/1.3.0/x/vera\" %*\r\n",
+                roots.vera_home.display()
+            ),
+        );
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            !shim.exists(),
+            "a batch shim was truncated at a hash: {stderr}"
+        );
     }
 
     /// A separator inside a quoted argument is data, not a command boundary.
