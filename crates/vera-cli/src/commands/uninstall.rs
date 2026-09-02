@@ -10,7 +10,12 @@ use super::agent;
 use crate::state;
 
 /// Candidate directories where the shim may have been placed.
-fn shim_candidates(home: &Path, user_bin_dir: Option<&Path>) -> Vec<PathBuf> {
+///
+/// `cargo_bin` is the directory `cargo install` writes to (`$CARGO_HOME/bin`
+/// or `~/.cargo/bin`). It is passed in rather than derived here so the
+/// candidate set tracks a non-default `CARGO_HOME` — a hard-coded
+/// `home.join(".cargo").join("bin")` silently missed a custom cargo home.
+fn shim_candidates(home: &Path, user_bin_dir: Option<&Path>, cargo_bin: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(dir) = user_bin_dir {
         dirs.push(dir.to_path_buf());
@@ -29,7 +34,7 @@ fn shim_candidates(home: &Path, user_bin_dir: Option<&Path>) -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         dirs.push(home.join(".local").join("bin"));
-        dirs.push(home.join(".cargo").join("bin"));
+        dirs.push(cargo_bin.to_path_buf());
         dirs.push(home.join("bin"));
     }
     dirs
@@ -227,8 +232,12 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path
 /// host with `CARGO_HOME` set resolved somewhere other than the tree under
 /// test, which passed locally and failed on CI.
 fn cargo_bin_dir(home: &Path, cwd: &Path) -> PathBuf {
-    std::env::var_os("CARGO_HOME")
-        .filter(|value| !value.is_empty())
+    let cargo_home = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty());
+    cargo_bin_dir_with(home, cwd, cargo_home.as_deref())
+}
+
+fn cargo_bin_dir_with(home: &Path, cwd: &Path, cargo_home: Option<&std::ffi::OsStr>) -> PathBuf {
+    cargo_home
         .map(|value| absolutize(cwd, PathBuf::from(value)))
         .unwrap_or_else(|| home.join(".cargo"))
         .join("bin")
@@ -371,7 +380,7 @@ fn run_at(
     // Removals that were skipped: the trailing report must name what stayed
     // instead of claiming a complete uninstall.
     let mut leftover_failures: Vec<(PathBuf, anyhow::Error)> = Vec::new();
-    for dir in shim_candidates(home, user_bin_dir) {
+    for dir in shim_candidates(home, user_bin_dir, cargo_bin) {
         for name in entry_names() {
             let entry = dir.join(name);
             // `exists` follows the link and so reports `false` for a broken
@@ -1091,17 +1100,33 @@ mod tests {
     }
 
     /// `CARGO_HOME` goes through the same resolution, for the same reason: the
-    /// candidate paths it is compared against are absolute.
+    /// candidate paths it is compared against are absolute. The helper is
+    /// pure — no process-global env mutation — so the test is safe under
+    /// parallel execution.
     #[test]
     fn a_relative_cargo_home_is_resolved_before_comparison() {
         let home = Path::new("/home/u");
         let cwd = Path::new("/work/project");
-        // SAFETY: single-threaded within this test, and the value is removed
-        // before returning. No other test reads CARGO_HOME.
-        unsafe { std::env::set_var("CARGO_HOME", "vendor/cargo") };
-        let resolved = cargo_bin_dir(home, cwd);
-        unsafe { std::env::remove_var("CARGO_HOME") };
+        let cargo_home = std::ffi::OsString::from("vendor/cargo");
+        let resolved = cargo_bin_dir_with(home, cwd, Some(cargo_home.as_os_str()));
         assert_eq!(resolved, Path::new("/work/project/vendor/cargo/bin"));
+    }
+
+    #[test]
+    fn an_absolute_cargo_home_is_not_rebased() {
+        let home = Path::new("/home/u");
+        let cwd = Path::new("/work/project");
+        let cargo_home = std::ffi::OsString::from("/opt/cargo");
+        let resolved = cargo_bin_dir_with(home, cwd, Some(cargo_home.as_os_str()));
+        assert_eq!(resolved, Path::new("/opt/cargo/bin"));
+    }
+
+    #[test]
+    fn no_cargo_home_falls_back_to_home_dot_cargo() {
+        let home = Path::new("/home/u");
+        let cwd = Path::new("/work/project");
+        let resolved = cargo_bin_dir_with(home, cwd, None);
+        assert_eq!(resolved, Path::new("/home/u/.cargo/bin"));
     }
 
     /// Cargo's directory is derived from the cargo home, not matched by shape:
@@ -1126,6 +1151,128 @@ mod tests {
                 "{foreign} is not cargo's own bin directory"
             );
         }
+    }
+
+    /// A non-default `CARGO_HOME` changes where the cargo shim lives. The
+    /// candidate set must track `cargo_bin` so an unreadable executable in a
+    /// custom cargo bin is still recognized, while one in the default cargo
+    /// bin is not when `CARGO_HOME` points elsewhere — and vice versa.
+    #[test]
+    fn shim_candidates_track_non_default_cargo_home() {
+        let home = Path::new("/home/u");
+        let cwd = Path::new("/work/project");
+        // Default cargo home
+        let default_cargo_bin = cargo_bin_dir_with(home, cwd, None);
+        // Custom cargo home
+        let custom_home = std::ffi::OsString::from("/tmp/custom-cargo");
+        let custom_cargo_bin = cargo_bin_dir_with(home, cwd, Some(custom_home.as_os_str()));
+        assert_eq!(custom_cargo_bin, Path::new("/tmp/custom-cargo/bin"));
+
+        // Candidate set with default cargo bin must contain the default, not the custom
+        let cands_default = shim_candidates(home, None, &default_cargo_bin);
+        assert!(
+            cands_default.iter().any(|p| p == &default_cargo_bin),
+            "default candidates must contain default cargo bin {default_cargo_bin:?}, got {cands_default:?}"
+        );
+        assert!(
+            !cands_default.iter().any(|p| p == &custom_cargo_bin),
+            "default candidates must not contain custom cargo bin"
+        );
+
+        // Candidate set with custom cargo bin must contain the custom, not the default
+        let cands_custom = shim_candidates(home, None, &custom_cargo_bin);
+        assert!(
+            cands_custom.iter().any(|p| p == &custom_cargo_bin),
+            "custom candidates must contain custom cargo bin"
+        );
+        // The default path is not in the custom set unless it equals the custom one
+        assert!(
+            !cands_custom
+                .iter()
+                .any(|p| p == &default_cargo_bin && default_cargo_bin != custom_cargo_bin),
+            "custom candidates must not contain default cargo bin when distinct"
+        );
+    }
+
+    /// End-to-end: a cargo-installed binary under a non-default `CARGO_HOME`
+    /// is removed when `cargo_bin` points there, proving the lookup is not
+    /// hard-coded to `~/.cargo/bin`.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_cargo_binary_under_non_default_cargo_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let roots = roots();
+        // Place the binary under a custom cargo bin, not the default one.
+        let custom_cargo_bin = roots.home.join("custom").join("cargo").join("bin");
+        fs::create_dir_all(&custom_cargo_bin).unwrap();
+        let binary = custom_cargo_bin.join("vera");
+        fs::write(&binary, [0x7f, b'E', b'L', b'F', 0xcf]).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_at(
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(roots.user_bin_dir.as_path()),
+                recorded_binary: None,
+                cargo_bin: &custom_cargo_bin,
+            },
+            true,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert!(
+            !binary.exists(),
+            "cargo binary under custom CARGO_HOME survived at {}",
+            binary.display()
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["complete"], serde_json::json!(true));
+        assert!(
+            document["removed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tag| tag == "cargo-installed binary"),
+            "custom cargo binary should be reported as removed: {document}"
+        );
+
+        // A binary in the default cargo bin must be left alone when the
+        // custom cargo_bin is authoritative — hard-coding would have deleted it.
+        let default_cargo_bin = roots.home.join(".cargo").join("bin");
+        fs::create_dir_all(&default_cargo_bin).unwrap();
+        let other = default_cargo_bin.join("vera");
+        fs::write(&other, [0x7f, b'E', b'L', b'F', 0xcf]).unwrap();
+        fs::set_permissions(&other, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let mut stdout2 = Vec::new();
+        let mut stderr2 = Vec::new();
+        run_at(
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(roots.user_bin_dir.as_path()),
+                recorded_binary: None,
+                cargo_bin: &custom_cargo_bin,
+            },
+            true,
+            &mut stdout2,
+            &mut stderr2,
+        )
+        .unwrap();
+        assert!(
+            other.exists(),
+            "binary in default cargo bin was deleted while CARGO_HOME pointed elsewhere — hard-coded candidate"
+        );
+        // Cleanup
+        let _ = fs::remove_file(&other);
     }
 
     /// A chain that never terminates must not hang the uninstall.
