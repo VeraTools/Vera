@@ -735,6 +735,98 @@ pub fn print_human_summary(summary: &vera_core::indexing::IndexSummary, verbose:
     }
 }
 
+/// Warn when a `--path` pattern matched none of the indexed files.
+///
+/// Empty results look the same whether the query found nothing or the filter
+/// excluded everything, and the two want different fixes. The common case is a
+/// directory pattern carrying a wildcard: `--path 'crates/*/src'` matches no
+/// *file*, while the wildcard-free `--path crates/vera-core/src` is treated as
+/// a directory prefix and matches everything beneath it.
+///
+/// Returns `None` when every pattern matched something, so a genuinely empty
+/// result set stays quiet.
+pub fn path_filter_hint(
+    index_dir: &std::path::Path,
+    filters: &vera_core::types::SearchFilters,
+) -> Option<String> {
+    if filters.path_glob.is_empty() {
+        return None;
+    }
+
+    // Best effort: this runs only on an empty result set, and a hint is not
+    // worth failing a command over.
+    let store =
+        vera_core::storage::metadata::MetadataStore::open_existing(&index_dir.join("metadata.db"))
+            .ok()?;
+    let files = store.indexed_files().ok()?;
+    let unmatched = filters.path_patterns_matching_nothing(&files);
+    // `path_glob` is OR-combined, so one working pattern still admits files and
+    // the empty result is then a genuine miss rather than the filter's doing.
+    if unmatched.is_empty() || unmatched.len() != filters.path_glob.len() {
+        return None;
+    }
+
+    let quoted: Vec<String> = unmatched.iter().map(|p| format!("`{p}`")).collect();
+    let suggestions: Vec<String> = unmatched
+        .iter()
+        .copied()
+        .filter_map(|pattern| {
+            if let Some(s) = vera_core::types::directory_pattern_suggestion(pattern) {
+                return Some(s);
+            }
+            // Fallback for a literal file miss where the parent directory exists
+            // as a file container, e.g. `src/auth.rs` missing while
+            // `src/auth/mod.rs` exists suggests `src/auth/**`. The pure
+            // directory-pattern helper only handles wildcarded directory prefixes,
+            // so a literal file pattern would otherwise get no suggestion even
+            // though its directory variant is actionable.
+            let trimmed = pattern.trim_end_matches(['/', '\\']);
+            if !trimmed.contains('*') {
+                let last = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+                if last.contains('.') {
+                    // Strip extension to derive a directory candidate, e.g.
+                    // `src/auth.rs` -> `src/auth`, `a/b/c.rs` -> `a/b/c`.
+                    let stem = last.split('.').next().unwrap_or(last);
+                    let dir_candidate = if let Some(slash) = trimmed.rfind(['/', '\\']) {
+                        let parent = &trimmed[..slash];
+                        if parent.is_empty() {
+                            stem.to_string()
+                        } else {
+                            format!("{parent}/{stem}")
+                        }
+                    } else {
+                        // No directory component, e.g. `auth.rs` -> `auth`
+                        stem.to_string()
+                    };
+                    if !dir_candidate.is_empty() {
+                        let parent_pat = format!("{dir_candidate}/**");
+                        let probe = vera_core::types::SearchFilters {
+                            path_glob: vec![parent_pat.clone()],
+                            ..Default::default()
+                        };
+                        if probe.path_patterns_matching_nothing(&files).is_empty() {
+                            return Some(format!("`{dir_candidate}/**`"));
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    let mut hint = format!(
+        "note: no indexed file matches {}; the path filter excluded everything, so this is not necessarily an empty search",
+        quoted.join(", ")
+    );
+    if !suggestions.is_empty() {
+        hint.push_str(&format!(
+            "\n      a directory pattern containing a wildcard matches no file on its own; try {}",
+            suggestions.join(", ")
+        ));
+    }
+    Some(hint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

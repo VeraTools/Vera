@@ -130,6 +130,27 @@ impl SearchFilters {
         }
     }
 
+    /// Which of the active `--path` patterns match none of `files`.
+    ///
+    /// A pattern that matches nothing is indistinguishable in the output from a
+    /// query that genuinely has no results, and the two want different fixes.
+    /// Exposed so the CLI can say which pattern was the empty one rather than
+    /// guessing, and pure so it can be tested without an index.
+    pub fn path_patterns_matching_nothing<'a>(&'a self, files: &[impl AsRef<str>]) -> Vec<&'a str> {
+        if files.is_empty() {
+            return Vec::new();
+        }
+        self.path_glob
+            .iter()
+            .filter(|pattern| {
+                !files
+                    .iter()
+                    .any(|path| glob_matches(pattern, path.as_ref()))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
     /// Check whether a search result matches all active filters.
     pub fn matches(&self, result: &SearchResult) -> bool {
         if !self.matches_file(&result.file_path, result.language) {
@@ -224,6 +245,28 @@ pub fn directory_prefix_near_misses(patterns: &[String], paths: &[String]) -> Ve
         })
         .cloned()
         .collect()
+}
+
+/// The `/**` spelling to suggest for an unmatched pattern, if one makes sense.
+///
+/// Only patterns that look like a directory prefix get one. Appending `/**` to
+/// anything else produces a suggestion that cannot match: `*.rs/**` and
+/// `Makefile*/**` both ask for files beneath a directory of that name, and
+/// `src/**/` already ends in `**` once the trailing separator is normalized.
+///
+/// Separate from `path_filter_hint` so the classification can be tested
+/// without an index behind it.
+pub fn directory_pattern_suggestion(pattern: &str) -> Option<String> {
+    let trimmed = pattern.trim_end_matches(['/', '\\']);
+    let last_segment = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+
+    let looks_like_a_directory_prefix = trimmed.contains('*')
+        && !trimmed.ends_with("**")
+        // A literal directory name: no extension, and not itself a glob.
+        && !last_segment.contains('.')
+        && !last_segment.contains('*');
+
+    looks_like_a_directory_prefix.then(|| format!("`{trimmed}/**`"))
 }
 
 /// True when `pattern` fully matches a proper directory ancestor of `path`
@@ -2085,5 +2128,268 @@ mod tests {
         // Patterns are checked per pattern; an empty pattern list stays empty.
         let files = vec!["crates/vera-core/src/types.rs".to_string()];
         assert!(directory_prefix_near_misses(&[], &files).is_empty());
+    }
+
+    // ── path_patterns_matching_nothing + directory_pattern_suggestion (#250) ──
+
+    #[test]
+    fn path_patterns_matching_nothing_names_only_the_empty_ones() {
+        let files = vec![
+            "crates/vera-core/src/lib.rs".to_string(),
+            "docs/guide.md".to_string(),
+        ];
+
+        // The wildcard-free directory pattern matches via the prefix fallback,
+        // the wildcarded one matches no file at all. Both spellings look the
+        // same to a user, which is why the empty one has to be named.
+        let filters = SearchFilters {
+            path_glob: vec![
+                "crates/vera-core/src".to_string(),
+                "crates/*/src".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            filters.path_patterns_matching_nothing(&files),
+            vec!["crates/*/src"]
+        );
+
+        // Nothing to report when every pattern matched something: a genuinely
+        // empty result set must stay quiet.
+        let ok = SearchFilters {
+            path_glob: vec!["crates/**/*.rs".to_string(), "docs/*.md".to_string()],
+            ..Default::default()
+        };
+        assert!(ok.path_patterns_matching_nothing(&files).is_empty());
+
+        // An empty index is not the filter's doing: every pattern would look
+        // unmatched and the note would blame the wrong thing.
+        let empty: Vec<String> = Vec::new();
+        assert!(filters.path_patterns_matching_nothing(&empty).is_empty());
+
+        // And no filter means nothing to say.
+        assert!(
+            SearchFilters::default()
+                .path_patterns_matching_nothing(&files)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn path_patterns_matching_nothing_literal_no_match() {
+        let files = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+        let filters = SearchFilters {
+            path_glob: vec!["src/auth.rs".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            filters.path_patterns_matching_nothing(&files),
+            vec!["src/auth.rs"]
+        );
+        // Exact literal that exists matches.
+        let ok = SearchFilters {
+            path_glob: vec!["src/main.rs".to_string()],
+            ..Default::default()
+        };
+        assert!(ok.path_patterns_matching_nothing(&files).is_empty());
+    }
+
+    #[test]
+    fn path_patterns_matching_nothing_wildcard_match() {
+        let files = vec![
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "tests/test_auth.py".to_string(),
+        ];
+        // Wildcard that matches at least one file is not reported.
+        let wildcard_ok = SearchFilters {
+            path_glob: vec!["src/*.rs".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            wildcard_ok
+                .path_patterns_matching_nothing(&files)
+                .is_empty()
+        );
+
+        // Wildcard that matches nothing is reported.
+        let wildcard_miss = SearchFilters {
+            path_glob: vec!["src/*.py".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            wildcard_miss.path_patterns_matching_nothing(&files),
+            vec!["src/*.py"]
+        );
+
+        // Single-segment `*` must not cross directory boundary.
+        let deep = SearchFilters {
+            path_glob: vec!["src/*".to_string()],
+            ..Default::default()
+        };
+        // src/* matches src/main.rs but not deeper; still considered a match
+        // because at least one file matched, so nothing to report.
+        assert!(deep.path_patterns_matching_nothing(&files).is_empty());
+
+        // But with only deep files, src/* matches nothing.
+        let only_deep = vec!["src/a/b/c.rs".to_string()];
+        assert_eq!(
+            deep.path_patterns_matching_nothing(&only_deep),
+            vec!["src/*"]
+        );
+    }
+
+    #[test]
+    fn path_patterns_matching_nothing_recursive_doublestar() {
+        let files = vec![
+            "src/a/b/c.rs".to_string(),
+            "src/main.rs".to_string(),
+            "crates/vera-core/src/lib.rs".to_string(),
+        ];
+        // ** matches any depth.
+        let rec = SearchFilters {
+            path_glob: vec!["src/**".to_string()],
+            ..Default::default()
+        };
+        assert!(rec.path_patterns_matching_nothing(&files).is_empty());
+
+        let any_rs = SearchFilters {
+            path_glob: vec!["**/*.rs".to_string()],
+            ..Default::default()
+        };
+        assert!(any_rs.path_patterns_matching_nothing(&files).is_empty());
+
+        // Non-matching recursive still reported.
+        let miss = SearchFilters {
+            path_glob: vec!["**/*.py".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(miss.path_patterns_matching_nothing(&files), vec!["**/*.py"]);
+
+        // Standalone ** matches everything, never reported.
+        let all = SearchFilters {
+            path_glob: vec!["**".to_string()],
+            ..Default::default()
+        };
+        assert!(all.path_patterns_matching_nothing(&files).is_empty());
+    }
+
+    #[test]
+    fn path_patterns_matching_nothing_multi_pattern_returns_only_misses() {
+        let files = vec![
+            "crates/vera-core/src/lib.rs".to_string(),
+            "docs/guide.md".to_string(),
+            "src/main.rs".to_string(),
+        ];
+        let filters = SearchFilters {
+            path_glob: vec![
+                "crates/**/*.rs".to_string(), // matches
+                "src/*.py".to_string(),       // misses
+                "docs/*.md".to_string(),      // matches
+                "nonexistent/**".to_string(), // misses
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            filters.path_patterns_matching_nothing(&files),
+            vec!["src/*.py", "nonexistent/**"]
+        );
+
+        // All miss.
+        let all_miss = SearchFilters {
+            path_glob: vec!["a/*.rs".to_string(), "b/*.py".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            all_miss.path_patterns_matching_nothing(&files),
+            vec!["a/*.rs", "b/*.py"]
+        );
+
+        // All match.
+        let all_match = SearchFilters {
+            path_glob: vec!["crates/**/*.rs".to_string(), "docs/*.md".to_string()],
+            ..Default::default()
+        };
+        assert!(all_match.path_patterns_matching_nothing(&files).is_empty());
+    }
+
+    #[test]
+    fn path_patterns_matching_nothing_bare_directory_prefix_fallback() {
+        let files = vec![
+            "app/src/foo.ts".to_string(),
+            "app/src/bar/baz.rs".to_string(),
+        ];
+        // Bare directory without wildcard matches via prefix fallback.
+        let bare = SearchFilters {
+            path_glob: vec!["app/src".to_string()],
+            ..Default::default()
+        };
+        assert!(bare.path_patterns_matching_nothing(&files).is_empty());
+
+        let files2 = vec!["crates/vera-core/src/lib.rs".to_string()];
+        let filters = SearchFilters {
+            path_glob: vec!["crates/*/src".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            filters.path_patterns_matching_nothing(&files2),
+            vec!["crates/*/src"]
+        );
+    }
+
+    #[test]
+    fn directory_pattern_suggestion_only_for_directory_shaped_patterns() {
+        // The case the hint exists for: a wildcarded directory prefix, which
+        // matches no file on its own.
+        assert_eq!(
+            directory_pattern_suggestion("crates/*/src").as_deref(),
+            Some("`crates/*/src/**`")
+        );
+        // A trailing separator is normalized, not carried into the suggestion.
+        assert_eq!(
+            directory_pattern_suggestion("crates/*/src/").as_deref(),
+            Some("`crates/*/src/**`")
+        );
+        assert_eq!(
+            directory_pattern_suggestion("crates/*/src\\").as_deref(),
+            Some("`crates/*/src/**`")
+        );
+
+        // Everything below would produce a suggestion that cannot match.
+        for pattern in [
+            "*.rs",        // extension glob: `*.rs/**` wants files under a dir named `*.rs`
+            "src/*.ts",    // same, with a prefix
+            "Makefile*",   // extensionless file glob, still not a directory
+            "src/**",      // already recursive
+            "src/**/",     // already recursive, with a trailing separator
+            "crates/*",    // last segment is itself a glob, not a directory name
+            "src",         // no wildcard: the prefix fallback already covers it
+            "src/auth.rs", // file with extension
+            "a/b/c",       // no wildcard
+        ] {
+            assert_eq!(
+                directory_pattern_suggestion(pattern),
+                None,
+                "{pattern} must not get a `/**` suggestion"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_pattern_suggestion_wildcard_directory_variants() {
+        assert_eq!(
+            directory_pattern_suggestion("src/*/auth").as_deref(),
+            Some("`src/*/auth/**`")
+        );
+        assert_eq!(
+            directory_pattern_suggestion("a/**/b/c").as_deref(),
+            Some("`a/**/b/c/**`")
+        );
+        // Last segment contains dot -> file-like, no suggestion
+        assert_eq!(directory_pattern_suggestion("src/*.rs"), None);
+        assert_eq!(directory_pattern_suggestion("src/auth/*.rs"), None);
+        // Last segment is glob -> no suggestion
+        assert_eq!(directory_pattern_suggestion("src/*"), None);
+        assert_eq!(directory_pattern_suggestion("src/a/*"), None);
     }
 }
