@@ -253,6 +253,142 @@ fn glob_matches_as_dir_prefix(pattern: &str, path: &str) -> bool {
     false
 }
 
+/// Bulk glob resolution reusing a single matcher instance per pattern.
+///
+/// Tests `distinct_paths` against `patterns` (OR semantics) with one
+/// `BulkGlobMatcher` reused across all paths. This avoids 10-20k
+/// allocations per filtered query and preserves the memoized failing-states
+/// mechanism across the loop, per the mission bulk-resolution convention.
+pub(crate) fn bulk_glob_allowed(patterns: &[String], distinct_paths: &[String]) -> Vec<bool> {
+    if patterns.is_empty() || distinct_paths.is_empty() {
+        return vec![false; distinct_paths.len()];
+    }
+    // Normalize patterns once (same rules as `glob_matches`).
+    let norm_patterns: Vec<Vec<u8>> = patterns
+        .iter()
+        .map(|p| {
+            let n = p.replace('\\', "/");
+            let n = n
+                .strip_prefix("./")
+                .unwrap_or(&n)
+                .trim_end_matches('/')
+                .to_string();
+            n.into_bytes()
+        })
+        .collect();
+    // Normalize paths once.
+    let norm_paths: Vec<Vec<u8>> = distinct_paths
+        .iter()
+        .map(|p| {
+            let n = p.replace('\\', "/");
+            let n = n.strip_prefix("./").unwrap_or(&n).to_string();
+            n.into_bytes()
+        })
+        .collect();
+    let mut out = vec![false; distinct_paths.len()];
+    let mut matcher = BulkGlobMatcher::new();
+    for (idx, path_bytes) in norm_paths.iter().enumerate() {
+        for pat_bytes in &norm_patterns {
+            if bulk_glob_matches(&mut matcher, pat_bytes, path_bytes) {
+                out[idx] = true;
+                break;
+            }
+            // Bare-directory fallback (no wildcards): `app/src` matches `app/src/**`.
+            if !pat_bytes.contains(&b'*')
+                && !pat_bytes.is_empty()
+                && path_bytes.starts_with(pat_bytes.as_slice())
+                && path_bytes.get(pat_bytes.len()) == Some(&b'/')
+            {
+                out[idx] = true;
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn bulk_glob_matches(matcher: &mut BulkGlobMatcher, pattern: &[u8], text: &[u8]) -> bool {
+    matcher.matches(pattern, text)
+}
+
+/// Reusable glob matcher that reuses its `dead` allocation across many texts
+/// for the same pattern family. One instance serves an entire distinct-path
+/// table (10-20k entries) without per-path allocation.
+struct BulkGlobMatcher {
+    dead: Vec<bool>,
+}
+
+impl BulkGlobMatcher {
+    fn new() -> Self {
+        Self { dead: Vec::new() }
+    }
+
+    fn matches(&mut self, pattern: &[u8], text: &[u8]) -> bool {
+        let needed = (pattern.len() + 1) * (text.len() + 1);
+        if self.dead.len() != needed {
+            self.dead.resize(needed, false);
+        }
+        self.dead.fill(false);
+        self.matches_inner(pattern, text, 0, 0)
+    }
+
+    fn offset(&self, text_len: usize, p: usize, t: usize) -> usize {
+        (text_len + 1) * p + t
+    }
+
+    fn matches_inner(&mut self, pattern: &[u8], text: &[u8], p: usize, t: usize) -> bool {
+        let cell = self.offset(text.len(), p, t);
+        if self.dead[cell] {
+            return false;
+        }
+        let matched = self.advance(pattern, text, p, t);
+        if !matched {
+            self.dead[cell] = true;
+        }
+        matched
+    }
+
+    fn advance(&mut self, pattern: &[u8], text: &[u8], p: usize, t: usize) -> bool {
+        if pattern[p..] == *b"**" {
+            return true;
+        }
+        if pattern[p..].starts_with(b"**/") {
+            let rest = p + 3;
+            if self.matches_inner(pattern, text, rest, t) {
+                return true;
+            }
+            for (i, byte) in text.iter().enumerate().skip(t) {
+                if *byte == b'/' && self.matches_inner(pattern, text, rest, i + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if p == pattern.len() && t == text.len() {
+            return true;
+        }
+        if p == pattern.len() {
+            return false;
+        }
+        if pattern[p] == b'*' {
+            let rest = p + 1;
+            if self.matches_inner(pattern, text, rest, t) {
+                return true;
+            }
+            for (i, byte) in text.iter().enumerate().skip(t) {
+                if *byte == b'/' {
+                    break;
+                }
+                if self.matches_inner(pattern, text, rest, i + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        t < text.len() && pattern[p] == text[t] && self.matches_inner(pattern, text, p + 1, t + 1)
+    }
+}
+
 /// Recursive glob matcher over byte suffixes with memoized failed states.
 ///
 /// States are addressed by absolute (pattern offset, text offset): every

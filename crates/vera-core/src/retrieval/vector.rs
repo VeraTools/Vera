@@ -37,6 +37,11 @@ pub enum VectorSearchError {
         source: EmbeddingError,
     },
 
+    /// Eligibility doubt — stale/corrupted/inconsistent/IO — caller should
+    /// fall back to the legacy whole-index fetch; not a hard failure.
+    #[error("eligibility doubt: {0}")]
+    EligibilityDoubt(#[from] crate::storage::eligibility::EligibilityError),
+
     /// Storage or metadata error.
     #[error("storage error: {0:#}")]
     StorageError(#[from] anyhow::Error),
@@ -343,7 +348,21 @@ pub(crate) fn search_vector_from_embedding_filtered(
     let (_requested, candidates) = candidate_pool(limit, index_count, is_flat);
     let vector_results = vector_store
         .search_filtered(query_embedding, candidates, map, query_elig)
-        .map_err(|e| VectorSearchError::StorageError(e.context("filtered vector search failed")))?;
+        .map_err(|e| {
+            if e.downcast_ref::<crate::storage::eligibility::EligibilityError>()
+                .is_some()
+                || e.chain().any(|c| {
+                    c.downcast_ref::<crate::storage::eligibility::EligibilityError>()
+                        .is_some()
+                })
+            {
+                VectorSearchError::EligibilityDoubt(
+                    crate::storage::eligibility::EligibilityError::Inconsistent(format!("{e:#}")),
+                )
+            } else {
+                VectorSearchError::StorageError(e.context("filtered vector search failed"))
+            }
+        })?;
     debug!(
         query = query,
         raw_results = vector_results.len(),

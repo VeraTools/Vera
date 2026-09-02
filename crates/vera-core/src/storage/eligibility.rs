@@ -14,10 +14,25 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::types::{Language, SearchFilters};
+
+/// Typed eligibility doubt: any missing/stale/corrupted/inconsistent/IO
+/// state must fall back to the legacy whole-index fetch.
+#[derive(Debug, thiserror::Error)]
+pub enum EligibilityError {
+    #[error("eligibility map stale: {0}")]
+    Stale(String),
+    #[error("eligibility map corrupted: {0}")]
+    Corrupted(String),
+    #[error("eligibility map IO error: {0}")]
+    Io(String),
+    #[error("eligibility map inconsistent: {0}")]
+    Inconsistent(String),
+    #[error("eligibility resolution doubt: {0}")]
+    Resolution(String),
+}
 
 static BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -205,6 +220,7 @@ pub fn is_map_evaluable(filters: &SearchFilters) -> bool {
 }
 
 /// Eligibility map per store generation.
+#[derive(Debug)]
 pub struct EligibilityMap {
     /// Distinct paths table, order is path-id assignment order (sorted for determinism).
     pub distinct_paths: Vec<String>,
@@ -220,36 +236,53 @@ pub struct EligibilityMap {
 
 impl EligibilityMap {
     /// Build from the two SQLite files. Returns error on any inconsistency -> caller falls back.
-    pub fn build(metadata_path: &Path, vector_path: &Path) -> Result<Self> {
+    pub fn build(
+        metadata_path: &Path,
+        vector_path: &Path,
+    ) -> std::result::Result<Self, EligibilityError> {
         BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
         // Open metadata read-only.
         let conn = Connection::open_with_flags(metadata_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| {
-                format!(
-                    "eligibility: failed to open metadata {}",
+            .map_err(|e| {
+                EligibilityError::Io(format!(
+                    "eligibility: failed to open metadata {}: {e}",
                     metadata_path.display()
-                )
+                ))
             })?;
 
         // ATTACH vector db as vecdb.
-        let vector_path_str = vector_path
-            .to_str()
-            .context("eligibility: vector path is not valid unicode")?
-            .replace('\'', "''");
+        let vector_path_str = vector_path.to_str().ok_or_else(|| {
+            EligibilityError::Io("eligibility: vector path is not valid unicode".to_string())
+        })?;
+        let vector_path_str = vector_path_str.replace('\'', "''");
         conn.execute_batch(&format!("ATTACH DATABASE '{vector_path_str}' AS vecdb"))
-            .context("eligibility: failed to attach vector db")?;
+            .map_err(|e| {
+                EligibilityError::Io(format!("eligibility: failed to attach vector db: {e}"))
+            })?;
 
         // Distinct paths.
         let distinct_paths: Vec<String> = {
             let mut stmt = conn
                 .prepare("SELECT DISTINCT file_path FROM chunks ORDER BY file_path")
-                .context("eligibility: failed to prepare distinct paths")?;
+                .map_err(|e| {
+                    EligibilityError::Io(format!(
+                        "eligibility: failed to prepare distinct paths: {e}"
+                    ))
+                })?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
-                .context("eligibility: failed to query distinct paths")?;
+                .map_err(|e| {
+                    EligibilityError::Io(format!(
+                        "eligibility: failed to query distinct paths: {e}"
+                    ))
+                })?;
             let mut paths = Vec::new();
             for r in rows {
-                paths.push(r.context("eligibility: failed to read distinct path")?);
+                paths.push(r.map_err(|e| {
+                    EligibilityError::Corrupted(format!(
+                        "eligibility: failed to read distinct path: {e}"
+                    ))
+                })?);
             }
             paths
         };
@@ -266,14 +299,20 @@ impl EligibilityMap {
             path_to_id.insert(key, idx as u32);
         }
 
-        // Max rowid.
+        // Max rowid: use sqlite_sequence high-water mark to match flat snapshot sizing.
         let max_rowid: i64 = conn
             .query_row(
-                "SELECT COALESCE(MAX(rowid),0) FROM vecdb.chunk_id_map",
+                "SELECT COALESCE(
+                    (SELECT seq FROM sqlite_sequence WHERE name = 'chunk_id_map'),
+                    (SELECT MAX(rowid) FROM vecdb.chunk_id_map),
+                    0
+                )",
                 [],
                 |row| row.get(0),
             )
-            .context("eligibility: failed to read max rowid")?;
+            .map_err(|e| {
+                EligibilityError::Io(format!("eligibility: failed to read max rowid: {e}"))
+            })?;
 
         let size = if max_rowid < 0 { 0 } else { max_rowid as usize };
         let mut path_ids = vec![SENTINEL_PATH_ID; size];
@@ -287,28 +326,39 @@ impl EligibilityMap {
                      FROM vecdb.chunk_id_map JOIN chunks ON chunks.id = vecdb.chunk_id_map.chunk_id \
                      ORDER BY vecdb.chunk_id_map.rowid",
                 )
-                .context("eligibility: failed to prepare join")?;
-            let mut rows = stmt
-                .query([])
-                .context("eligibility: failed to query join")?;
-            while let Some(row) = rows
-                .next()
-                .context("eligibility: failed to fetch join row")?
-            {
-                let rowid: i64 = row.get(0).context("eligibility: failed to read rowid")?;
-                let file_path: String = row
-                    .get(1)
-                    .context("eligibility: failed to read file_path")?;
-                let lang_str: String =
-                    row.get(2).context("eligibility: failed to read language")?;
+                .map_err(|e| {
+                    EligibilityError::Io(format!("eligibility: failed to prepare join: {e}"))
+                })?;
+            let mut rows = stmt.query([]).map_err(|e| {
+                EligibilityError::Io(format!("eligibility: failed to query join: {e}"))
+            })?;
+            while let Some(row) = rows.next().map_err(|e| {
+                EligibilityError::Io(format!("eligibility: failed to fetch join row: {e}"))
+            })? {
+                let rowid: i64 = row.get(0).map_err(|e| {
+                    EligibilityError::Corrupted(format!("eligibility: failed to read rowid: {e}"))
+                })?;
+                let file_path: String = row.get(1).map_err(|e| {
+                    EligibilityError::Corrupted(format!(
+                        "eligibility: failed to read file_path: {e}"
+                    ))
+                })?;
+                let lang_str: String = row.get(2).map_err(|e| {
+                    EligibilityError::Corrupted(format!(
+                        "eligibility: failed to read language: {e}"
+                    ))
+                })?;
                 if rowid <= 0 || rowid > max_rowid {
                     continue;
                 }
                 let idx = (rowid - 1) as usize;
                 let key = file_path.replace('\\', "/");
                 let pid = path_to_id.get(&key).copied().unwrap_or(SENTINEL_PATH_ID);
-                let lang_compact = parse_language_compact(&lang_str)
-                    .unwrap_or(language_to_compact(Language::Unknown));
+                let lang_compact = parse_language_compact(&lang_str).ok_or_else(|| {
+                    EligibilityError::Corrupted(format!(
+                        "invalid stored language '{lang_str}' for chunk row {rowid}"
+                    ))
+                })?;
                 path_ids[idx] = pid;
                 languages[idx] = lang_compact;
             }
@@ -321,24 +371,36 @@ impl EligibilityMap {
                      FROM vecdb.chunk_id_map JOIN chunks ON chunks.id = vecdb.chunk_id_map.chunk_id \
                      ORDER BY vecdb.chunk_id_map.rowid",
                 )
-                .context("eligibility: failed to prepare join (empty distinct)")?;
-            let mut rows = stmt
-                .query([])
-                .context("eligibility: failed to query join")?;
-            while let Some(row) = rows
-                .next()
-                .context("eligibility: failed to fetch join row")?
-            {
-                let rowid: i64 = row.get(0).context("eligibility: rowid")?;
-                let _file_path: String = row.get(1).context("eligibility: file_path")?;
-                let lang_str: String = row.get(2).context("eligibility: language")?;
+                .map_err(|e| {
+                    EligibilityError::Io(format!(
+                        "eligibility: failed to prepare join (empty distinct): {e}"
+                    ))
+                })?;
+            let mut rows = stmt.query([]).map_err(|e| {
+                EligibilityError::Io(format!("eligibility: failed to query join: {e}"))
+            })?;
+            while let Some(row) = rows.next().map_err(|e| {
+                EligibilityError::Io(format!("eligibility: failed to fetch join row: {e}"))
+            })? {
+                let rowid: i64 = row
+                    .get(0)
+                    .map_err(|e| EligibilityError::Corrupted(format!("eligibility: rowid: {e}")))?;
+                let _file_path: String = row.get(1).map_err(|e| {
+                    EligibilityError::Corrupted(format!("eligibility: file_path: {e}"))
+                })?;
+                let lang_str: String = row.get(2).map_err(|e| {
+                    EligibilityError::Corrupted(format!("eligibility: language: {e}"))
+                })?;
                 if rowid <= 0 || rowid > max_rowid {
                     continue;
                 }
                 let idx = (rowid - 1) as usize;
                 // path remains sentinel
-                let lang_compact = parse_language_compact(&lang_str)
-                    .unwrap_or(language_to_compact(Language::Unknown));
+                let lang_compact = parse_language_compact(&lang_str).ok_or_else(|| {
+                    EligibilityError::Corrupted(format!(
+                        "invalid stored language '{lang_str}' for chunk row {rowid}"
+                    ))
+                })?;
                 languages[idx] = lang_compact;
             }
         }
@@ -387,24 +449,15 @@ impl QueryEligibility {
 pub fn resolve_query_eligibility(
     map: &EligibilityMap,
     filters: &SearchFilters,
-) -> Result<QueryEligibility> {
+) -> std::result::Result<QueryEligibility, EligibilityError> {
     // Path dimension.
     let path = if filters.path_glob.is_empty() && filters.exact_paths.is_none() {
         PathEligibility::All
     } else {
-        // Compute glob-allowed set if needed.
+        // Compute glob-allowed set if needed via bulk matcher (single allocation reuse).
         let glob_allowed: Option<Vec<bool>> = if !filters.path_glob.is_empty() {
-            let mut allowed = vec![false; map.distinct_paths.len()];
-            let mut any = false;
-            for (idx, path) in map.distinct_paths.iter().enumerate() {
-                for pattern in &filters.path_glob {
-                    if crate::types::glob_matches(pattern, path) {
-                        allowed[idx] = true;
-                        any = true;
-                        break;
-                    }
-                }
-            }
+            let allowed = crate::types::bulk_glob_allowed(&filters.path_glob, &map.distinct_paths);
+            let any = allowed.iter().any(|&v| v);
             // If no glob matches and there is no exact filter, then empty.
             if !any && filters.exact_paths.is_none() {
                 return Ok(QueryEligibility {

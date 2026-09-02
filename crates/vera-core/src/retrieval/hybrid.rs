@@ -687,52 +687,46 @@ async fn search_hybrid_inner(
             // supported filtered query and invalidated via MetadataDbStamp and
             // VectorStoreStamp (generation/manifest).
             match stores_arc.eligibility_map() {
-                Ok(map) => match resolve_query_eligibility(&map, filters) {
-                    Ok(query_elig) if query_elig.is_empty() => {
-                        // Honest empty: nothing can match, no scan, no warning.
-                        optimized_outcome = Some(Ok((Vec::new(), Duration::ZERO)));
-                    }
-                    Ok(query_elig) => {
-                        // Limit for filtered scan: same candidate pool that an
-                        // unfiltered query would have used, clamped to the index.
-                        // This keeps hydration to 1-2 batches (filtered top-K)
-                        // instead of 567 batches for a 509k index.
-                        let filtered_limit = vector_candidates.min(index_count);
-                        if let Some(cached_vs) = &vector_store_cached {
-                            let filtered_res = search_vector_with_cached_stores_filtered_timed(
-                                cached_vs.as_ref(),
-                                &stores_arc.vector_metadata,
-                                provider,
-                                vector_query,
-                                filtered_limit,
-                                &map,
-                                &query_elig,
-                            )
-                            .await;
-                            match filtered_res {
+                Ok(map) => {
+                    match resolve_query_eligibility(&map, filters) {
+                        Ok(query_elig) if query_elig.is_empty() => {
+                            // Honest empty: nothing can match, no scan, no warning.
+                            optimized_outcome = Some(Ok((Vec::new(), Duration::ZERO)));
+                        }
+                        Ok(query_elig) => {
+                            // Limit for filtered scan: same candidate pool that an
+                            // unfiltered query would have used, clamped to the index.
+                            // This keeps hydration to 1-2 batches (filtered top-K)
+                            // instead of 567 batches for a 509k index.
+                            let filtered_limit = vector_candidates.min(index_count);
+                            if let Some(cached_vs) = &vector_store_cached {
+                                let filtered_res = search_vector_with_cached_stores_filtered_timed(
+                                    cached_vs.as_ref(),
+                                    &stores_arc.vector_metadata,
+                                    provider,
+                                    vector_query,
+                                    filtered_limit,
+                                    &map,
+                                    &query_elig,
+                                )
+                                .await;
+                                match filtered_res {
                                 Ok(ok) => optimized_outcome = Some(Ok(ok)),
+                                Err(crate::retrieval::vector::VectorSearchError::EligibilityDoubt(_)) => {
+                                    // Any eligibility doubt (stale/corrupted/inconsistent/IO) -> legacy whole-index fetch
+                                    optimized_outcome = None;
+                                }
                                 Err(e) => {
-                                    let msg = format!("{e:#}");
-                                    let is_stale = msg.contains("eligibility")
-                                        || msg.contains("map length")
-                                        || msg.contains("flat vector")
-                                        || msg.contains("generation")
-                                        || msg.contains("STale")
-                                        || msg.contains("stale");
-                                    if is_stale {
-                                        // Treat stale/inconsistent map as fallback
-                                        optimized_outcome = None;
-                                    } else {
-                                        optimized_outcome = Some(Err(e));
-                                    }
+                                    optimized_outcome = Some(Err(e));
                                 }
                             }
+                            }
+                        }
+                        Err(_) => {
+                            // Resolution doubt -> fallback
                         }
                     }
-                    Err(_) => {
-                        // Resolution doubt -> fallback
-                    }
-                },
+                }
                 Err(_) => {
                     // Missing/stale/inconsistent map -> fallback
                 }
