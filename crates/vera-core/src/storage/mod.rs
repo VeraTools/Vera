@@ -8,6 +8,7 @@
 //! These are composed by the indexing pipeline and retrieval engine.
 
 pub mod bm25;
+pub mod eligibility;
 pub mod metadata;
 pub mod vector;
 

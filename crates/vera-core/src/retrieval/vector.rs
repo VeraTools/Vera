@@ -6,10 +6,21 @@
 //! metadata store. Finds semantically related code even when query terms
 //! don't appear literally in results (e.g., "memory allocation" finds `alloc`).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tracing::debug;
+
+static LAST_HYDRATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn last_hydration_count() -> usize {
+    LAST_HYDRATION_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn reset_last_hydration_count() {
+    LAST_HYDRATION_COUNT.store(0, Ordering::Relaxed);
+}
 
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::storage::metadata::MetadataStore;
@@ -177,6 +188,7 @@ fn search_vector_from_embedding(
         .iter()
         .map(|vr| vr.chunk_id.clone())
         .collect();
+    LAST_HYDRATION_COUNT.store(ids.len(), Ordering::Relaxed);
     let mut chunk_by_id = metadata_store.get_chunks_by_ids(&ids).map_err(|e| {
         VectorSearchError::StorageError(e.context("failed to batch-fetch chunk metadata"))
     })?;
@@ -235,6 +247,134 @@ pub(crate) fn candidate_pool(limit: usize, index_count: usize, is_flat: bool) ->
         clamped_requested.min(MAX_KNN_K)
     };
     (clamped_requested, fetched)
+}
+
+pub(crate) async fn search_vector_with_cached_stores_filtered_timed(
+    vector_store: &std::sync::Mutex<VectorStore>,
+    metadata_store: &std::sync::Mutex<MetadataStore>,
+    provider: &impl EmbeddingProvider,
+    query: &str,
+    limit: usize,
+    map: &crate::storage::eligibility::EligibilityMap,
+    query_elig: &crate::storage::eligibility::QueryEligibility,
+) -> Result<(Vec<SearchResult>, Duration), VectorSearchError> {
+    if limit == 0 || query_elig.is_empty() {
+        LAST_HYDRATION_COUNT.store(0, Ordering::Relaxed);
+        return Ok((Vec::new(), Duration::ZERO));
+    }
+    let stored_dim = vector_store
+        .lock()
+        .map_err(|_| {
+            VectorSearchError::StorageError(anyhow::anyhow!("vector store lock poisoned"))
+        })?
+        .dim();
+    let embed_start = Instant::now();
+    let query_embedding = generate_query_embedding(provider, query, stored_dim).await?;
+    let embed_elapsed = embed_start.elapsed();
+    debug!(
+        query = query,
+        dim = query_embedding.len(),
+        "generated query embedding (filtered)"
+    );
+    let vector_store = vector_store.lock().map_err(|_| {
+        VectorSearchError::StorageError(anyhow::anyhow!("vector store lock poisoned"))
+    })?;
+    let metadata_store = metadata_store.lock().map_err(|_| {
+        VectorSearchError::StorageError(anyhow::anyhow!("metadata store lock poisoned"))
+    })?;
+    let results = search_vector_from_embedding_filtered(
+        &vector_store,
+        &metadata_store,
+        query,
+        limit,
+        &query_embedding,
+        map,
+        query_elig,
+    )?;
+    Ok((results, embed_elapsed))
+}
+
+#[allow(dead_code)]
+pub(crate) async fn search_vector_with_stores_filtered_timed(
+    vector_store: &VectorStore,
+    metadata_store: &MetadataStore,
+    provider: &impl EmbeddingProvider,
+    query: &str,
+    limit: usize,
+    map: &crate::storage::eligibility::EligibilityMap,
+    query_elig: &crate::storage::eligibility::QueryEligibility,
+) -> Result<(Vec<SearchResult>, Duration), VectorSearchError> {
+    if limit == 0 || query_elig.is_empty() {
+        LAST_HYDRATION_COUNT.store(0, Ordering::Relaxed);
+        return Ok((Vec::new(), Duration::ZERO));
+    }
+    let stored_dim = vector_store.dim();
+    let embed_start = Instant::now();
+    let query_embedding = generate_query_embedding(provider, query, stored_dim).await?;
+    let embed_elapsed = embed_start.elapsed();
+    let results = search_vector_from_embedding_filtered(
+        vector_store,
+        metadata_store,
+        query,
+        limit,
+        &query_embedding,
+        map,
+        query_elig,
+    )?;
+    Ok((results, embed_elapsed))
+}
+
+pub(crate) fn search_vector_from_embedding_filtered(
+    vector_store: &VectorStore,
+    metadata_store: &MetadataStore,
+    query: &str,
+    limit: usize,
+    query_embedding: &[f32],
+    map: &crate::storage::eligibility::EligibilityMap,
+    query_elig: &crate::storage::eligibility::QueryEligibility,
+) -> Result<Vec<SearchResult>, VectorSearchError> {
+    if query_elig.is_empty() {
+        LAST_HYDRATION_COUNT.store(0, Ordering::Relaxed);
+        return Ok(Vec::new());
+    }
+    let index_count = vector_store.count().unwrap_or(usize::MAX as u64) as usize;
+    let is_flat = vector_store.is_flat();
+    // Use candidate_pool to absorb missing-metadata overfetch, same as unfiltered path.
+    let (_requested, candidates) = candidate_pool(limit, index_count, is_flat);
+    let vector_results = vector_store
+        .search_filtered(query_embedding, candidates, map, query_elig)
+        .map_err(|e| VectorSearchError::StorageError(e.context("filtered vector search failed")))?;
+    debug!(
+        query = query,
+        raw_results = vector_results.len(),
+        "filtered vector search returned candidates"
+    );
+    let ids: Vec<String> = vector_results
+        .iter()
+        .map(|vr| vr.chunk_id.clone())
+        .collect();
+    LAST_HYDRATION_COUNT.store(ids.len(), Ordering::Relaxed);
+    let mut chunk_by_id = metadata_store.get_chunks_by_ids(&ids).map_err(|e| {
+        VectorSearchError::StorageError(e.context("failed to batch-fetch chunk metadata"))
+    })?;
+    let mut results = Vec::with_capacity(vector_results.len());
+    for vr in &vector_results {
+        let Some(chunk) = chunk_by_id.remove(&vr.chunk_id) else {
+            debug!(chunk_id = %vr.chunk_id, "chunk metadata not found, skipping (filtered)");
+            continue;
+        };
+        let score = distance_to_similarity(vr.distance);
+        results.push(chunk.into_search_result(score));
+        if results.len() >= limit {
+            break;
+        }
+    }
+    debug!(
+        query = query,
+        returned = results.len(),
+        "filtered vector search complete"
+    );
+    Ok(results)
 }
 
 /// Generate a query embedding, truncating to match stored dimensionality.

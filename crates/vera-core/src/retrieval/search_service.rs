@@ -17,10 +17,7 @@ use crate::embedding::{CachedEmbeddingProvider, DynamicProvider, EmbeddingProvid
 use crate::retrieval::dynamic_reranker::DynamicReranker;
 use crate::retrieval::exact_matches::augment_exact_match_candidates_with_store_and_config;
 pub use crate::retrieval::exact_matches::augment_multi_query_exact_matches;
-use crate::retrieval::hybrid::{
-    SearchStores, compute_vector_candidates, search_hybrid_reranked_with_stores,
-    search_hybrid_with_stores,
-};
+use crate::retrieval::hybrid::{SearchStores, compute_vector_candidates};
 use crate::retrieval::query_classifier::{QueryType, classify_query, params_for_query_type};
 use crate::retrieval::ranking::{RankingStage, is_path_weighted_query};
 use crate::retrieval::{apply_filters, search_bm25_with_stores_and_filters};
@@ -386,8 +383,17 @@ impl SearchContext {
             RankingStage::Initial
         };
 
+        let filter_flag = config.retrieval.vector_filter_during_scan_enabled();
         let (results, hybrid_timings) = if let Some(reranker) = reranker {
-            search_hybrid_reranked_with_stores(
+            // Reranked path: temporary direct call that respects the flag via
+            // the default-config fallback (env authoritative). Full flag threading
+            // for reranked path will be added if needed; for now the non-reranked
+            // path is the differential surface covered by VAL-197.
+            // To keep the flag authoritative through SearchContext, we route the
+            // non-reranked filtered path via the flagged variant and leave the
+            // reranked variant on the legacy default-flag path unless the config
+            // flag is carried through the reranked wrapper in a follow-up.
+            crate::retrieval::hybrid::search_hybrid_reranked_with_augmentation_and_flag(
                 index_dir,
                 provider,
                 reranker,
@@ -402,10 +408,11 @@ impl SearchContext {
                 vector_candidates,
                 crate::config::graph_augmentation_enabled(),
                 Arc::clone(&stores),
+                filter_flag,
             )
             .await?
         } else {
-            search_hybrid_with_stores(
+            crate::retrieval::hybrid::search_hybrid_with_stores_and_flag(
                 index_dir,
                 provider,
                 query,
@@ -416,6 +423,7 @@ impl SearchContext {
                 stored_dim,
                 vector_candidates,
                 Arc::clone(&stores),
+                filter_flag,
             )
             .await?
         };
