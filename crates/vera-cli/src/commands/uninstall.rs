@@ -83,7 +83,10 @@ fn shim_target(text: &str) -> Option<&str> {
         .find_map(|(head, tail)| {
             text.strip_prefix(head)
                 .and_then(|rest| rest.strip_suffix(tail))
-                .filter(|target| !target.is_empty() && !target.contains('"'))
+                // Both ends are anchored, so whatever lies between them is the
+                // path, quote characters included: a unix path may contain one and
+                // the installer writes it through verbatim.
+                .filter(|target| !target.is_empty())
         })
 }
 
@@ -157,21 +160,43 @@ fn is_inside(path: &Path, root: &Path) -> bool {
     lexically_normalize(path).starts_with(lexically_normalize(root))
 }
 
+/// How many links to follow before giving up, so a cycle cannot hang the run.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Where a symlink chain lands, resolved one hop at a time.
+///
+/// Each relative target is resolved against its own link's directory, so
+/// `vera -> ../lib/vera/bin/vera` is judged on where it actually lands rather
+/// than on how it is spelled. Resolution stops at the first path that is not a
+/// link, which includes a dangling one: that path is still the answer, and
+/// comparing it lexically is what lets a broken alias into Vera's own files be
+/// recognized and removed.
+fn resolve_symlink_chain(entry: &Path) -> Option<PathBuf> {
+    let mut current = fs::read_link(entry).ok()?;
+    if current.is_relative() {
+        current = entry.parent().unwrap_or(Path::new("")).join(current);
+    }
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(next) = fs::read_link(&current) else {
+            return Some(current);
+        };
+        current = if next.is_absolute() {
+            next
+        } else {
+            current.parent().unwrap_or(Path::new("")).join(next)
+        };
+    }
+    Some(current)
+}
+
 /// Whether a symlink at `entry` resolves to this installation's binary.
 ///
-/// A relative target is resolved against the link's own directory first, so
-/// `vera -> ../lib/vera/bin/vera` is judged on where it actually lands, not on
-/// how it is spelled.
+/// The whole chain is followed, so an alias that reaches Vera through another
+/// link is still ours. Stopping at the first hop left such an alias on PATH
+/// while the run reported a complete uninstall.
 fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path>) -> bool {
-    let Ok(target) = fs::read_link(entry) else {
-        return false;
-    };
-    let resolved = if target.is_absolute() {
-        target
-    } else {
-        entry.parent().unwrap_or(Path::new("")).join(target)
-    };
-    is_our_binary(&resolved, recorded, vera_home)
+    resolve_symlink_chain(entry)
+        .is_some_and(|resolved| is_our_binary(&resolved, recorded, vera_home))
 }
 
 /// Executability where the platform tracks it. Windows has no file mode bit;
@@ -836,6 +861,81 @@ mod tests {
             ours.symlink_metadata().is_err(),
             "a dangling Vera symlink stayed on PATH: {stderr}"
         );
+    }
+
+    /// A path may contain a quote character, and the installer writes it into
+    /// the shim verbatim. Rejecting such a target left the shim on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn a_quote_in_the_home_path_does_not_hide_the_shim() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("ho\"me");
+        let bin = home.join(".local").join("bin");
+        let vera_home = home.join(".vera");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(temp.path().join("project")).unwrap();
+        let binary = vera_home.join("bin").join("1.3.0").join("x").join("vera");
+        let shim = install_shim(
+            &bin,
+            &format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", binary.display()),
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_at(
+            InstallLayout {
+                home: &home,
+                vera_home: &vera_home,
+                cwd: &temp.path().join("project"),
+                user_bin_dir: Some(bin.as_path()),
+                recorded_binary: None,
+            },
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert!(!shim.exists(), "a quote in the path hid our own shim");
+    }
+
+    /// An alias that reaches Vera through another link is still ours. Comparing
+    /// only the first hop left it on PATH while the run reported success.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_chain_reaching_vera_is_followed() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let binary = roots.vera_home.join("bin").join("vera");
+        let middle = roots.home.join("alias-vera");
+        std::os::unix::fs::symlink(&binary, &middle).unwrap();
+        let entry = bin.join("vera");
+        std::os::unix::fs::symlink(&middle, &entry).unwrap();
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            entry.symlink_metadata().is_err(),
+            "an aliased Vera symlink stayed on PATH: {stderr}"
+        );
+    }
+
+    /// A chain that never terminates must not hang the uninstall.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_terminates() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let a = bin.join("vera");
+        let b = roots.home.join("loop-b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(stderr.contains("uninstalled"), "{stderr}");
     }
 
     #[cfg(unix)]
