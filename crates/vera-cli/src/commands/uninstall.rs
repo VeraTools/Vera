@@ -119,7 +119,7 @@ fn is_our_binary(target: &Path, recorded: Option<&Path>, vera_home: &Path) -> bo
 /// else named `vera`.
 fn classify_launch_entry(
     entry: &Path,
-    home: &Path,
+    cargo_bin: &Path,
     vera_home: &Path,
     recorded: Option<&Path>,
 ) -> Option<LaunchEntry> {
@@ -142,7 +142,7 @@ fn classify_launch_entry(
     // would not help, because any binary named `vera` passes that too.
     let is_cargo_binary = entry
         .parent()
-        .is_some_and(|parent| is_cargo_bin_dir(parent, &cargo_bin_dir(home)))
+        .is_some_and(|parent| is_cargo_bin_dir(parent, cargo_bin))
         && read_as_text.is_err()
         && fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file())
         && is_executable(entry);
@@ -221,6 +221,11 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path
 /// Derived rather than pattern-matched. A configured `VERA_USER_BIN_DIR` that
 /// merely *ends* in `.cargo/bin` is not cargo's directory, and treating it as
 /// one would hand every unreadable executable there to the cargo arm.
+///
+/// The environment is read here, at the edge, and the answer is passed down.
+/// Reading it inside the classifier made the result depend on the machine: a
+/// host with `CARGO_HOME` set resolved somewhere other than the tree under
+/// test, which passed locally and failed on CI.
 fn cargo_bin_dir(home: &Path) -> PathBuf {
     std::env::var_os("CARGO_HOME")
         .filter(|value| !value.is_empty())
@@ -290,6 +295,7 @@ pub fn run(json_output: bool) -> Result<()> {
             cwd: &cwd,
             user_bin_dir: user_bin_dir.as_deref(),
             recorded_binary: recorded_binary.as_deref(),
+            cargo_bin: &cargo_bin_dir(&home),
         },
         json_output,
         &mut std::io::stdout().lock(),
@@ -307,6 +313,9 @@ struct InstallLayout<'a> {
     /// The binary the installer recorded in `install.json`, read before the
     /// Vera home is removed.
     recorded_binary: Option<&'a Path>,
+    /// Cargo's own bin directory, resolved by the caller so classification
+    /// never consults the environment.
+    cargo_bin: &'a Path,
 }
 
 fn run_at(
@@ -321,6 +330,7 @@ fn run_at(
         cwd,
         user_bin_dir,
         recorded_binary,
+        cargo_bin,
     } = layout;
     let mut removed = Vec::new();
 
@@ -369,7 +379,8 @@ fn run_at(
             if entry.symlink_metadata().is_err() {
                 continue;
             }
-            let Some(kind) = classify_launch_entry(&entry, home, vera_home, recorded_binary) else {
+            let Some(kind) = classify_launch_entry(&entry, cargo_bin, vera_home, recorded_binary)
+            else {
                 // Not ours: leave it alone silently, as before.
                 continue;
             };
@@ -513,6 +524,7 @@ mod tests {
                 cwd: &roots.cwd,
                 user_bin_dir: Some(roots.user_bin_dir.as_path()),
                 recorded_binary: None,
+                cargo_bin: &roots.home.join(".cargo").join("bin"),
             },
             json_output,
             &mut stdout,
@@ -538,6 +550,7 @@ mod tests {
                 cwd: &roots.cwd,
                 user_bin_dir: Some(roots.user_bin_dir.as_path()),
                 recorded_binary: None,
+                cargo_bin: &roots.home.join(".cargo").join("bin"),
             },
             json_output,
             &mut stdout,
@@ -938,6 +951,7 @@ mod tests {
                 cwd: &temp.path().join("project"),
                 user_bin_dir: Some(bin.as_path()),
                 recorded_binary: None,
+                cargo_bin: &home.join(".cargo").join("bin"),
             },
             false,
             &mut stdout,
@@ -1003,6 +1017,7 @@ mod tests {
                 cwd: &roots.cwd,
                 user_bin_dir: Some(bin.as_path()),
                 recorded_binary: Some(recorded.as_path()),
+                cargo_bin: &roots.home.join(".cargo").join("bin"),
             },
             false,
             &mut stdout,
