@@ -199,6 +199,7 @@ fn val_001_lazy_per_store_generation() {
 // ── VAL-197-002 ──
 #[test]
 fn val_002_metadata_agreement_and_globmatcher() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -407,6 +408,7 @@ async fn val_010_filter_before_hydration() {
 
 // ── VAL-197-011 (mini) ──
 // Test differential across small synthetic cases; overcap fixture is tested separately in next test.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_011_differential_small() {
     let _guard = eligibility_guard();
@@ -494,8 +496,10 @@ async fn val_011_differential_small() {
 }
 
 // ── VAL-197-013 tombstone ──
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_013_tombstone_exclusion() {
+    let _guard = eligibility_guard();
     let dir = tempdir().unwrap();
     let dim = 8;
     let chunks = vec![
@@ -628,6 +632,7 @@ async fn val_014_staleness_invalidation() {
 }
 
 // ── VAL-197-015 missing/stale fallback ──
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_015_missing_stale_fallback() {
     let _guard = eligibility_guard();
@@ -719,6 +724,7 @@ fn overcap_path() -> Option<std::path::PathBuf> {
     }
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_011_overcap_differential_matrix() {
     let _guard = eligibility_guard();
@@ -864,6 +870,7 @@ async fn val_011_overcap_differential_matrix() {
 }
 
 // ── VAL-197-008 honest empty ──
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_008_honest_empty() {
     let _guard = eligibility_guard();
@@ -924,6 +931,7 @@ async fn val_008_honest_empty() {
 }
 
 // ── VAL-197-012 unfiltered byte-identical ──
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_012_unfiltered_byte_identical() {
     let _guard = eligibility_guard();
@@ -1035,6 +1043,7 @@ async fn val_012_unfiltered_byte_identical() {
 }
 
 // ── VAL-197-016 scope fallback ──
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_016_scope_fallback() {
     let _guard = eligibility_guard();
@@ -1097,6 +1106,7 @@ async fn val_016_scope_fallback() {
 }
 
 // ── VAL-197-017 include_generated fallback ──
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_017_include_generated_fallback() {
     let _guard = eligibility_guard();
@@ -1152,6 +1162,7 @@ async fn val_017_include_generated_fallback() {
 }
 
 // ── VAL-197-018 mixed fallback ──
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn val_018_mixed_fallback() {
     let _guard = eligibility_guard();
@@ -1219,6 +1230,7 @@ async fn val_018_mixed_fallback() {
 // ── VAL-197-019 vec0 untouched (flag ignored) ──
 #[test]
 fn val_019_vec0_flag_ignored() {
+    let _guard = eligibility_guard();
     crate::test_env::run_env_test(
         "retrieval::filter_scan_tests::val_019_vec0_probe",
         &[("VERA_VECTOR_SCAN", Some("vec0"))],
@@ -1446,6 +1458,7 @@ async fn val_015_io_error_fallback() {
 // ── Bulk matcher equivalence (scan guard + matcher reuse) ──
 #[test]
 fn bulk_glob_matches_single_allocation() {
+    let _guard = eligibility_guard();
     let patterns = vec![
         "src/**".to_string(),
         "src/video/**".to_string(),
