@@ -83,6 +83,8 @@ pub(crate) fn configured_max_file_size_bytes(store: &MetadataStore) -> u64 {
 }
 
 #[cfg(test)]
+mod filter_scan_tests;
+#[cfg(test)]
 #[path = "search_quality_tests.rs"]
 mod search_quality_tests;
 

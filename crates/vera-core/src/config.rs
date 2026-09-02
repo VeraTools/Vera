@@ -369,6 +369,15 @@ pub struct RetrievalConfig {
         alias = "ranking_pool_multiplier"
     )]
     pub ranking_candidate_pool_multiplier: bool,
+    /// Filter-during-scan optimization for filtered flat-vector queries.
+    ///
+    /// When enabled, filtered queries on the flat backend avoid hydrating the whole index:
+    /// a lazy per-store eligibility map (chunk row -> path-id, language) is built once per store+generation,
+    /// distinct paths are tested against glob filters via `GlobMatcher`, and the flat SIMD scan collects top-K only among eligible rows.
+    /// Scope gate: only path globs, exact paths, and language filters are eligible; other dimensions fall back to whole-index fetch.
+    /// Default OFF (0) — flipped only via evidence-backed PR; env authoritative `VERA_VECTOR_FILTER_DURING_SCAN`.
+    #[serde(default = "default_vector_filter_during_scan")]
+    pub vector_filter_during_scan: bool,
 }
 
 fn default_max_output_chars() -> usize {
@@ -499,6 +508,18 @@ fn default_ranking_candidate_pool_multiplier() -> bool {
     false
 }
 
+fn default_vector_filter_during_scan() -> bool {
+    // Default OFF at implementation; flipped only via evidence-backed PR.
+    // Alias set and precedence match `vector_filter_during_scan_enabled`
+    // (per alias-discipline convention): first wins, identical order.
+    for key in ["VERA_VECTOR_FILTER_DURING_SCAN"] {
+        if std::env::var(key).is_ok() {
+            return env_bool(key, false);
+        }
+    }
+    false
+}
+
 impl Default for RetrievalConfig {
     fn default() -> Self {
         Self {
@@ -522,6 +543,7 @@ impl Default for RetrievalConfig {
             ranking_recall_pool_expansion: default_ranking_recall_pool_expansion(),
             ranking_multiplicative_path_penalty: default_ranking_multiplicative_path_penalty(),
             ranking_candidate_pool_multiplier: default_ranking_candidate_pool_multiplier(),
+            vector_filter_during_scan: default_vector_filter_during_scan(),
         }
     }
 }
@@ -605,6 +627,18 @@ impl RetrievalConfig {
         } else {
             1
         }
+    }
+
+    /// Filter-during-scan optimization enabled, with env-var override.
+    /// Default OFF; env `VERA_VECTOR_FILTER_DURING_SCAN` authoritative.
+    /// Alias set and precedence identical to `default_vector_filter_during_scan`.
+    pub fn vector_filter_during_scan_enabled(&self) -> bool {
+        for key in ["VERA_VECTOR_FILTER_DURING_SCAN"] {
+            if std::env::var(key).is_ok() {
+                return env_bool(key, self.vector_filter_during_scan);
+            }
+        }
+        self.vector_filter_during_scan
     }
 }
 
@@ -2375,5 +2409,201 @@ card0, 1073741824, 4294967296\n";
         let cfg = VeraConfig::default();
         assert!(cfg.retrieval.ranking_multiplicative_path_penalty);
         assert!(cfg.retrieval.ranking_multiplicative_path_penalty_enabled());
+    }
+
+    // ── Filter-during-scan knob (#197) ──
+    #[test]
+    fn vector_filter_default_off() {
+        run_env_test(
+            "config::tests::vector_filter_default_off_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", None)],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_default_off"]
+    fn vector_filter_default_off_probe() {
+        assert!(std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").is_err());
+        assert!(!default_vector_filter_during_scan());
+        assert!(!RetrievalConfig::default().vector_filter_during_scan);
+        assert!(
+            !RetrievalConfig::default().vector_filter_during_scan_enabled(),
+            "default must be OFF"
+        );
+        assert!(
+            !VeraConfig::default()
+                .retrieval
+                .vector_filter_during_scan_enabled(),
+            "VeraConfig default must be OFF"
+        );
+        // Legacy JSON without field defaults to false.
+        let legacy = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0}"#;
+        let rcfg: RetrievalConfig = serde_json::from_str(legacy).unwrap();
+        assert!(!rcfg.vector_filter_during_scan);
+        assert!(!rcfg.vector_filter_during_scan_enabled());
+    }
+
+    #[test]
+    fn vector_filter_env_override() {
+        run_env_test(
+            "config::tests::vector_filter_env_on_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", Some("1"))],
+        );
+        run_env_test(
+            "config::tests::vector_filter_env_off_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", Some("0"))],
+        );
+        run_env_test(
+            "config::tests::vector_filter_env_true_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", Some("true"))],
+        );
+        run_env_test(
+            "config::tests::vector_filter_env_override_config_false_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", Some("1"))],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_env_override"]
+    fn vector_filter_env_on_probe() {
+        assert_eq!(
+            std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").unwrap(),
+            "1"
+        );
+        assert!(default_vector_filter_during_scan());
+        assert!(RetrievalConfig::default().vector_filter_during_scan_enabled());
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_env_override"]
+    fn vector_filter_env_off_probe() {
+        assert_eq!(
+            std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").unwrap(),
+            "0"
+        );
+        assert!(!default_vector_filter_during_scan());
+        // Even if file says true, env 0 must win.
+        let cfg = RetrievalConfig {
+            vector_filter_during_scan: true,
+            ..Default::default()
+        };
+        assert!(
+            !cfg.vector_filter_during_scan_enabled(),
+            "env 0 must override file true"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_env_override"]
+    fn vector_filter_env_true_probe() {
+        assert_eq!(
+            std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").unwrap(),
+            "true"
+        );
+        assert!(default_vector_filter_during_scan());
+        let cfg = RetrievalConfig {
+            vector_filter_during_scan: false,
+            ..Default::default()
+        };
+        assert!(
+            cfg.vector_filter_during_scan_enabled(),
+            "env true must override file false"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_env_override"]
+    fn vector_filter_env_override_config_false_probe() {
+        assert_eq!(
+            std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").unwrap(),
+            "1"
+        );
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"vector_filter_during_scan":false}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            cfg.vector_filter_during_scan_enabled(),
+            "env 1 must override config false"
+        );
+    }
+
+    #[test]
+    fn vector_filter_config_precedence() {
+        run_env_test(
+            "config::tests::vector_filter_config_file_true_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", None)],
+        );
+        run_env_test(
+            "config::tests::vector_filter_env_beats_file_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", Some("0"))],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_config_precedence"]
+    fn vector_filter_config_file_true_probe() {
+        assert!(std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").is_err());
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"vector_filter_during_scan":true}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.vector_filter_during_scan);
+        assert!(cfg.vector_filter_during_scan_enabled());
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_config_precedence"]
+    fn vector_filter_env_beats_file_probe() {
+        assert_eq!(
+            std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").unwrap(),
+            "0"
+        );
+        let json = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0,"vector_filter_during_scan":true}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            !cfg.vector_filter_during_scan_enabled(),
+            "env 0 must beat file true"
+        );
+    }
+
+    #[test]
+    fn vector_filter_alias_parity() {
+        // Single alias, but parity requires default_* and enabled helper share order.
+        run_env_test(
+            "config::tests::vector_filter_alias_parity_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", Some("1"))],
+        );
+        run_env_test(
+            "config::tests::vector_filter_alias_parity_off_probe",
+            &[("VERA_VECTOR_FILTER_DURING_SCAN", Some("0"))],
+        );
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_alias_parity"]
+    fn vector_filter_alias_parity_probe() {
+        assert_eq!(
+            std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").unwrap(),
+            "1"
+        );
+        // Both helpers must see same alias set precedence (only one alias, but still).
+        assert!(default_vector_filter_during_scan());
+        let cfg = RetrievalConfig {
+            vector_filter_during_scan: false,
+            ..Default::default()
+        };
+        assert!(cfg.vector_filter_during_scan_enabled());
+    }
+
+    #[test]
+    #[ignore = "driven by vector_filter_alias_parity"]
+    fn vector_filter_alias_parity_off_probe() {
+        assert_eq!(
+            std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").unwrap(),
+            "0"
+        );
+        assert!(!default_vector_filter_during_scan());
+        let cfg = RetrievalConfig {
+            vector_filter_during_scan: true,
+            ..Default::default()
+        };
+        assert!(!cfg.vector_filter_during_scan_enabled());
     }
 }

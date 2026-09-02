@@ -24,9 +24,11 @@ use crate::retrieval::query_utils::result_key;
 use crate::retrieval::ranking::is_path_weighted_query;
 use crate::retrieval::reranker::{Reranker, rerank_results};
 use crate::retrieval::vector::{
-    VectorSearchError, search_vector_with_cached_stores_timed, search_vector_with_stores_timed,
+    VectorSearchError, search_vector_with_cached_stores_filtered_timed,
+    search_vector_with_cached_stores_timed, search_vector_with_stores_timed,
 };
 use crate::storage::bm25::Bm25Index;
+use crate::storage::eligibility::{EligibilityMap, is_map_evaluable, resolve_query_eligibility};
 use crate::storage::metadata::MetadataStore;
 use crate::storage::vector::{MAX_KNN_K, VectorStore};
 use crate::types::{SearchFilters, SearchResult};
@@ -112,6 +114,13 @@ pub(crate) struct SearchStores {
     indexed_files: Mutex<Option<CachedIndexedFiles>>,
     cached_index_meta: Mutex<Option<CachedIndexMeta>>,
     open_stamp: MetadataDbStamp,
+    eligibility: Mutex<Option<CachedEligibility>>,
+}
+
+struct CachedEligibility {
+    map: Arc<EligibilityMap>,
+    metadata_stamp: MetadataDbStamp,
+    vector_stamp: VectorStoreStamp,
 }
 
 struct CachedIndexedFiles {
@@ -216,6 +225,7 @@ impl SearchStores {
             indexed_files: Mutex::new(None),
             cached_index_meta: Mutex::new(None),
             open_stamp,
+            eligibility: Mutex::new(None),
         })
     }
 
@@ -311,6 +321,54 @@ impl SearchStores {
 
     pub(crate) fn is_open_stamp_current(&self) -> bool {
         metadata_db_stamp(&self.metadata_path) == self.open_stamp
+    }
+
+    /// Lazily build and cache the eligibility map per store+generation.
+    /// Returns the cached map if stamps match, otherwise rebuilds.
+    /// Never panics; any build failure is propagated as an error for fallback.
+    pub(crate) fn eligibility_map(&self) -> Result<Arc<EligibilityMap>> {
+        let meta_stamp = metadata_db_stamp(&self.metadata_path);
+        let vec_stamp = vector_store_stamp(&self.vector_path);
+        {
+            let guard = self
+                .eligibility
+                .lock()
+                .map_err(|_| anyhow::anyhow!("eligibility cache lock poisoned"))?;
+            if let Some(cached) = guard.as_ref()
+                && cached.metadata_stamp == meta_stamp
+                && cached.vector_stamp == vec_stamp
+            {
+                return Ok(Arc::clone(&cached.map));
+            }
+        }
+        let map = EligibilityMap::build(&self.metadata_path, &self.vector_path)
+            .context("failed to build eligibility map")?;
+        let arc = Arc::new(map);
+        let mut guard = self
+            .eligibility
+            .lock()
+            .map_err(|_| anyhow::anyhow!("eligibility cache lock poisoned"))?;
+        *guard = Some(CachedEligibility {
+            map: Arc::clone(&arc),
+            metadata_stamp: meta_stamp,
+            vector_stamp: vec_stamp,
+        });
+        Ok(arc)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn eligibility_cached(&self) -> bool {
+        self.eligibility
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_eligibility_for_test(&self) {
+        let _ = self.eligibility.lock().map(|mut g| *g = None);
     }
 
     pub(crate) fn vector_store(&self, dim: usize) -> Result<Arc<Mutex<VectorStore>>> {
@@ -410,6 +468,9 @@ pub async fn search_hybrid(
     stored_dim: usize,
     vector_candidates: usize,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    let filter_during_scan_enabled = crate::config::VeraConfig::default()
+        .retrieval
+        .vector_filter_during_scan_enabled();
     search_hybrid_inner(
         index_dir,
         provider,
@@ -420,6 +481,7 @@ pub async fn search_hybrid(
         rrf_k,
         stored_dim,
         vector_candidates,
+        filter_during_scan_enabled,
         None,
     )
     .await
@@ -427,6 +489,7 @@ pub async fn search_hybrid(
 
 /// Perform hybrid search using stores retained by a reusable search context.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) async fn search_hybrid_with_stores(
     index_dir: &Path,
     provider: &impl EmbeddingProvider,
@@ -439,6 +502,9 @@ pub(crate) async fn search_hybrid_with_stores(
     vector_candidates: usize,
     stores: Arc<SearchStores>,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    let filter_during_scan_enabled = crate::config::VeraConfig::default()
+        .retrieval
+        .vector_filter_during_scan_enabled();
     search_hybrid_inner(
         index_dir,
         provider,
@@ -449,6 +515,39 @@ pub(crate) async fn search_hybrid_with_stores(
         rrf_k,
         stored_dim,
         vector_candidates,
+        filter_during_scan_enabled,
+        Some(stores),
+    )
+    .await
+}
+
+/// Perform hybrid search using stores + explicit filter-during-scan flag.
+/// SearchContext uses this to respect file-config + env precedence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_hybrid_with_stores_and_flag(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    vector_candidates: usize,
+    stores: Arc<SearchStores>,
+    filter_during_scan_enabled: bool,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_inner(
+        index_dir,
+        provider,
+        bm25_query,
+        vector_query,
+        filters,
+        limit,
+        rrf_k,
+        stored_dim,
+        vector_candidates,
+        filter_during_scan_enabled,
         Some(stores),
     )
     .await
@@ -465,6 +564,7 @@ async fn search_hybrid_inner(
     rrf_k: f64,
     stored_dim: usize,
     vector_candidates: usize,
+    filter_during_scan_enabled: bool,
     stores: Option<Arc<SearchStores>>,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
     let query_type = classify_query(bm25_query);
@@ -572,110 +672,182 @@ async fn search_hybrid_inner(
         _ => (true, usize::MAX),
     };
 
-    let vector_fetch = if filters.is_empty() {
-        // Unfiltered: use the query-type-aware candidate count, clamped to the index.
-        let base = vector_candidates.min(index_count);
-        if is_flat { base } else { base.min(MAX_KNN_K) }
-    } else if is_flat {
-        // Flat filtered: fetch the whole index so post-filtering can reach any chunk.
-        index_count
-    } else {
-        // vec0 filtered: fetch as many as the backend allows (cap) to maximize recall.
-        index_count.min(MAX_KNN_K)
-    };
-
-    // Use the shared candidate_pool helper so the diagnostic cap arithmetic cannot drift from the
-    // vector layer's actual fetching logic.
-    let (clamped_requested, fetched_for_diag) =
-        crate::retrieval::vector::candidate_pool(vector_fetch, index_count, is_flat);
-
-    let vector_outcome = match (stores, vector_store_cached, vector_store_direct) {
-        (Some(stores), Some(vector_store), _) => {
-            match search_vector_with_cached_stores_timed(
-                vector_store.as_ref(),
-                &stores.vector_metadata,
-                provider,
-                vector_query,
-                vector_fetch,
-            )
-            .await
-            {
-                Ok((mut results, embed_elapsed)) => {
-                    if !filters.is_empty() {
-                        results.retain(|result| filters.matches(result));
+    // Filter-during-scan fast path (default OFF, gated by config+env).
+    // When eligible, this builds (or reuses) the per-store EligibilityMap,
+    // resolves the query's path/language eligibility via the DISTINCT table,
+    // and scans only eligible rows, hydrating only top-K.
+    // Any doubt (stale map, resolution error, generation mismatch, vec0)
+    // falls back to the legacy whole-index fetch below.
+    let mut optimized_outcome: Option<Result<(Vec<SearchResult>, Duration), VectorSearchError>> =
+        None;
+    #[allow(clippy::collapsible_if)]
+    if filter_during_scan_enabled && !filters.is_empty() && is_flat && is_map_evaluable(filters) {
+        if let Some(stores_arc) = &stores {
+            // Eligibility map is per-store+generation, lazily built on first
+            // supported filtered query and invalidated via MetadataDbStamp and
+            // VectorStoreStamp (generation/manifest).
+            match stores_arc.eligibility_map() {
+                Ok(map) => match resolve_query_eligibility(&map, filters) {
+                    Ok(query_elig) if query_elig.is_empty() => {
+                        // Honest empty: nothing can match, no scan, no warning.
+                        optimized_outcome = Some(Ok((Vec::new(), Duration::ZERO)));
                     }
-                    let has_matches = if filters.is_empty() {
-                        false
-                    } else {
-                        stores
-                            .vector_metadata
-                            .lock()
-                            .ok()
-                            .and_then(|m| m.has_filter_matches(filters).ok())
-                            .unwrap_or(false)
-                    };
-                    emit_vec0_truncation_warning(
-                        is_flat,
-                        index_count,
-                        clamped_requested,
-                        fetched_for_diag,
-                        filters.is_empty(),
-                        has_matches,
-                    );
-                    Ok((results, embed_elapsed))
-                }
-                Err(err) => Err(err),
-            }
-        }
-        (Some(_), None, _) => Err(VectorSearchError::StorageError(
-            vector_store_error
-                .map(|e| e.context("failed to open vector store"))
-                .unwrap_or_else(|| anyhow::anyhow!("failed to open vector store")),
-        )),
-        (None, _, Some(vector_store)) => {
-            let vector_metadata_result = MetadataStore::open(&index_dir.join("metadata.db"))
-                .context("failed to open metadata store");
-            match vector_metadata_result {
-                Ok(vector_metadata) => {
-                    match search_vector_with_stores_timed(
-                        &vector_store,
-                        &vector_metadata,
-                        provider,
-                        vector_query,
-                        vector_fetch,
-                    )
-                    .await
-                    {
-                        Ok((mut results, embed_elapsed)) => {
-                            if !filters.is_empty() {
-                                results.retain(|result| filters.matches(result));
+                    Ok(query_elig) => {
+                        // Limit for filtered scan: same candidate pool that an
+                        // unfiltered query would have used, clamped to the index.
+                        // This keeps hydration to 1-2 batches (filtered top-K)
+                        // instead of 567 batches for a 509k index.
+                        let filtered_limit = vector_candidates.min(index_count);
+                        if let Some(cached_vs) = &vector_store_cached {
+                            let filtered_res = search_vector_with_cached_stores_filtered_timed(
+                                cached_vs.as_ref(),
+                                &stores_arc.vector_metadata,
+                                provider,
+                                vector_query,
+                                filtered_limit,
+                                &map,
+                                &query_elig,
+                            )
+                            .await;
+                            match filtered_res {
+                                Ok(ok) => optimized_outcome = Some(Ok(ok)),
+                                Err(e) => {
+                                    let msg = format!("{e:#}");
+                                    let is_stale = msg.contains("eligibility")
+                                        || msg.contains("map length")
+                                        || msg.contains("flat vector")
+                                        || msg.contains("generation")
+                                        || msg.contains("STale")
+                                        || msg.contains("stale");
+                                    if is_stale {
+                                        // Treat stale/inconsistent map as fallback
+                                        optimized_outcome = None;
+                                    } else {
+                                        optimized_outcome = Some(Err(e));
+                                    }
+                                }
                             }
-                            let has_matches = if filters.is_empty() {
-                                false
-                            } else {
-                                vector_metadata.has_filter_matches(filters).unwrap_or(false)
-                            };
-                            emit_vec0_truncation_warning(
-                                is_flat,
-                                index_count,
-                                clamped_requested,
-                                fetched_for_diag,
-                                filters.is_empty(),
-                                has_matches,
-                            );
-                            Ok((results, embed_elapsed))
                         }
-                        Err(err) => Err(err),
                     }
+                    Err(_) => {
+                        // Resolution doubt -> fallback
+                    }
+                },
+                Err(_) => {
+                    // Missing/stale/inconsistent map -> fallback
                 }
-                Err(err) => Err(VectorSearchError::StorageError(err)),
             }
         }
-        (None, _, None) => Err(VectorSearchError::StorageError(
-            vector_store_error
-                .map(|e| e.context("failed to open vector store"))
-                .unwrap_or_else(|| anyhow::anyhow!("failed to open vector store")),
-        )),
+    }
+
+    let vector_outcome = if let Some(outcome) = optimized_outcome {
+        outcome
+    } else {
+        let vector_fetch = if filters.is_empty() {
+            // Unfiltered: use the query-type-aware candidate count, clamped to the index.
+            let base = vector_candidates.min(index_count);
+            if is_flat { base } else { base.min(MAX_KNN_K) }
+        } else if is_flat {
+            // Flat filtered: fetch the whole index so post-filtering can reach any chunk.
+            index_count
+        } else {
+            // vec0 filtered: fetch as many as the backend allows (cap) to maximize recall.
+            index_count.min(MAX_KNN_K)
+        };
+
+        // Use the shared candidate_pool helper so the diagnostic cap arithmetic cannot drift from the
+        // vector layer's actual fetching logic.
+        let (clamped_requested, fetched_for_diag) =
+            crate::retrieval::vector::candidate_pool(vector_fetch, index_count, is_flat);
+
+        match (stores, vector_store_cached, vector_store_direct) {
+            (Some(stores), Some(vector_store), _) => {
+                match search_vector_with_cached_stores_timed(
+                    vector_store.as_ref(),
+                    &stores.vector_metadata,
+                    provider,
+                    vector_query,
+                    vector_fetch,
+                )
+                .await
+                {
+                    Ok((mut results, embed_elapsed)) => {
+                        if !filters.is_empty() {
+                            results.retain(|result| filters.matches(result));
+                        }
+                        let has_matches = if filters.is_empty() {
+                            false
+                        } else {
+                            stores
+                                .vector_metadata
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.has_filter_matches(filters).ok())
+                                .unwrap_or(false)
+                        };
+                        emit_vec0_truncation_warning(
+                            is_flat,
+                            index_count,
+                            clamped_requested,
+                            fetched_for_diag,
+                            filters.is_empty(),
+                            has_matches,
+                        );
+                        Ok((results, embed_elapsed))
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            (Some(_), None, _) => Err(VectorSearchError::StorageError(
+                vector_store_error
+                    .map(|e| e.context("failed to open vector store"))
+                    .unwrap_or_else(|| anyhow::anyhow!("failed to open vector store")),
+            )),
+            (None, _, Some(vector_store)) => {
+                let vector_metadata_result = MetadataStore::open(&index_dir.join("metadata.db"))
+                    .context("failed to open metadata store");
+                match vector_metadata_result {
+                    Ok(vector_metadata) => {
+                        match search_vector_with_stores_timed(
+                            &vector_store,
+                            &vector_metadata,
+                            provider,
+                            vector_query,
+                            vector_fetch,
+                        )
+                        .await
+                        {
+                            Ok((mut results, embed_elapsed)) => {
+                                if !filters.is_empty() {
+                                    results.retain(|result| filters.matches(result));
+                                }
+                                let has_matches = if filters.is_empty() {
+                                    false
+                                } else {
+                                    vector_metadata.has_filter_matches(filters).unwrap_or(false)
+                                };
+                                emit_vec0_truncation_warning(
+                                    is_flat,
+                                    index_count,
+                                    clamped_requested,
+                                    fetched_for_diag,
+                                    filters.is_empty(),
+                                    has_matches,
+                                );
+                                Ok((results, embed_elapsed))
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(VectorSearchError::StorageError(err)),
+                }
+            }
+            (None, _, None) => Err(VectorSearchError::StorageError(
+                vector_store_error
+                    .map(|e| e.context("failed to open vector store"))
+                    .unwrap_or_else(|| anyhow::anyhow!("failed to open vector store")),
+            )),
+        }
     };
     let embed_elapsed = vector_outcome
         .as_ref()
@@ -797,6 +969,7 @@ pub async fn search_hybrid_reranked(
 
 /// Perform reranked hybrid search using stores retained by a reusable context.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) async fn search_hybrid_reranked_with_stores(
     index_dir: &Path,
     provider: &impl EmbeddingProvider,
@@ -827,6 +1000,49 @@ pub(crate) async fn search_hybrid_reranked_with_stores(
         rerank_candidates,
         vector_candidates,
         graph_augmentation_enabled,
+        crate::config::VeraConfig::default()
+            .retrieval
+            .vector_filter_during_scan_enabled(),
+        Some(stores),
+    )
+    .await
+}
+
+/// Flagged variant respecting config-override for filter-during-scan.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) async fn search_hybrid_reranked_with_stores_and_flag(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    reranker: &impl Reranker,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    fetch_limit: usize,
+    result_limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    rerank_candidates: usize,
+    vector_candidates: usize,
+    graph_augmentation_enabled: bool,
+    stores: Arc<SearchStores>,
+    filter_during_scan_enabled: bool,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_reranked_inner(
+        index_dir,
+        provider,
+        reranker,
+        bm25_query,
+        vector_query,
+        filters,
+        fetch_limit,
+        result_limit,
+        rrf_k,
+        stored_dim,
+        rerank_candidates,
+        vector_candidates,
+        graph_augmentation_enabled,
+        filter_during_scan_enabled,
         Some(stores),
     )
     .await
@@ -863,7 +1079,48 @@ pub(crate) async fn search_hybrid_reranked_with_augmentation(
         rerank_candidates,
         vector_candidates,
         graph_augmentation_enabled,
+        crate::config::VeraConfig::default()
+            .retrieval
+            .vector_filter_during_scan_enabled(),
         None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_hybrid_reranked_with_augmentation_and_flag(
+    index_dir: &Path,
+    provider: &impl EmbeddingProvider,
+    reranker: &impl Reranker,
+    bm25_query: &str,
+    vector_query: &str,
+    filters: &SearchFilters,
+    fetch_limit: usize,
+    result_limit: usize,
+    rrf_k: f64,
+    stored_dim: usize,
+    rerank_candidates: usize,
+    vector_candidates: usize,
+    graph_augmentation_enabled: bool,
+    stores: Arc<SearchStores>,
+    filter_during_scan_enabled: bool,
+) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
+    search_hybrid_reranked_inner(
+        index_dir,
+        provider,
+        reranker,
+        bm25_query,
+        vector_query,
+        filters,
+        fetch_limit,
+        result_limit,
+        rrf_k,
+        stored_dim,
+        rerank_candidates,
+        vector_candidates,
+        graph_augmentation_enabled,
+        filter_during_scan_enabled,
+        Some(stores),
     )
     .await
 }
@@ -883,13 +1140,14 @@ async fn search_hybrid_reranked_inner(
     rerank_candidates: usize,
     vector_candidates: usize,
     graph_augmentation_enabled: bool,
+    filter_during_scan_enabled: bool,
     stores: Option<Arc<SearchStores>>,
 ) -> Result<(Vec<SearchResult>, HybridTimings), HybridSearchError> {
     let fusion_limit = rerank_candidates.max(fetch_limit);
 
     let (mut hybrid_results, mut timings) = match stores {
         Some(stores) => {
-            search_hybrid_with_stores(
+            search_hybrid_with_stores_and_flag(
                 index_dir,
                 provider,
                 bm25_query,
@@ -900,11 +1158,16 @@ async fn search_hybrid_reranked_inner(
                 stored_dim,
                 vector_candidates,
                 stores,
+                filter_during_scan_enabled,
             )
             .await?
         }
         None => {
-            search_hybrid(
+            // Direct path: respect the flag via default-config env (no SearchStores cache)
+            let flag = crate::config::VeraConfig::default()
+                .retrieval
+                .vector_filter_during_scan_enabled();
+            search_hybrid_inner(
                 index_dir,
                 provider,
                 bm25_query,
@@ -914,6 +1177,8 @@ async fn search_hybrid_reranked_inner(
                 rrf_k,
                 stored_dim,
                 vector_candidates,
+                flag,
+                None,
             )
             .await?
         }

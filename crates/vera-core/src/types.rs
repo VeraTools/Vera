@@ -171,7 +171,7 @@ impl SearchFilters {
 ///
 /// Supports common patterns: `*.rs`, `src/**/*.ts`, `**/test_*`.
 /// Does not support character classes or brace expansion.
-fn glob_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
     // Normalize separators.
     let pattern = pattern.replace('\\', "/");
     let path = path.replace('\\', "/");

@@ -259,6 +259,22 @@ impl FlatStorage {
         };
         scan_snapshot(snapshot, query, limit)
     }
+
+    fn search_filtered(
+        &mut self,
+        conn: &Connection,
+        query: &[f32],
+        limit: usize,
+        map: &crate::storage::eligibility::EligibilityMap,
+        query_elig: &crate::storage::eligibility::QueryEligibility,
+    ) -> Result<Vec<DistanceCandidate>> {
+        self.refresh(conn)?;
+        let snapshot = match self {
+            Self::Disk(storage) => &storage.snapshot,
+            Self::Memory(storage) => &storage.snapshot,
+        };
+        scan_snapshot_filtered(snapshot, query, limit, map, query_elig)
+    }
 }
 
 impl MemoryFlatStorage {
@@ -376,6 +392,78 @@ fn scan_snapshot(
             < *heap
                 .peek()
                 .context("flat top-k heap is unexpectedly empty")?
+        {
+            heap.pop();
+            heap.push(candidate);
+        }
+    }
+
+    let mut results: Vec<_> = heap.into_vec();
+    results.sort();
+    Ok(results)
+}
+
+fn scan_snapshot_filtered(
+    snapshot: &FlatSnapshot,
+    query: &[f32],
+    limit: usize,
+    map: &crate::storage::eligibility::EligibilityMap,
+    query_elig: &crate::storage::eligibility::QueryEligibility,
+) -> Result<Vec<DistanceCandidate>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if query_elig.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dim = snapshot.manifest.dim;
+    if dim == 0 || query.len() != dim {
+        anyhow::bail!(
+            "flat vector snapshot dimension mismatch: expected {}, got {}",
+            dim,
+            query.len()
+        );
+    }
+    // Check map length vs snapshot vector count.
+    let values_len = snapshot.data.as_slice().len();
+    let available = values_len / dim;
+    // Map's max_rowid should match available count (or superset). If map is smaller, treat as stale -> caller should have fallen back.
+    // Here we clamp available to min of map length and snapshot.
+    let map_len = map.path_ids.len();
+    let check_len = available.min(map_len);
+    // If map is inconsistent, return error to trigger fallback.
+    if map_len != available && (map.max_rowid as usize) != available {
+        anyhow::bail!(
+            "eligibility map length {} does not match vector count {}",
+            map_len,
+            available
+        );
+    }
+    let max_k = limit.min(available);
+    if max_k == 0 {
+        return Ok(Vec::new());
+    }
+    // Fast path: if query eligibility is empty we already returned; if All we could delegate, but keep uniform.
+    let values = snapshot.data.as_slice();
+    let mut heap = BinaryHeap::with_capacity(max_k);
+    for (index, vector) in values.chunks_exact(dim).enumerate() {
+        if index >= check_len {
+            break;
+        }
+        let rowid = index as i64 + 1;
+        if is_tombstoned(&snapshot.tombstones, rowid) {
+            continue;
+        }
+        if !crate::storage::eligibility::is_row_eligible(map, query_elig, index) {
+            continue;
+        }
+        let distance = f32::euclidean(query, vector)
+            .context("SimSIMD returned no distance for equal vector dimensions")?;
+        let candidate = DistanceCandidate { rowid, distance };
+        if heap.len() < max_k {
+            heap.push(candidate);
+        } else if let Some(top) = heap.peek()
+            && candidate < *top
         {
             heap.pop();
             heap.push(candidate);
@@ -1416,6 +1504,51 @@ impl VectorStore {
                 Ok(VectorSearchResult {
                     chunk_id,
                     distance: *distance,
+                })
+            })
+            .collect()
+    }
+
+    /// Filtered flat search using the eligibility map (filter-during-scan).
+    /// Returns up to `limit` eligible results sorted by distance. Callers must
+    /// have already verified `is_flat` and that the filter set is map-evaluable.
+    /// An empty eligibility (no match) returns empty without scanning.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        map: &crate::storage::eligibility::EligibilityMap,
+        query_elig: &crate::storage::eligibility::QueryEligibility,
+    ) -> Result<Vec<VectorSearchResult>> {
+        if query.len() != self.dim {
+            anyhow::bail!(
+                "query vector dimension mismatch: expected {}, got {}",
+                self.dim,
+                query.len()
+            );
+        }
+        if query_elig.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.scan_mode != VectorScanMode::Flat {
+            anyhow::bail!("filtered scan is only available on the flat backend");
+        }
+        let mut flat = self
+            .flat
+            .lock()
+            .map_err(|_| anyhow::anyhow!("flat vector storage lock poisoned"))?;
+        let hits = flat.search_filtered(&self.conn, query, limit, map, query_elig)?;
+        let rowids: Vec<i64> = hits.iter().map(|hit| hit.rowid).collect();
+        let chunk_ids = self.chunk_ids_for_rowids(&rowids)?;
+        hits.iter()
+            .map(|hit| {
+                let chunk_id = chunk_ids
+                    .get(&hit.rowid)
+                    .with_context(|| format!("failed to map rowid {} to chunk_id", hit.rowid))?
+                    .clone();
+                Ok(VectorSearchResult {
+                    chunk_id,
+                    distance: hit.distance,
                 })
             })
             .collect()
