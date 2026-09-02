@@ -132,7 +132,15 @@ fn classify_launch_entry(
         return Some(LaunchEntry::Shim);
     }
     // Decodable text that is not one of our templates belongs to someone else.
-    let is_cargo_binary = read_as_text.is_err()
+    //
+    // The cargo arm needs evidence of its own, and the only evidence available
+    // is where the file sits: `cargo install` writes to `~/.cargo/bin`, so an
+    // unreadable executable named `vera` there is a cargo artifact by
+    // construction. In the other candidate directories it is just somebody
+    // else's program with the same name. Checking the executable *format*
+    // would not help, because any binary named `vera` passes that too.
+    let is_cargo_binary = entry.parent().is_some_and(is_cargo_bin_dir)
+        && read_as_text.is_err()
         && fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file())
         && is_executable(entry);
     is_cargo_binary.then_some(LaunchEntry::CargoBinary)
@@ -204,6 +212,17 @@ fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path
         .is_some_and(|resolved| is_our_binary(&resolved, recorded, vera_home))
 }
 
+/// Whether a directory is where `cargo install` places binaries.
+fn is_cargo_bin_dir(dir: &Path) -> bool {
+    let normalized = lexically_normalize(dir);
+    let mut components = normalized
+        .components()
+        .rev()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned());
+    components.next().is_some_and(|last| last == "bin")
+        && components.next().is_some_and(|parent| parent == ".cargo")
+}
+
 /// Executability where the platform tracks it. Windows has no file mode bit;
 /// membership among the exact entry names above is what restricts candidates.
 fn is_executable(path: &Path) -> bool {
@@ -237,7 +256,15 @@ pub fn run(json_output: bool) -> Result<()> {
         .and_then(|provenance| provenance.binary_path)
         .map(PathBuf::from);
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    let user_bin_dir = configured_user_bin_dir();
+    // A relative override would otherwise be compared against absolute paths
+    // when a symlink chain is resolved, so an owned relative link survives.
+    let user_bin_dir = configured_user_bin_dir().map(|dir| {
+        if dir.is_absolute() {
+            dir
+        } else {
+            cwd.join(dir)
+        }
+    });
 
     run_at(
         InstallLayout {
@@ -971,6 +998,93 @@ mod tests {
             entry.symlink_metadata().is_err(),
             "an alias through a deleted intermediate stayed on PATH: {stderr}"
         );
+    }
+
+    /// An unreadable executable named `vera` is only evidence of a cargo
+    /// install where cargo puts one. Elsewhere it is somebody else's program
+    /// with the same name, and deleting it is unrecoverable.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_executable_outside_the_cargo_bin_dir_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let roots = roots();
+        // Same bytes, same permissions, two locations.
+        let cargo_bin = roots.home.join(".cargo").join("bin");
+        let other_bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&cargo_bin).unwrap();
+        fs::create_dir_all(&other_bin).unwrap();
+        let ours = cargo_bin.join("vera");
+        let theirs = other_bin.join("vera");
+        for path in [&ours, &theirs] {
+            fs::write(path, [0x7f, b'E', b'L', b'F', 0xcf]).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (_, stderr) = uninstall(&roots, false);
+
+        assert!(
+            !ours.exists(),
+            "the cargo-installed binary stayed: {stderr}"
+        );
+        assert!(
+            theirs.exists(),
+            "deleted an unreadable executable that cargo never wrote: {stderr}"
+        );
+    }
+
+    #[test]
+    fn only_cargos_own_bin_directory_counts_as_cargo() {
+        assert!(is_cargo_bin_dir(Path::new("/home/u/.cargo/bin")));
+        assert!(is_cargo_bin_dir(Path::new("/home/u/.cargo/./bin")));
+        assert!(!is_cargo_bin_dir(Path::new("/home/u/.local/bin")));
+        assert!(!is_cargo_bin_dir(Path::new("/home/u/cargo/bin")));
+        assert!(!is_cargo_bin_dir(Path::new("/home/u/.cargo/bin/nested")));
+    }
+
+    /// A relative `VERA_USER_BIN_DIR` leaves a resolved symlink target relative
+    /// too, so comparing it against the absolute Vera home fails and an owned
+    /// link survives.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_user_bin_dir_is_resolved_before_comparison() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let entry = bin.join("vera");
+        std::os::unix::fs::symlink(roots.vera_home.join("bin").join("vera"), &entry).unwrap();
+
+        // The override arrives relative; `run` must resolve it against cwd.
+        let relative = pathdiff_from(&roots.cwd, &bin);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_at(
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(&roots.cwd.join(&relative)),
+                recorded_binary: None,
+            },
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert!(
+            entry.symlink_metadata().is_err(),
+            "an owned link under a relative bin dir stayed on PATH"
+        );
+    }
+
+    /// Naive relative path from `base` to `target`, enough for the fixture.
+    #[cfg(unix)]
+    fn pathdiff_from(base: &Path, target: &Path) -> PathBuf {
+        let mut up = PathBuf::new();
+        for _ in base.components().skip(1) {
+            up.push("..");
+        }
+        up.join(target.strip_prefix("/").unwrap_or(target))
     }
 
     /// A chain that never terminates must not hang the uninstall.
