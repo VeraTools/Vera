@@ -90,17 +90,22 @@ fn shim_target(text: &str) -> Option<&str> {
         })
 }
 
-/// Whether a launcher path is the one this installation put there.
+/// Whether a launcher path is one this installation put there.
 ///
-/// The recorded path is authoritative: `install.json` carries `binary_path`,
-/// which is what `upgrade` already uses to find the installed executable.
-/// Without a record, containment in the Vera home is the fallback, which is
-/// still an exact question about a path rather than a guess about a script.
+/// Two ways to qualify, and either is enough. The recorded path is
+/// authoritative: `install.json` carries `binary_path`, which is what `upgrade`
+/// already uses to find the installed executable. Containment in the Vera home
+/// qualifies as well, and not only as a fallback when nothing was recorded.
+///
+/// That second arm carries weight: step 2 removes the Vera home before this
+/// runs, so a chain through an intermediate link inside it, such as
+/// `PATH/vera -> ~/.vera/current -> <recorded binary>`, resolves only as far as
+/// the link that has just been deleted. Requiring an exact match against the
+/// recorded path would leave that alias on PATH. A path inside our own
+/// directory is ours whether or not it is the one we wrote down.
 fn is_our_binary(target: &Path, recorded: Option<&Path>, vera_home: &Path) -> bool {
-    match recorded {
-        Some(recorded) => lexically_normalize(target) == lexically_normalize(recorded),
-        None => is_inside(target, vera_home),
-    }
+    recorded.is_some_and(|recorded| lexically_normalize(target) == lexically_normalize(recorded))
+        || is_inside(target, vera_home)
 }
 
 /// Recognizes a candidate path as a removable Vera launcher, or leaves it
@@ -921,6 +926,53 @@ mod tests {
         );
     }
 
+    /// The Vera home is removed before PATH entries are classified, so a chain
+    /// through an intermediate link inside it resolves only as far as a link
+    /// that no longer exists. That terminal path is still inside our own
+    /// directory, and the alias must still be removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_through_a_deleted_intermediate_is_still_ours() {
+        let roots = roots();
+        let bin = roots.home.join(".local").join("bin");
+        let recorded = roots
+            .vera_home
+            .join("bin")
+            .join("1.3.0")
+            .join("x")
+            .join("vera");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(recorded.parent().unwrap()).unwrap();
+        fs::write(&recorded, "binary").unwrap();
+        // PATH/vera -> <vera_home>/current -> <recorded binary>
+        let middle = roots.vera_home.join("current");
+        std::os::unix::fs::symlink(&recorded, &middle).unwrap();
+        let entry = bin.join("vera");
+        std::os::unix::fs::symlink(&middle, &entry).unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_at(
+            InstallLayout {
+                home: &roots.home,
+                vera_home: &roots.vera_home,
+                cwd: &roots.cwd,
+                user_bin_dir: Some(bin.as_path()),
+                recorded_binary: Some(recorded.as_path()),
+            },
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(
+            entry.symlink_metadata().is_err(),
+            "an alias through a deleted intermediate stayed on PATH: {stderr}"
+        );
+    }
+
     /// A chain that never terminates must not hang the uninstall.
     #[cfg(unix)]
     #[test]
@@ -1013,10 +1065,17 @@ mod tests {
             Some(recorded),
             vera_home
         ));
-        // Without a record, containment in the Vera home is the fallback.
+        // Containment qualifies on its own, with or without a record: an
+        // intermediate link inside the Vera home has already been deleted by
+        // the time a chain is resolved, so it can never match the record.
         assert!(is_our_binary(
             &vera_home.join("bin/1.3.0/x/vera"),
             None,
+            vera_home
+        ));
+        assert!(is_our_binary(
+            &vera_home.join("current"),
+            Some(recorded),
             vera_home
         ));
         assert!(!is_our_binary(
