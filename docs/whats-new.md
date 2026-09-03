@@ -2,6 +2,12 @@
 
 Release highlights from v1.0 onward. For the current benchmark tables and methodology, see [benchmarks.md](benchmarks.md). For the full command surface, see [features.md](features.md).
 
+## v1.3.1
+
+- `vera grep` now prints a path-filter hint when every `--path` pattern matches nothing and suggests a wildcard directory alternative.
+- `vera setup` on Windows now probes Direct3D 12 to decide whether DirectML can run instead of accepting any non-Basic adapter.
+- `vera uninstall` recognizes the installed shim by matching what the installer wrote and handles non-default `CARGO_HOME`.
+
 ## v1.3.0
 
 ### Search correctness
