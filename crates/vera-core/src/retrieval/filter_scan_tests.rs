@@ -18,11 +18,6 @@ fn eligibility_guard() -> std::sync::MutexGuard<'static, ()> {
     crate::test_serial::counter_guard()
 }
 
-#[allow(dead_code)]
-fn hydration_guard() -> std::sync::MutexGuard<'static, ()> {
-    crate::test_serial::counter_guard()
-}
-
 use crate::config::VeraConfig;
 use crate::embedding::test_helpers::MockProvider;
 use crate::retrieval::hybrid::{SearchStores, search_hybrid_with_stores_and_flag};
