@@ -105,7 +105,7 @@ Use `vera grep` when you want exact text or regex matches limited to indexed fil
 - `vera grep "TODO\(" -i`
 - `vera grep "queryClient|invalidateQueries" --path "frontend/src/**"`
 
-Vera uses Rust regex syntax. Use `|` for alternation. `\|` matches a literal pipe. When every `--path` pattern matches zero indexed files, `vera grep` prints a hint to stderr suggesting a wildcard directory alternative (for example `src/**/` instead of `src/`).
+Vera uses Rust regex syntax. Use `|` for alternation. `\|` matches a literal pipe. When every `--path` pattern matches zero-indexed files, `vera grep` prints a hint to stderr suggesting a wildcard directory alternative (for example `src/**/` instead of `src/`).
 
 Use `rg` when you need:
 

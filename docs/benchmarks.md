@@ -6,7 +6,7 @@ This page tracks the current Semble comparison first, then historical snapshots 
 
 Semble-derived runs use the task set from [Semble v0.5.5](https://github.com/MinishLab/semble/tree/v0.5.5) at commit `9218491`: 1,251 tasks across 63 pinned repositories. The converter and corpus manifests pin that commit and record a deterministic task-content hash. The 320-task tuning subset is an unchanged 16-repository slice of the same release.
 
-Vera reports `vera-graded-2-1-task-mean-v1`: primary targets have relevance 2, secondary targets have relevance 1, duplicate matching chunks receive credit once, and scores are averaged over tasks. Historical Semble published tables use binary relevance and repository/language macro averages. The current 2026-08-23 comparison below uses the same graded scorer for both tools. New JSON reports record both the Semble snapshot and metric contract; older reports without those fields are `unknown-legacy` and use Vera's graded calculation.
+Vera reports `vera-graded-2-1-task-mean-v1`: primary targets have relevance 2, secondary targets have relevance 1, duplicate matching chunks receive credit once, and scores are averaged over tasks. Historical Semble published tables use binary relevance and repository/language macro averages. The 2026-09-03 comparison below uses the same graded scorer for both tools. New JSON reports record both the Semble snapshot and metric contract; older reports without those fields are `unknown-legacy` and use Vera's graded calculation.
 
 ## 2026-09-03 Semble Comparison (Vera row refreshed for v1.4.0)
 

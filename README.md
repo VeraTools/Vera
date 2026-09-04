@@ -77,7 +77,7 @@ The default local embedding model is [`minishlab/potion-code-16M-v2`](https://hu
 | | |
 |---|---|
 | **Wins where it was never tuned** | Trails Semble by 0.008 nDCG on Semble's own benchmark set, but leads on the independent contamination set (10 fresh repositories, locally generated ground truth) and on recall@5. Vera refuses ground-truth-specific tuning, which costs home-field points and buys generalization. |
-| **Fast at query time, tiny on disk** | 6.4 ms median query latency on the 1,251-task suite with a 4.7 GB index for 63 repositories (6.8x smaller than Semble's 32 GB). Filter-during-scan, enabled by default in v1.4.0, halves filtered-query latency with ranking unchanged. |
+| **Fast at query time, tiny on disk** | 6.4 ms median query latency on the 1,251-task suite (local Potion Code defaults) with a 4.7 GB index for 63 repositories (6.8x smaller than Semble's 32 GB). Filter-during-scan, enabled by default in v1.4.0, halves filtered-query latency with ranking unchanged. |
 | **Updates, not just re-indexes** | Incremental updates and watch mode keep the index current as files change. Persistent indexes survive restarts and are reused when identity checks pass. |
 | **Single binary, 65 languages** | One static binary with 61 tree-sitter grammars compiled in. No Python, no language servers, no per-language toolchains. |
 | **Built-in code intelligence** | Call graph analysis, reference finding, dead code detection, and project overview, all from the same index. |

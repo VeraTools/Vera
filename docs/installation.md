@@ -225,7 +225,7 @@ pip install --upgrade vera-ai && vera-ai install
 ## Uninstalling
 
 ```bash
-vera uninstall   # removes the entire Vera data directory including the config dir, skill files, PATH shim, binary caches, and downloaded model weights
+vera uninstall   # removes the entire Vera data directory (config, skill files, binary caches, downloaded model weights) and the PATH shim it installed
 ```
 
 ## Troubleshooting

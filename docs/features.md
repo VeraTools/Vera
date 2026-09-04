@@ -158,7 +158,7 @@ Use this as the default structural workflow. Use `vera references` for exact cal
 
 ### Regex Search
 
-`vera grep "pattern"` runs regex search over indexed files with configurable context lines, case sensitivity, and the same corpus filters as `vera search` (`--lang`, `--path`, `--type`, `--scope`). Repeat `--path` to match any of several patterns. When every `--path` pattern matches zero indexed files, Vera prints a stderr hint suggesting the wildcard directory alternative (for example, `crates/vera-core/src/**` instead of `crates/*/src`). It complements semantic search for exact string matching, import statements, TODOs, and known identifiers.
+`vera grep "pattern"` runs regex search over indexed files with configurable context lines, case sensitivity, and the same corpus filters as `vera search` (`--lang`, `--path`, `--type`, `--scope`). Repeat `--path` to match any of several patterns. When every `--path` pattern matches zero-indexed files, Vera prints a stderr hint suggesting the wildcard directory alternative (for example, `crates/vera-core/src/**` instead of `crates/*/src`). It complements semantic search for exact string matching, import statements, TODOs, and known identifiers.
 
 ## Model Backend
 

@@ -3,7 +3,7 @@
 Vera runs in two modes, and both start from the same setup wizard:
 
 - **API mode with the Qwen preset (recommended)**: `qwen/qwen3-embedding-8b` plus `qwen/qwen3-reranker-8b` through OpenRouter with a single shared API key. Measured on the 320-task Semble subset, the Qwen pair with reranking scored `0.8647` nDCG@10 versus `0.8538` for local-only defaults, with recall@1 up three points: the strongest quality configuration Vera ships. Setup is one key entry and the wizard fills the rest.
-- **Local mode with Potion Code (the easy default)**: `minishlab/potion-code-16M-v2` runs locally on CPU on any supported machine, no GPU or ONNX Runtime needed, and indexes the 63-repository Semble corpus in about two minutes. It is what you get with no API key, no account, and no hardware requirements.
+- **Local mode with Potion Code (the easy default)**: `minishlab/potion-code-16M-v2` runs locally on CPU on any supported machine, no GPU or ONNX Runtime needed, and indexes the 63-repository Semble corpus in about two minutes. It is what you get with no API key, no account, and no GPU or ONNX Runtime requirement.
 
 The Qwen numbers above are screening measurements on the tuning subset, not full-suite claims; the honest comparison is that API mode trades a paid endpoint and network latency for measured reranker gains, while local mode is free, private, and fast enough for interactive use.
 
@@ -27,7 +27,7 @@ With reranking disabled, the default Potion Code path uses vector/BM25 fusion pl
 
 ## Embedding Screening
 
-These screening results (2026-08-21/22, pre-dating the ranking-signal improvements of v1.3.0; today's shipped defaults score higher, see [benchmarks.md](benchmarks.md)) use Vera's hybrid retrieval with reranking disabled. The first set has 320 Semble tasks; the independent set has 180 tasks from separate repositories.
+These screening results (2026-08-21/22, pre-dating the ranking-signal improvements of v1.3.0; the v1.4.0 local defaults score 0.8538 on the same subset, see [benchmarks.md](benchmarks.md)) use Vera's hybrid retrieval with reranking disabled. The first set has 320 Semble tasks; the independent set has 180 tasks from separate repositories.
 
 | Model | 320-task nDCG@10 | Independent nDCG@10 | 320-task p50 | Independent p50 | 320-task index | Independent index |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
