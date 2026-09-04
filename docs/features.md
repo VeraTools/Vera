@@ -13,6 +13,8 @@ Every query runs two retrieval paths in parallel:
 
 Results from both paths merge through Reciprocal Rank Fusion (RRF), so a result that scores well in both lists rises to the top. Full details: [how-it-works.md](how-it-works.md).
 
+When a query carries path glob, exact path, or language filters, the flat vector scan skips ineligible chunks before hydration: only eligible chunks compete for the top-K and only the filtered top-K is hydrated. This is on by default and results are byte-identical to the unfiltered path. Control it with `retrieval.vector_filter_during_scan` in config (default `true`) or `VERA_VECTOR_FILTER_DURING_SCAN` in the environment; the env var wins over the config file. The sqlite-vec backend (`VERA_VECTOR_SCAN=vec0`) ignores this knob. Decision record: [adr/008-filter-during-scan-default.md](adr/008-filter-during-scan-default.md).
+
 ### Cross-Encoder Reranking
 
 After fusion, Vera can send the top candidates to a cross-encoder that reads query and candidate together as a single pair. Reranking is controlled by `retrieval.reranking_enabled` and is off by default; the deterministic heuristic stack ranks results when it is disabled.

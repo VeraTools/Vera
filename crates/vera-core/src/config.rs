@@ -428,7 +428,7 @@ pub struct RetrievalConfig {
     /// a lazy per-store eligibility map (chunk row -> path-id, language) is built once per store+generation,
     /// distinct paths are tested against glob filters via `GlobMatcher`, and the flat SIMD scan collects top-K only among eligible rows.
     /// Scope gate: only path globs, exact paths, and language filters are eligible; other dimensions fall back to whole-index fetch.
-    /// Default OFF (0) — flipped only via evidence-backed PR; env authoritative `VERA_VECTOR_FILTER_DURING_SCAN`.
+    /// Default ON (1) since the r5 evidence-backed flip (issue #197); env override `VERA_VECTOR_FILTER_DURING_SCAN` authoritative.
     #[serde(default = "default_vector_filter_during_scan")]
     pub vector_filter_during_scan: bool,
 }
@@ -586,15 +586,21 @@ fn default_ranking_candidate_pool_multiplier() -> bool {
 }
 
 fn default_vector_filter_during_scan() -> bool {
-    // Default OFF at implementation; flipped only via evidence-backed PR.
+    // Default ON since the r5 evidence-backed flip (issue #197). The r5
+    // preregistered decision round at 98e6e50 (3 flag-on + 3 flag-off
+    // full-suite runs) passed all three gates: mechanism control (p50 delta
+    // 5.651 ms > 0.6, p95 delta 74.090 ms > 5), same-head nDCG parity
+    // (|delta| 0.0000049 <= 0.001), and absolute latency acceptance (p50
+    // 6.353 ms <= 7.38, p95 65.034 ms <= 65.88 vs the 072c725 9800X3D
+    // baseline 7.879/60.880). Evidence: docs/adr/008-filter-during-scan-default.md.
     // Alias set and precedence match `vector_filter_during_scan_enabled`
     // (per alias-discipline convention): first wins, identical order.
     for key in ["VERA_VECTOR_FILTER_DURING_SCAN"] {
         if std::env::var(key).is_ok() {
-            return env_bool(key, false);
+            return env_bool(key, true);
         }
     }
-    false
+    true
 }
 
 impl Default for RetrievalConfig {
@@ -734,7 +740,8 @@ impl RetrievalConfig {
     }
 
     /// Filter-during-scan optimization enabled, with env-var override.
-    /// Default OFF; env `VERA_VECTOR_FILTER_DURING_SCAN` authoritative.
+    /// Default ON since the r5 evidence-backed flip (issue #197);
+    /// env `VERA_VECTOR_FILTER_DURING_SCAN` authoritative.
     /// Alias set and precedence identical to `default_vector_filter_during_scan`.
     pub fn vector_filter_during_scan_enabled(&self) -> bool {
         for key in ["VERA_VECTOR_FILTER_DURING_SCAN"] {
@@ -2518,34 +2525,34 @@ card0, 1073741824, 4294967296\n";
 
     // ── Filter-during-scan knob (#197) ──
     #[test]
-    fn vector_filter_default_off() {
+    fn vector_filter_default_on() {
         run_env_test(
-            "config::tests::vector_filter_default_off_probe",
+            "config::tests::vector_filter_default_on_probe",
             &[("VERA_VECTOR_FILTER_DURING_SCAN", None)],
         );
     }
 
     #[test]
-    #[ignore = "driven by vector_filter_default_off"]
-    fn vector_filter_default_off_probe() {
+    #[ignore = "driven by vector_filter_default_on"]
+    fn vector_filter_default_on_probe() {
         assert!(std::env::var("VERA_VECTOR_FILTER_DURING_SCAN").is_err());
-        assert!(!default_vector_filter_during_scan());
-        assert!(!RetrievalConfig::default().vector_filter_during_scan);
+        assert!(default_vector_filter_during_scan());
+        assert!(RetrievalConfig::default().vector_filter_during_scan);
         assert!(
-            !RetrievalConfig::default().vector_filter_during_scan_enabled(),
-            "default must be OFF"
+            RetrievalConfig::default().vector_filter_during_scan_enabled(),
+            "default must be ON"
         );
         assert!(
-            !VeraConfig::default()
+            VeraConfig::default()
                 .retrieval
                 .vector_filter_during_scan_enabled(),
-            "VeraConfig default must be OFF"
+            "VeraConfig default must be ON"
         );
-        // Legacy JSON without field defaults to false.
+        // Legacy JSON without field defaults to true (r5-flipped default).
         let legacy = r#"{"default_limit":5,"rrf_k":60.0,"rerank_candidates":50,"reranking_enabled":false,"max_rerank_batch":20,"max_output_chars":0}"#;
         let rcfg: RetrievalConfig = serde_json::from_str(legacy).unwrap();
-        assert!(!rcfg.vector_filter_during_scan);
-        assert!(!rcfg.vector_filter_during_scan_enabled());
+        assert!(rcfg.vector_filter_during_scan);
+        assert!(rcfg.vector_filter_during_scan_enabled());
     }
 
     #[test]
