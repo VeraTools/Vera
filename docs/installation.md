@@ -7,12 +7,13 @@ For the short path, use the [Quick Start](../README.md#quick-start) in the READM
 Pick whichever package manager you have:
 
 ```bash
-bunx @vera-ai/cli install   # Bun
-npx -y @vera-ai/cli install # npm
-uvx vera-ai install          # Python (uv)
+bunx @vera-ai/cli install               # Bun
+npx -y @vera-ai/cli install             # npm
+uvx vera-ai install                     # Python (uv)
+pip install vera-ai && vera-ai install  # Python (pip)
 ```
 
-The installer downloads the `vera` binary for your platform, writes a shim to a user bin directory, and installs global agent skill files. After that, `vera` is a standalone command.
+The installer downloads the `vera` binary for your platform, writes a shim to a user bin directory, and delegates to `vera agent install`, which launches an interactive scope and client selector to install skill files. After that, `vera` is a standalone command.
 
 <details>
 <summary>Other install methods</summary>
@@ -217,12 +218,14 @@ bun install -g @vera-ai/cli && bunx @vera-ai/cli install
 npm install -g @vera-ai/cli && npx @vera-ai/cli install
 # uv
 uvx vera-ai install
+# pip
+pip install --upgrade vera-ai && vera-ai install
 ```
 
 ## Uninstalling
 
 ```bash
-vera uninstall   # removes config dir, skill files, PATH shim
+vera uninstall   # removes the entire Vera data directory (config, skill files, binary caches, downloaded model weights) and the PATH shim it installed
 ```
 
 ## Troubleshooting
