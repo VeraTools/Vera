@@ -1086,7 +1086,9 @@ async fn filter_combined_path_and_lang() {
 // ── 6. Hybrid RRF + filter integration ──────────────────────────────
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn hybrid_rrf_with_filters() {
+    let _guard = crate::test_serial::counter_guard();
     let (bm25, meta, vec_store, _, provider, _) = setup_indexed_corpus().await;
 
     // Get BM25 results.

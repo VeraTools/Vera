@@ -672,7 +672,7 @@ async fn search_hybrid_inner(
         _ => (true, usize::MAX),
     };
 
-    // Filter-during-scan fast path (default OFF, gated by config+env).
+    // Filter-during-scan fast path (default ON since PR #268, overridable via config+env).
     // When eligible, this builds (or reuses) the per-store EligibilityMap,
     // resolves the query's path/language eligibility via the DISTINCT table,
     // and scans only eligible rows, hydrating only top-K.
