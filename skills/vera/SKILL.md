@@ -5,7 +5,7 @@ description: Code search over the current repository. Before reading files to an
 
 # Vera
 
-Ranked code search over an indexed repository. Results are markdown codeblocks: `path:line_start-line_end symbol_type:symbol_name`, then the code.
+Ranked code search over an indexed repository. Results are markdown codeblocks: `path:line_start-line_end symbol_type:symbol_name` (split symbols render as `name (part N)` in that position, the bare name plus the part suffix), then the code.
 
 ## Pick the tool
 
@@ -15,10 +15,13 @@ Ranked code search over an indexed repository. Results are markdown codeblocks: 
 | Read files to understand how something works | `vera search "env file loading decision"` |
 | Find documentation on a topic | `vera search "deploying behind proxy" --scope docs` |
 | Find every occurrence of a pattern | `vera grep "TODO\|FIXME"` |
+| `vera grep` with `--path` matches nothing | Check stderr: when every `--path` pattern matches zero indexed files, Vera suggests a wildcard directory alternative (for example `src/**/` instead of `src/`) |
 | Find callers or callees of a symbol | `vera references make_config` |
 | Find definitions, routes, env reads | `vera structural env` / `vera structural routes` |
 | Edit the same pattern in many files | `rg` |
 | Read a file you already know | Read it directly |
+
+`vera references` resolves split-symbol call sites, `vera structural definitions` finds split symbols by bare name and deduplicates to the earliest declaration, and `vera dead-code` deduplicates split parts by (symbol, file).
 
 ## Do not use Vera when
 

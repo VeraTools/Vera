@@ -19,7 +19,7 @@ When a query carries path glob, exact path, or language filters, the flat vector
 
 After fusion, Vera can send the top candidates to a cross-encoder that reads query and candidate together as a single pair. Reranking is controlled by `retrieval.reranking_enabled` and is off by default; the deterministic heuristic stack ranks results when it is disabled.
 
-Vera supports local cross-encoders (Jina) and remote reranking endpoints (Jina, Cohere, or Voyage AI `rerank-2` with `RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1`, with wire format handled automatically).
+Vera supports local cross-encoders (Jina) and remote reranking endpoints (Jina, Cohere, or Voyage AI `rerank-2` with `RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1`). The reranker wire protocol is configured via `retrieval.reranker_protocol` (`generic` with `top_n`/`results` or `voyage` with `top_k`/`data`); Vera auto-detects the variant from the reranker hostname and `retrieval.reranker_protocol` overrides it explicitly.
 
 The 2026-08-23 dual-set screening found no cross-encoder improvement over the no-reranker baseline. See [models.md](models.md#reranking) for the scores and the recommended `mxbai-rerank-xsmall-v1` local override.
 
@@ -158,7 +158,7 @@ Use this as the default structural workflow. Use `vera references` for exact cal
 
 ### Regex Search
 
-`vera grep "pattern"` runs regex search over indexed files with configurable context lines, case sensitivity, and the same corpus filters as `vera search` (`--lang`, `--path`, `--type`, `--scope`). Repeat `--path` to match any of several patterns. It complements semantic search for exact string matching, import statements, TODOs, and known identifiers.
+`vera grep "pattern"` runs regex search over indexed files with configurable context lines, case sensitivity, and the same corpus filters as `vera search` (`--lang`, `--path`, `--type`, `--scope`). Repeat `--path` to match any of several patterns. When every `--path` pattern matches zero indexed files, Vera prints a stderr hint suggesting the wildcard directory alternative (for example, `crates/vera-core/src/**` instead of `crates/*/src`). It complements semantic search for exact string matching, import statements, TODOs, and known identifiers.
 
 ## Model Backend
 
@@ -168,7 +168,7 @@ Indexing, storage, and search always stay on your machine. The backend choice on
 
 - **Potion Code**: `vera setup --potion-code` selects the default `minishlab/potion-code-16M-v2` static embedding model. It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed.
 - **Jina ONNX GPU**: `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag selects an opt-in ONNX embedding backend. The local pipeline runs without external calls.
-- **API mode**: Point at any OpenAI-compatible endpoint (remote APIs or local servers like llama.cpp). Only model calls leave your machine. Query prefixes for asymmetric embedding models (Qwen3, CodeRankEmbed, E5, BGE) are auto-detected from the model ID. Override with `EMBEDDING_QUERY_PREFIX` for unsupported models. See [llama-cpp-setup.md](llama-cpp-setup.md) for a step-by-step guide.
+- **API mode (Qwen preset, recommended)**: `qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` with a single shared key and the generic rerank protocol (auto-detected). Or point at any OpenAI-compatible endpoint (remote APIs or local servers like llama.cpp). Only model calls leave your machine. Query prefixes for asymmetric embedding models (Qwen3, CodeRankEmbed, E5, BGE) are auto-detected from the model ID. Override with `EMBEDDING_QUERY_PREFIX` for unsupported models. See [llama-cpp-setup.md](llama-cpp-setup.md) for a step-by-step guide.
 
 ### Curated Local Models
 
@@ -265,7 +265,7 @@ During setup, Vera offers to add a usage snippet to your project's agent config 
 
 ### Interactive Setup Wizard
 
-`vera setup` walks through backend selection, agent skill installation, and optional project indexing in one command. Skip the wizard with flags for non-interactive use.
+`vera setup` walks through backend selection, agent skill installation, and optional project indexing in one command for local backends. The API first-run flow with a preset (Qwen) completes immediately after credential entry and skips the skills and indexing prompts. Skip the wizard with flags for non-interactive use.
 
 ### Backend Management
 

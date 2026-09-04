@@ -1,11 +1,11 @@
 # Local Models
 
-Vera's default embedding model is [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2), a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives.
+Vera runs in two modes, and both start from the same setup wizard:
 
-Vera has two local backend families:
+- **API mode with the Qwen preset (recommended)**: `qwen/qwen3-embedding-8b` plus `qwen/qwen3-reranker-8b` through OpenRouter with a single shared API key. Measured on the 320-task Semble subset, the Qwen pair with reranking scored `0.8647` nDCG@10 versus `0.8538` for local-only defaults, with recall@1 up three points: the strongest quality configuration Vera ships. Setup is one key entry and the wizard fills the rest.
+- **Local mode with Potion Code (the easy default)**: `minishlab/potion-code-16M-v2` runs locally on CPU on any supported machine, no GPU or ONNX Runtime needed, and indexes the 63-repository Semble corpus in about two minutes. It is what you get with no API key, no account, and no hardware requirements.
 
-- Potion Code: the default local embedding backend.
-- Jina ONNX: an opt-in local embedding backend with a local reranker.
+The Qwen numbers above are screening measurements on the tuning subset, not full-suite claims; the honest comparison is that API mode trades a paid endpoint and network latency for measured reranker gains, while local mode is free, private, and fast enough for interactive use.
 
 `vera setup` downloads model assets into the Vera data directory (`$XDG_DATA_HOME/vera/models/`, or `~/.vera/models/` on existing installs). Jina ONNX backends also install the matching ONNX Runtime library into `lib/`.
 
@@ -27,7 +27,7 @@ With reranking disabled, the default Potion Code path uses vector/BM25 fusion pl
 
 ## Embedding Screening
 
-These screening results (2026-08-21/22, pre-dating the ranking improvements) use Vera's hybrid retrieval with reranking disabled. The first set has 320 Semble tasks; the independent set has 180 tasks from separate repositories.
+These screening results (2026-08-21/22, pre-dating the ranking-signal improvements of v1.3.0; today's shipped defaults score higher, see [benchmarks.md](benchmarks.md)) use Vera's hybrid retrieval with reranking disabled. The first set has 320 Semble tasks; the independent set has 180 tasks from separate repositories.
 
 | Model | 320-task nDCG@10 | Independent nDCG@10 | 320-task p50 | Independent p50 | 320-task index | Independent index |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -35,7 +35,7 @@ These screening results (2026-08-21/22, pre-dating the ranking improvements) use
 | `jina-embeddings-v5` | 0.7956 | 0.7149 | 44.9 ms | 13.3 ms | 147 s | 61 s |
 | `CodeRankEmbed` | 0.7949 | 0.7069 | 21.3 ms | 14.8 ms | 375 s | 153 s |
 
-Potion Code remains the recommended default because it runs locally on all supported machines and has the lowest screening index time among these embedding alternatives. The full benchmark tables and methodology are in [benchmarks.md](benchmarks.md).
+Within local mode, Potion Code remains the recommended local backend because it runs on all supported machines and has the lowest screening index time among these embedding alternatives. The full benchmark tables and methodology are in [benchmarks.md](benchmarks.md).
 
 ## Reranking
 
@@ -150,7 +150,7 @@ Interactive setup prompts for the endpoint URL, model ID, API key, and optional 
 vera setup --api
 ```
 
-The reranker step also configures the wire protocol (auto, generic, or voyage), endpoint path override, and optional task instruction. Qwen via OpenRouter relies on the generic protocol unless overridden. Custom proxies can select `generic` or `voyage` via `retrieval.reranker_protocol` without hostname spoofing.
+The reranker step also configures the wire protocol (auto, generic, or voyage), endpoint path override, and optional task instruction; for the Qwen preset setup auto-applies the generic protocol without prompting to preserve the single-key flow. Qwen via OpenRouter relies on the generic protocol unless overridden. Custom proxies can select `generic` or `voyage` via `retrieval.reranker_protocol` without hostname spoofing.
 
 For non-interactive setup, export the API values first and add `--yes`:
 

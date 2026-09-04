@@ -68,7 +68,7 @@ If one phrasing is too narrow, pass 2-3 varied queries in one call:
 vera search "OAuth token refresh" "JWT expiry handling" "auth middleware"
 ```
 
-Vera runs each query, then merges the results with reciprocal rank fusion.
+Vera runs each query, then merges the results with reciprocal rank fusion. Downstream ranking signals can reorder the fused candidates (definition chunks get a boost by default).
 
 ## Intent
 
@@ -93,7 +93,7 @@ Vera's hybrid pipeline handles both natural language intent and exact symbol loo
 
 ## Default Search Bias
 
-Vera favors source files by default. Docs, archives, runtime extracts, and generated files are still available, but they are no longer treated as equally good defaults for everyday coding tasks.
+Vera favors source files by default. Docs, archives, runtime extracts, and generated files are still available, but they are no longer treated as equally good defaults for everyday coding tasks. Definition chunks get a ranking boost by default (`retrieval.ranking_definition_boost`).
 
 Use `--scope docs` when you are reading guides or ADRs. Use `--scope runtime` when you're debugging extracted app bundles or decompiled runtime code. Add `--include-generated` when you intentionally want minified or generated files in the result set.
 
@@ -105,7 +105,7 @@ Use `vera grep` when you want exact text or regex matches limited to indexed fil
 - `vera grep "TODO\(" -i`
 - `vera grep "queryClient|invalidateQueries" --path "frontend/src/**"`
 
-Vera uses Rust regex syntax. Use `|` for alternation. `\|` matches a literal pipe.
+Vera uses Rust regex syntax. Use `|` for alternation. `\|` matches a literal pipe. When every `--path` pattern matches zero indexed files, `vera grep` prints a hint to stderr suggesting a wildcard directory alternative (for example `src/**/` instead of `src/`).
 
 Use `rg` when you need:
 
@@ -126,7 +126,8 @@ vera structural sql
 vera structural impls Loader
 ```
 
-This is the better default for agents.
+This is the better default for agents. `vera structural definitions` accepts bare symbol names for split symbols and deduplicates to the earliest declaration.
+
 Use `vera structural impls <symbol>` for explicit inheritance or conformance declarations. It does not infer implicit interface satisfaction.
 
 Use `vera references` for exact caller/callee questions:
@@ -142,7 +143,7 @@ Callers are matched by symbol name, so two definitions sharing a name land in
 one answer. When that happens the output names the receivers the calls went
 through and their counts; rerun with `--receiver <name>` to keep only the calls
 made through one of them. Calls written without a receiver (a plain
-`parse_config()`) are not matched by any `--receiver` value.
+`parse_config()`) are not matched by any `--receiver` value. `vera references` resolves split-symbol call sites, and `vera dead-code` deduplicates split parts by (symbol, file).
 
 ## Missing Files Or Surprising Exclusions
 
@@ -164,7 +165,7 @@ Use `vera stats --json` when you want the repo-wide health view for parse failur
 
 ## Output Format
 
-See [features: output formats](features.md#multiple-output-formats) for all options (`--json`, `--raw`, `--timing`). `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`. They can appear before or after the subcommand. `vera search --timing` prints per-stage timings; `vera grep --timing` prints total regex-search time.
+See [features: output formats](features.md#multiple-output-formats) for all options (`--json`, `--raw`, `--timing`). `--raw` works with `vera search`, `vera grep`, and `vera references`; `--timing` works with `vera search` and `vera grep`. They can appear before or after the subcommand. `vera search --timing` prints per-stage timings; `vera grep --timing` prints total regex-search time. In JSON, `symbol_name` is the bare string and split symbols add a `part_index` field. `retrieval.max_output_chars` defaults to 0 (unlimited output) and when non-zero truncates lower-ranked results first.
 
 ## Keeping Results Fresh
 

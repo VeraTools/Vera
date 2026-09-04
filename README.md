@@ -41,17 +41,27 @@ bunx @vera-ai/cli install   # or: npx -y @vera-ai/cli install / uvx vera-ai inst
 ```
 
 **2. Set up and index** (pick one)
+
+Recommended: the Qwen preset via OpenRouter (best measured search quality, single API key):
 ```bash
-vera setup                                  # Interactive, indexes this project by default
-vera setup --potion-code --index .          # Default local model
-vera setup --api --index .                  # Remote API mode, prompts for endpoint + key
+vera setup --api --index .          # choose the Qwen preset, paste one key
+```
+
+The zero-setup local option (runs on CPU, no key, no GPU):
+```bash
+vera setup --potion-code --index .
+```
+
+Other backends:
+```bash
+vera setup                                  # Interactive wizard, indexes this project by default
 vera setup --onnx-jina-coreml --index .     # Apple Silicon (M1/M2/M3/M4)
 vera setup --onnx-jina-cuda --index .       # NVIDIA GPU
 vera setup --onnx-jina-rocm --index .       # AMD GPU (ROCm, Linux)
 vera setup --onnx-jina-openvino --index .   # Intel GPU (OpenVINO, Linux)
 vera setup --onnx-jina-directml --index .   # DirectX 12 GPU (Windows)
 ```
-The interactive `vera setup` wizard offers presets for OpenAI, Jina, Voyage, and Qwen via OpenRouter; the Qwen preset uses `qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` with a single shared key and generic reranker protocol.
+The wizard also offers presets for OpenAI, Jina, and Voyage. The Qwen preset uses `qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` with a single shared key and the generic reranker protocol.
 
 **3. Search**
 ```bash
@@ -60,16 +70,18 @@ vera search "authentication logic"
 
 If the current project has no index, interactive search offers to create one. JSON and non-interactive searches still return the missing-index error.
 
-The default local embedding model is [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2). It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives.
+The default local embedding model is [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2), a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives. For the highest measured search quality, use the Qwen preset through OpenRouter instead; see [docs/models.md](docs/models.md).
 
 ## What Sets Vera Apart
 
 | | |
 |---|---|
-| **Opt-in cross-encoder reranking** | Enable query-candidate scoring with `retrieval.reranking_enabled` when you need it. Reranking is off by default. |
+| **Wins where it was never tuned** | Trails Semble by 0.008 nDCG on Semble's own benchmark set, but leads on the independent contamination set (10 fresh repositories, locally generated ground truth) and on recall@5. Vera refuses ground-truth-specific tuning, which costs home-field points and buys generalization. |
+| **Fast at query time, tiny on disk** | 6.4 ms median query latency on the 1,251-task suite with a 4.7 GB index for 63 repositories (6.8x smaller than Semble's 32 GB). Filter-during-scan, enabled by default in v1.4.0, halves filtered-query latency with ranking unchanged. |
+| **Updates, not just re-indexes** | Incremental updates and watch mode keep the index current as files change. Persistent indexes survive restarts and are reused when identity checks pass. |
 | **Single binary, 65 languages** | One static binary with 61 tree-sitter grammars compiled in. No Python, no language servers, no per-language toolchains. |
 | **Built-in code intelligence** | Call graph analysis, reference finding, dead code detection, and project overview, all from the same index. |
-| **Token-efficient for agents** | Returns symbol-bounded chunks, not entire files. 75-95% fewer tokens on typical queries. |
+| **Token-efficient for agents** | Returns symbol-bounded chunks, not entire files. 75-95% fewer tokens on typical queries. In a blind-graded agent benchmark, a mid-tier model with Vera reached the same answer quality while reading 17% fewer input tokens. |
 
 Vera started after weeks of working on Pampax, a project I forked because it and other similar tools were missing what I wanted. I kept running into deep-rooted bugs, less-than-ideal design decisions, and thought I could build something better from the ground up. Every design choice comes from careful research, learning from other projects, benchmarking and evaluation. Take a look at the full [feature list](docs/features.md) to see everything Vera can do.
 
@@ -175,16 +187,20 @@ vera explain-path path/to/file
 
 ## Benchmarks
 
-Semble benchmark comparison on 1,251 tasks across 63 repositories (Vera v1.2.0 row measured 2026-08-26 on the pre-upgrade Ryzen 7 7600X3D host; Semble column from the 2026-08-23 comparison):
+Semble benchmark comparison on 1,251 tasks across 63 repositories (Vera v1.4.0 row measured 2026-09-03 on AMD Ryzen 7 9800X3D; Semble column from the 2026-08-23 comparison on the same task set and embeddings):
 
 | Tool | nDCG@10 | R@1 | R@5 | R@10 | MRR | Query p50 | Index time | Index size |
 |------|---------|------|------|-------|-----|-----------|------------|------------|
-| Vera | 0.8450 | 0.6719 | **0.9203** | 0.9514 | 0.8267 | 9.4 ms | 139 s | **4.7 GB** |
+| Vera | 0.8437 | 0.6713 | **0.9189** | 0.9502 | 0.8258 | 6.4 ms | 115 s | **4.7 GB** |
 | Semble 0.5.5, full rerank stack | **0.8514** | **0.6747** | 0.9177 | **0.9656** | **0.8348** | **2.3 ms** | **100 s** | 32 GB |
 
-Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, graded relevance, and suffix-corrected path matching in the scorer. On the 320-task tuning subset, Vera scored `0.8534` versus Semble at `0.8494` nDCG. On the contamination-check independent set, Vera scored `0.7654` versus Semble at `0.7655`. See [docs/benchmarks.md](docs/benchmarks.md) for the screening tables and historical comparisons.
+Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, graded relevance, and suffix-corrected path matching in the scorer.
 
-Latency figures from the 2026-08-26 host are not directly comparable to measurements on the current Ryzen 7 9800X3D host. See the hardware caveat in [docs/197-profiling.md](docs/197-profiling.md) and the v1.3.0 notes in [docs/whats-new.md](docs/whats-new.md). All new ranking knobs added in v1.3.0 ship default off, so the v1.2.0 ranking defaults match v1.3.0 and the quality columns (nDCG, recall, MRR) still represent current behavior.
+How to read this table honestly: the full-suite gap (`0.8437` vs `0.8514`) is measured on Semble's own benchmark, whose 63 repositories are also the development corpus Semble's ranker was tuned against; MinishLab publishes both Semble and the Potion embedding model. On the 320-task tuning subset Vera scores `0.8538` against `0.8494`, and on the independent contamination set, 10 repositories disjoint from Semble's 63 with locally generated ground truth, Vera scores `0.7674` against `0.7655`. Vera deliberately tunes ranking signals only through preregistered ablations and refuses ground-truth-specific rules, which costs home-field points on this table and is the same discipline that shows up as a win the moment the evaluation leaves Semble's corpus. Recall@5, the metric that matters most for feeding candidates to a model or reranker, favors Vera on the full suite (`0.9189` vs `0.9177`).
+
+For agents in real coding sessions, the measurable effects are context and workflow, not just ranking: Vera returns symbol-bounded chunks (75-95% fewer tokens than file reads), ships incremental updates and watch mode so the index tracks edits, and in a blind-graded agent benchmark a mid-tier model reached the same answer quality while reading 17% fewer input tokens with Vera installed.
+
+The Vera row is from the 9800X3D host and the Semble column predates the CPU change, so latency columns are indicative, not a controlled comparison. See [docs/benchmarks.md](docs/benchmarks.md) for the screening tables, the agent-level benchmark, and historical comparisons.
 
 Full methodology and version history: [docs/benchmarks.md](docs/benchmarks.md).
 
