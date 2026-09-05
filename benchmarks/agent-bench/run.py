@@ -258,7 +258,7 @@ BENCH_MODEL = "custom:GLM-5.3-Free-[TokenRouter]-0"
 BENCH_EFFORT = "high"
 
 
-def build_factory_home(run_dir: Path) -> Path:
+def build_factory_home(run_dir: Path, model: str, effort: str) -> Path:
     """Build a run-local droid home with live credentials but isolated config.
 
     The real `~/.factory` carries global AGENTS.md instructions, personal
@@ -296,15 +296,15 @@ def build_factory_home(run_dir: Path) -> Path:
         (
             m
             for m in operator_settings.get("customModels", [])
-            if m.get("id") == BENCH_MODEL
+            if m.get("id") == model
         ),
         None,
     )
     if lane_entry is None:
-        fail(f"bench lane model {BENCH_MODEL} is not defined in operator settings")
+        fail(f"bench lane model {model} is not defined in operator settings")
     vanilla_settings = {
         "customModels": [lane_entry],
-        "sessionDefaultSettings": {"model": BENCH_MODEL, "reasoningEffort": BENCH_EFFORT},
+        "sessionDefaultSettings": {"model": model, "reasoningEffort": effort},
         "logoAnimation": "off",
         "ideAutoConnect": False,
         "includeCoAuthoredByDroid": False,
@@ -315,9 +315,9 @@ def build_factory_home(run_dir: Path) -> Path:
     return home
 
 
-def environment_for(arm: str, run_dir: Path) -> dict[str, str]:
+def environment_for(arm: str, run_dir: Path, model: str, effort: str) -> dict[str, str]:
     env = os.environ.copy()
-    env["FACTORY_HOME_OVERRIDE"] = str(build_factory_home(run_dir))
+    env["FACTORY_HOME_OVERRIDE"] = str(build_factory_home(run_dir, model, effort))
     path_parts: list[str] = []
     if arm == "with-vera":
         env["VERA_LOCAL"] = "1"
@@ -341,6 +341,26 @@ def environment_for(arm: str, run_dir: Path) -> dict[str, str]:
             value = SECRET_ENV.get(name) or DEFAULT_QWEN_ENV.get(name)
             if value:
                 env[name] = value
+            else:
+                # A missing preset value must not fall through to whatever the
+                # parent shell carries: an inherited endpoint or key would
+                # index this arm with operator-specific config and invalidate
+                # the measurement.
+                env.pop(name, None)
+        required = (
+            "EMBEDDING_MODEL_BASE_URL",
+            "EMBEDDING_MODEL_ID",
+            "EMBEDDING_MODEL_API_KEY",
+            "RERANKER_MODEL_BASE_URL",
+            "RERANKER_MODEL_ID",
+            "RERANKER_MODEL_API_KEY",
+        )
+        missing = [name for name in required if not env.get(name)]
+        if missing:
+            fail(
+                "secrets.env is missing Qwen preset values for: "
+                + ", ".join(missing)
+            )
         qwen_home = run_dir / arm / "vera-home"
         qwen_home.mkdir(parents=True, exist_ok=True)
         env["VERA_HOME"] = str(qwen_home)
@@ -457,7 +477,9 @@ def write_semble_agents_md(repo: Path) -> str:
     return "hand-written CLI snippet (SEMBLE_AGENTS_MD)"
 
 
-def setup_run(questions: list[dict[str, Any]]) -> Path:
+def setup_run(
+    questions: list[dict[str, Any]], model: str, effort: str
+) -> Path:
     binary = ensure_binary()
     run_dir = make_run_dir()
     with_repo = run_dir / "with-vera" / "repo"
@@ -476,7 +498,7 @@ def setup_run(questions: list[dict[str, Any]]) -> Path:
         if ARM_SHIMS[arm]:
             write_shims(run_dir / arm / "bin", ARM_SHIMS[arm])
 
-    with_env = environment_for("with-vera", run_dir)
+    with_env = environment_for("with-vera", run_dir, model, effort)
     index_log = run_dir / "with-vera" / "index.log"
     install_log = run_dir / "with-vera" / "agent-install.log"
     with index_log.open("w", encoding="utf-8") as output:
@@ -516,7 +538,7 @@ def setup_run(questions: list[dict[str, Any]]) -> Path:
     if (sem_repo / ".vera").exists() or (sem_repo / ".factory").exists():
         fail("with-semble arm contains Vera artifacts")
 
-    qwen_env = environment_for("with-vera-qwen", run_dir)
+    qwen_env = environment_for("with-vera-qwen", run_dir, model, effort)
     qwen_index_log = run_dir / "with-vera-qwen" / "index.log"
     with qwen_index_log.open("w", encoding="utf-8") as output:
         result = subprocess.run(
@@ -548,7 +570,7 @@ def setup_run(questions: list[dict[str, Any]]) -> Path:
         fail(f"Qwen-arm Vera agent installation failed; see {qwen_install_log}")
     write_vera_agents_md(qwen_repo)
 
-    sem_env = environment_for("with-semble", run_dir)
+    sem_env = environment_for("with-semble", run_dir, model, effort)
     sem_cache = Path(sem_env["SEMBLE_CACHE_LOCATION"])
     sem_cache.mkdir(parents=True, exist_ok=True)
     # Pre-warm the Semble index so question runs measure search, not indexing.
@@ -632,7 +654,7 @@ def run_question(
                 return
         except json.JSONDecodeError:
             pass
-    env = environment_for(arm, run_dir)
+    env = environment_for(arm, run_dir, model, effort)
     for attempt in range(2):
         returncode, timed_out, wall_s = execute_cell(
             repo_dir, prompt, output_path, stderr_path, env, model, effort
@@ -687,7 +709,7 @@ def stall_watchdog(
     past the suspend. The watchdog enforces progress in wall-clock terms.
     """
     last_size = transcript.stat().st_size if transcript.exists() else 0
-    idle = 0.0
+    last_growth_at = time.time()
     while process.poll() is None:
         time.sleep(poll_s)
         try:
@@ -696,12 +718,10 @@ def stall_watchdog(
             size = last_size
         if size > last_size:
             last_size = size
-            idle = 0.0
-        else:
-            idle += poll_s
-            if idle >= STALL_TIMEOUT_S:
-                process.kill()
-                return
+            last_growth_at = time.time()
+        elif time.time() - last_growth_at >= STALL_TIMEOUT_S:
+            process.kill()
+            return
 
 
 def execute_cell(
@@ -753,8 +773,13 @@ def execute_cell(
             returncode = process.returncode
     except subprocess.TimeoutExpired:
         timed_out = True
-        process.kill()
-        process.wait(timeout=10)
+        try:
+            process.kill()
+            process.wait(timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            # An unkillable child must not abort the whole sweep: the cell is
+            # already marked failed, and the next one can still run.
+            pass
     return returncode, timed_out, time.monotonic() - start
 
 
@@ -970,7 +995,7 @@ def main() -> None:
         run_agents(args.run.resolve(), questions, args.model, args.effort, args.force)
         analyze_run(args.run.resolve(), questions, args.model, args.effort)
         return
-    run_dir = setup_run(questions)
+    run_dir = setup_run(questions, args.model, args.effort)
     if args.setup_only:
         return
     run_agents(run_dir, questions, args.model, args.effort, args.force)

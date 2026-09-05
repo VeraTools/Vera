@@ -19,7 +19,7 @@ Put exactly 10 questions in `flask/questions.md` under `## Question 1` through `
 
 ## Reproduce
 
-From the Vera repository root, build the harness's release binary and create the three arms:
+From the Vera repository root, build the harness's release binary and create the four arms:
 
 ```bash
 python3 benchmarks/agent-bench/run.py --setup-only
@@ -45,7 +45,7 @@ To parse or re-parse existing JSONL outputs without invoking an agent:
 python3 benchmarks/agent-bench/run.py --analyze ~/.cache/agent-bench/<timestamp>
 ```
 
-Analysis covers whatever arms exist in the run directory, so older two-arm runs still summarize cleanly. Pick the tested model and reasoning effort with `--model` and `--effort` (defaults: GLM-5.3 Free via tokenrouter, `high`). Each model+effort pair writes its own transcripts (`qNN.<model>-<effort>.jsonl`) and `results.<model>-<effort>.json`, so several lanes can share one run directory. Grade a lane's answers with:
+Analysis covers whatever arms exist in the run directory, so older two-arm runs still summarize cleanly. Pick the tested model and reasoning effort with `--model` and `--effort` (defaults: GLM-5.3 Free via tokenrouter, `high`). Each model+effort pair writes its own transcripts and results file named with the normalized lane slug, so several lanes can share one run directory. Grade a lane's answers with:
 
 ```bash
 python3 benchmarks/agent-bench/judge.py ~/.cache/agent-bench/<timestamp> <lane-slug>
