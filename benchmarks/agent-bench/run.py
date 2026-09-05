@@ -693,7 +693,13 @@ def transient_provider_error(transcript: Path) -> bool:
         return False
     return any(
         marker in text
-        for marker in ("service_overloaded", "temporarily overloaded", " 429 ", " 503 ")
+        for marker in (
+            "service_overloaded",
+            "temporarily overloaded",
+            " 429 ",
+            " 503 ",
+            "Connection error",
+        )
     )
 
 
