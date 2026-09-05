@@ -344,6 +344,21 @@ def environment_for(arm: str, run_dir: Path) -> dict[str, str]:
         qwen_home = run_dir / arm / "vera-home"
         qwen_home.mkdir(parents=True, exist_ok=True)
         env["VERA_HOME"] = str(qwen_home)
+        # A fresh VERA_HOME has no saved config, and reranking defaults to
+        # disabled, so this arm would silently test embeddings-only. Set the
+        # product's own config knob through its own CLI so the arm exercises
+        # the advertised embedding + reranker pair.
+        result = subprocess.run(
+            [str(VERA_BINARY), "config", "set", "retrieval.reranking_enabled", "true"],
+            cwd=run_dir,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0:
+            fail("setting reranking_enabled in the Qwen arm failed")
         # VERA_BACKEND selects the InferenceBackend; the saved-config fallback
         # would otherwise pick the local Potion backend.
         env["VERA_BACKEND"] = "api"
