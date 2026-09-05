@@ -2,15 +2,16 @@
 
 This benchmark measures whether a coding agent answers cross-file questions about Flask with less tool use and lower latency when a code-search tool is available. It records answer text, tool-call counts, token usage reported by the agent stream, and wall-clock time. Answer quality is graded separately by `judge.py`, which scores each answer blind (no arm label) against `flask/answer-key.md` with a 0-10 rubric.
 
-There are three arms:
+There are four arms:
 
-- `with-vera`: fresh Flask copy with a local Vera index and the project-scoped Droid skill installed. Its `PATH` resolves the release Vera binary first; a shim makes `semble` exit 127.
+- `with-vera`: fresh Flask copy with a local Vera index (Potion Code backend, `VERA_LOCAL=1`), the project-scoped Droid skill, and the `AGENTS.md` snippet `vera agent install` offers by default. Its `PATH` resolves the release Vera binary first; a shim makes `semble` exit 127.
+- `with-vera-qwen`: identical to `with-vera` except the index is built with the Qwen API preset (embedding and reranker endpoints from the repo's `secrets.env`, never logged); the same Droid skill, the same `AGENTS.md` snippet, the same binary, the same shims. This arm isolates the effect of the API embedding + reranker stack against the local Potion backend.
 - `with-semble`: fresh Flask copy with an `AGENTS.md` at the repo root describing Semble's CLI usage and a pre-warmed Semble index cache inside the arm (`SEMBLE_CACHE_LOCATION` points there). A shim makes `vera` exit 127.
 - `control`: otherwise identical copy with neither tool; shims make both `vera` and `semble` exit 127 with `<tool>: not available in this environment`.
 
-Fairness: each tool arm gets that tool's own CLI integration. The Vera arm installs its Droid skill; the Semble arm gets a hand-written `AGENTS.md` covering the documented `semble search` and `semble find-related` usage, recorded in `setup.json`. Semble's installer text is not used because it leads with `mcp__semble__*` tool calls and no MCP server runs here; both tools are exercised through the shell only. Questions run sequentially, rotating the starting arm by question number so each arm leads roughly equally often.
+Fairness: each tool arm gets that tool's own CLI integration. The Vera arms install the Droid skill and the product's `AGENTS.md` snippet (extracted verbatim from the `agent install` implementation, so it cannot drift from the shipped text); the Semble arm gets a hand-written `AGENTS.md` covering the documented `semble search` and `semble find-related` usage, recorded in `setup.json`. Semble's installer text is not used because it leads with `mcp__semble__*` tool calls and no MCP server runs here; both tools are exercised through the shell only. Questions run sequentially, rotating the starting arm by question number so each arm leads roughly equally often.
 
-Every cell runs with `FACTORY_HOME_OVERRIDE` pointed at a run-local config directory holding only credentials and model settings, and with `--disable-builtin-skills`. Without that, the operator's global `AGENTS.md`, personal skills, and custom droids would reach into all three arms and shift agent behavior for reasons unrelated to the tool under test.
+Every cell runs with `FACTORY_HOME_OVERRIDE` pointed at a run-local config directory holding only credentials and model settings, and with `--disable-builtin-skills`. Auth files are symlinked to the live ones (droid rotates refresh tokens during exec, so copies go stale mid-run), while settings carry only the bench lane model. Without that isolation, the operator's global `AGENTS.md`, personal skills, and custom droids would reach into all arms and shift agent behavior for reasons unrelated to the tool under test.
 
 ## Questions
 
@@ -24,7 +25,7 @@ From the Vera repository root, build the harness's release binary and create the
 python3 benchmarks/agent-bench/run.py --setup-only
 ```
 
-The setup phase copies `.bench/semble-repos/flask` into a timestamped directory under `~/.cache/agent-bench/`, excludes `.git`, `.vera`, and `.factory`, indexes only the Vera arm with `VERA_LOCAL=1` and installs the Droid skill there, pre-warms the Semble index in the Semble arm with one search, and writes that arm's `AGENTS.md`. It does not modify the source Flask checkout.
+The setup phase copies `.bench/semble-repos/flask` into a timestamped directory under `~/.cache/agent-bench/`, excludes `.git`, `.vera`, and `.factory`, indexes the local Vera arm with `VERA_LOCAL=1`, installs the Droid skill and writes the product `AGENTS.md` snippet in both Vera arms, pre-warms the Semble index in the Semble arm with one search, and writes that arm's `AGENTS.md`. It does not modify the source Flask checkout.
 
 The command prints the run directory. Use that path for the question sweep:
 
@@ -44,11 +45,13 @@ To parse or re-parse existing JSONL outputs without invoking an agent:
 python3 benchmarks/agent-bench/run.py --analyze ~/.cache/agent-bench/<timestamp>
 ```
 
-Analysis covers whatever arms exist in the run directory, so older two-arm runs still summarize cleanly. Pick the tested model and reasoning effort with `--model` and `--effort` (defaults: `claude-opus-5`, `medium`). Each model+effort pair writes its own transcripts (`qNN.<model>-<effort>.jsonl`) and `results.<model>-<effort>.json`, so several lanes can share one run directory. Grade a lane's answers with:
+Analysis covers whatever arms exist in the run directory, so older two-arm runs still summarize cleanly. Pick the tested model and reasoning effort with `--model` and `--effort` (defaults: GLM-5.3 Free via tokenrouter, `high`). Each model+effort pair writes its own transcripts (`qNN.<model>-<effort>.jsonl`) and `results.<model>-<effort>.json`, so several lanes can share one run directory. Grade a lane's answers with:
 
 ```bash
-python3 benchmarks/agent-bench/judge.py ~/.cache/agent-bench/<timestamp> <model>-<effort>
+python3 benchmarks/agent-bench/judge.py ~/.cache/agent-bench/<timestamp> <lane-slug>
 ```
+
+The `<lane-slug>` is the results-file tag (for example `custom-GLM-5.3-Free--TokenRouter--0-high-abc123def456`), printed by `--analyze`.
 
 Running the script with no mode performs setup, the full sweep, and analysis sequentially.
 

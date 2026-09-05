@@ -23,10 +23,11 @@ SOURCE_REPO = REPO_ROOT / ".bench" / "semble-repos" / "flask"
 QUESTIONS_FILE = Path(__file__).resolve().parent / "flask" / "questions.md"
 VERA_BINARY = REPO_ROOT / "target" / "release" / "vera"
 RUNS_ROOT = Path(os.environ.get("AGENT_BENCH_RUNS", Path.home() / ".cache" / "agent-bench"))
-ARMS = ("with-vera", "with-semble", "control")
+ARMS = ("with-vera", "with-vera-qwen", "with-semble", "control")
 # Shims make a binary exit 127 so an arm cannot reach another arm's tool.
 ARM_SHIMS = {
     "with-vera": ("semble",),
+    "with-vera-qwen": ("semble",),
     "with-semble": ("vera",),
     "control": ("vera", "semble"),
 }
@@ -56,6 +57,26 @@ TOKEN_KEYS = {
 }
 
 
+def load_secret_env() -> dict[str, str]:
+    """Parse the repo's secrets.env for API-mode credentials (values never logged)."""
+    values: dict[str, str] = {}
+    path = REPO_ROOT / "secrets.env"
+    if not path.is_file():
+        return values
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+SECRET_ENV = load_secret_env()
+# Rate-limit handling for the OpenRouter Qwen pair, matching the screening runs.
+DEFAULT_QWEN_ENV = {"VERA_RERANK_RATE_LIMIT_WAIT_SECS": "65"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -77,9 +98,9 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Use only the first N questions (1-10)",
     )
-    parser.add_argument("--model", default="claude-opus-5", help="droid model ID")
+    parser.add_argument("--model", default=BENCH_MODEL, help="droid model ID")
     parser.add_argument(
-        "--effort", default="medium", help="droid reasoning effort level"
+        "--effort", default=BENCH_EFFORT, help="droid reasoning effort level"
     )
     parser.add_argument(
         "--force",
@@ -225,17 +246,32 @@ FACTORY_HOME_FILES = (
     "auth.v2.key",
     "host.json",
     "last-startup-version",
+    "certs",
 )
+# Auth material droid refreshes at runtime; symlinked so a run-local home never
+# holds a token snapshot that a previous cell's refresh has already consumed.
+FACTORY_HOME_SYMLINKED = ("auth.v2.file", "auth.v2.key", "certs")
+# The agent lane tested by this benchmark. GLM-5.3 via tokenrouter at high
+# reasoning; free, stable, and independent of the operator's account rotation.
+BENCH_MODEL = "custom:GLM-5.3-Free-[TokenRouter]-0"
+BENCH_EFFORT = "high"
 
 
 def build_factory_home(run_dir: Path) -> Path:
-    """Copy the minimum droid config into a run-local home.
+    """Build a run-local droid home with live credentials but isolated config.
 
     The real `~/.factory` carries global AGENTS.md instructions, personal
     skills, and custom droids. Any of those would reach into every arm and
     change agent behavior in ways that have nothing to do with the tool under
     test, so cells run against a home that holds only credentials and model
     settings.
+
+    Auth files (auth.v2.file, auth.v2.key, certs) are SYMLINKS to the live
+    `~/.factory` files, not copies: droid rotates its refresh tokens during
+    exec runs, so a copied token snapshot goes stale after the first few
+    cells and every later cell fails authentication. Symlinks always resolve
+    to the current token. Config files (settings.json, host.json) are real
+    copies so operator config stays out of the cells.
     """
     home = run_dir / "factory-home"
     config = home / ".factory"
@@ -243,8 +279,38 @@ def build_factory_home(run_dir: Path) -> Path:
     source = Path.home() / ".factory"
     for name in FACTORY_HOME_FILES:
         candidate = source / name
-        if candidate.is_file():
-            shutil.copy2(candidate, config / name)
+        target = config / name
+        if not target.exists() and not target.is_symlink():
+            if name in FACTORY_HOME_SYMLINKED:
+                target.symlink_to(candidate)
+            elif candidate.is_file():
+                shutil.copy2(candidate, target)
+    # Strip the copied settings down to a near-vanilla configuration: the
+    # operator's other custom models, droids, mission/subagent routing, and
+    # favorites describe our local setup, not the tool under test, and any of
+    # them could steer cell behavior. Keep exactly one custom model entry
+    # (the bench lane's endpoint definition) and nothing else.
+    operator_settings = json.loads((source / "settings.json").read_text(encoding="utf-8"))
+    lane_entry = next(
+        (
+            m
+            for m in operator_settings.get("customModels", [])
+            if m.get("id") == BENCH_MODEL
+        ),
+        None,
+    )
+    if lane_entry is None:
+        fail(f"bench lane model {BENCH_MODEL} is not defined in operator settings")
+    vanilla_settings = {
+        "customModels": [lane_entry],
+        "sessionDefaultSettings": {"model": BENCH_MODEL, "reasoningEffort": BENCH_EFFORT},
+        "logoAnimation": "off",
+        "ideAutoConnect": False,
+        "includeCoAuthoredByDroid": False,
+        "compactionTokenLimit": 200000,
+    }
+    settings_target = config / "settings.json"
+    settings_target.write_text(json.dumps(vanilla_settings, indent=2) + "\n", encoding="utf-8")
     return home
 
 
@@ -254,6 +320,32 @@ def environment_for(arm: str, run_dir: Path) -> dict[str, str]:
     path_parts: list[str] = []
     if arm == "with-vera":
         env["VERA_LOCAL"] = "1"
+        path_parts.append(str(VERA_BINARY.parent))
+    elif arm == "with-vera-qwen":
+        # API mode with the Qwen OpenRouter preset: same Vera binary and skill,
+        # but the index is built with the embedding/reranker endpoint credentials
+        # from secrets.env instead of the local Potion backend. A run-local
+        # VERA_HOME isolates this arm from the operator's global ~/.vera saved
+        # config (which carries local_mode=true and a 60s embedding timeout that
+        # OpenRouter batches can exceed); API mode needs no model downloads.
+        for name in (
+            "EMBEDDING_MODEL_BASE_URL",
+            "EMBEDDING_MODEL_ID",
+            "EMBEDDING_MODEL_API_KEY",
+            "RERANKER_MODEL_BASE_URL",
+            "RERANKER_MODEL_ID",
+            "RERANKER_MODEL_API_KEY",
+            "VERA_RERANK_RATE_LIMIT_WAIT_SECS",
+        ):
+            value = SECRET_ENV.get(name) or DEFAULT_QWEN_ENV.get(name)
+            if value:
+                env[name] = value
+        qwen_home = run_dir / arm / "vera-home"
+        qwen_home.mkdir(parents=True, exist_ok=True)
+        env["VERA_HOME"] = str(qwen_home)
+        # VERA_BACKEND selects the InferenceBackend; the saved-config fallback
+        # would otherwise pick the local Potion backend.
+        env["VERA_BACKEND"] = "api"
         path_parts.append(str(VERA_BINARY.parent))
     else:
         env.pop("VERA_LOCAL", None)
@@ -301,6 +393,43 @@ rg/grep remain available for exact strings, symbol names, and regex search.
 """
 
 
+def vera_agents_md_snippet() -> str:
+    """Extract the AGENTS.md snippet exactly as `vera agent install` writes it.
+
+    The product's interactive install offers this snippet with a default-yes
+    prompt (offer_agents_md_snippet in agent.rs), so a real user accepting
+    defaults gets skill + snippet. Reading it out of the Rust source instead
+    of hardcoding a copy keeps the benchmark from drifting from the product.
+    """
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "crates"
+        / "vera-cli"
+        / "src"
+        / "commands"
+        / "agent.rs"
+    )
+    text = source.read_text(encoding="utf-8")
+    marker = 'const AGENTS_MD_SNIPPET: &str = r#"'
+    start = text.find(marker)
+    if start < 0:
+        fail("AGENTS_MD_SNIPPET not found in agent.rs; update the extraction")
+    start += len(marker)
+    end = text.find('"#;', start)
+    if end < 0:
+        fail("AGENTS_MD_SNIPPET terminator not found in agent.rs")
+    snippet = text[start:end].strip()
+    if "<!-- vera:begin -->" not in snippet or "vera search" not in snippet:
+        fail("extracted AGENTS_MD_SNIPPET looks wrong; update the extraction")
+    return snippet
+
+
+def write_vera_agents_md(repo: Path) -> str:
+    """Write the product's AGENTS.md snippet into a Vera arm's repo."""
+    (repo / "AGENTS.md").write_text(vera_agents_md_snippet() + "\n", encoding="utf-8")
+    return "vera agent install AGENTS_MD_SNIPPET (product source)"
+
+
 def write_semble_agents_md(repo: Path) -> str:
     """Write the with-semble arm's AGENTS.md and return its provenance label.
 
@@ -316,9 +445,11 @@ def setup_run(questions: list[dict[str, Any]]) -> Path:
     binary = ensure_binary()
     run_dir = make_run_dir()
     with_repo = run_dir / "with-vera" / "repo"
+    qwen_repo = run_dir / "with-vera-qwen" / "repo"
     sem_repo = run_dir / "with-semble" / "repo"
     control_repo = run_dir / "control" / "repo"
     copy_repo(with_repo)
+    copy_repo(qwen_repo)
     copy_repo(sem_repo)
     copy_repo(control_repo)
     shutil.rmtree(sem_repo / ".vera", ignore_errors=True)
@@ -363,10 +494,43 @@ def setup_run(questions: list[dict[str, Any]]) -> Path:
     skill_dir = with_repo / ".factory" / "skills" / "vera"
     if not skill_dir.is_dir():
         fail(f"Vera agent installation failed; see {install_log}")
+    vera_agents_md_source = write_vera_agents_md(with_repo)
     if (control_repo / ".vera").exists() or (control_repo / ".factory").exists():
         fail("control arm contains Vera artifacts")
     if (sem_repo / ".vera").exists() or (sem_repo / ".factory").exists():
         fail("with-semble arm contains Vera artifacts")
+
+    qwen_env = environment_for("with-vera-qwen", run_dir)
+    qwen_index_log = run_dir / "with-vera-qwen" / "index.log"
+    with qwen_index_log.open("w", encoding="utf-8") as output:
+        result = subprocess.run(
+            ["vera", "index", "."],
+            cwd=qwen_repo,
+            env=qwen_env,
+            text=True,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            timeout=1800,
+            check=False,
+        )
+    if result.returncode != 0:
+        fail(f"Qwen-arm Vera indexing failed; see {qwen_index_log}")
+    qwen_install_log = run_dir / "with-vera-qwen" / "agent-install.log"
+    with qwen_install_log.open("w", encoding="utf-8") as output:
+        result = subprocess.run(
+            ["vera", "agent", "install", "--client", "droid", "--scope", "project"],
+            cwd=qwen_repo,
+            env=qwen_env,
+            text=True,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            timeout=300,
+            check=False,
+        )
+    qwen_skill_dir = qwen_repo / ".factory" / "skills" / "vera"
+    if not qwen_skill_dir.is_dir():
+        fail(f"Qwen-arm Vera agent installation failed; see {qwen_install_log}")
+    write_vera_agents_md(qwen_repo)
 
     sem_env = environment_for("with-semble", run_dir)
     sem_cache = Path(sem_env["SEMBLE_CACHE_LOCATION"])
@@ -399,6 +563,14 @@ def setup_run(questions: list[dict[str, Any]]) -> Path:
                 "repo": str(with_repo),
                 "path_prefix": str(binary.parent),
                 "shims": list(ARM_SHIMS["with-vera"]),
+                "agents_md_source": vera_agents_md_source,
+            },
+            "with-vera-qwen": {
+                "repo": str(qwen_repo),
+                "path_prefix": str(binary.parent),
+                "shims": list(ARM_SHIMS["with-vera-qwen"]),
+                "backend": "api: openrouter qwen3-embedding-8b + reranker (secrets.env)",
+                "agents_md_source": vera_agents_md_source,
             },
             "with-semble": {
                 "repo": str(sem_repo),
