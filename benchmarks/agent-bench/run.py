@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -634,6 +635,11 @@ def run_question(
 
 
 TIMEOUT_S = 7200
+# Kill a cell whose transcript has not grown for this many wall-clock seconds.
+# Long thinking pauses exist, but an hour of zero events means the process is
+# wedged; the watchdog turns that into a failed cell the harness can retry
+# instead of a night lost to a hung provider connection.
+STALL_TIMEOUT_S = 3600
 
 
 def transient_provider_error(transcript: Path) -> bool:
@@ -654,6 +660,35 @@ def transient_provider_error(transcript: Path) -> bool:
     )
 
 
+def stall_watchdog(
+    process: subprocess.Popen, transcript: Path, poll_s: float = 60.0
+) -> None:
+    """Kill the agent when its transcript stops growing.
+
+    A cell whose transcript has not grown for STALL_TIMEOUT_S is wedged, not
+    thinking: provider connections die silently (observed in real runs), and a
+    system suspend leaves the process parked on dead sockets for hours while
+    the monotonic clock, and therefore subprocess.run's timeout, never advances
+    past the suspend. The watchdog enforces progress in wall-clock terms.
+    """
+    last_size = transcript.stat().st_size if transcript.exists() else 0
+    idle = 0.0
+    while process.poll() is None:
+        time.sleep(poll_s)
+        try:
+            size = transcript.stat().st_size
+        except OSError:
+            size = last_size
+        if size > last_size:
+            last_size = size
+            idle = 0.0
+        else:
+            idle += poll_s
+            if idle >= STALL_TIMEOUT_S:
+                process.kill()
+                return
+
+
 def execute_cell(
     repo_dir: Path,
     prompt: Path,
@@ -671,7 +706,7 @@ def execute_cell(
         with output_path.open("w", encoding="utf-8") as output, stderr_path.open(
             "w", encoding="utf-8"
         ) as errors:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [
                     "droid",
                     "exec",
@@ -694,12 +729,17 @@ def execute_cell(
                 text=True,
                 stdout=output,
                 stderr=errors,
-                timeout=timeout_s,
-                check=False,
             )
-            returncode = result.returncode
+            watchdog = threading.Thread(
+                target=stall_watchdog, args=(process, output_path), daemon=True
+            )
+            watchdog.start()
+            process.wait(timeout=timeout_s)
+            returncode = process.returncode
     except subprocess.TimeoutExpired:
         timed_out = True
+        process.kill()
+        process.wait(timeout=10)
     return returncode, timed_out, time.monotonic() - start
 
 
