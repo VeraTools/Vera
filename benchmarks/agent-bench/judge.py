@@ -58,10 +58,20 @@ def main():
         if entry.get("failed"):
             print(f"skip {arm} q{qn}: failed run"); continue
         out_file = judge_dir / f"{arm}-q{qn:02d}.txt"
+        # Resume: a prior judge pass may have graded this cell (crash recovery,
+        # or a re-run after fill-in cells refreshed the results file). Reuse the
+        # recorded score instead of paying for the opus call again.
+        if out_file.exists():
+            m = re.search(r"(?m)^SCORE:\s*(\d+)\s*$", out_file.read_text())
+            if m and 0 <= int(m.group(1)) <= 10:
+                entry["score"] = int(m.group(1))
+                print(f"resume {arm} q{qn:02d}: {entry['score']}", flush=True)
+                continue
         score = judge(qtext[qn], keys[qn], entry["answer"], out_file)
         entry["score"] = score
         print(f"{arm} q{qn:02d}: {score}", flush=True)
-    results_file.write_text(json.dumps(results, indent=2) + "\n")
+        # Persist after every cell so a crash mid-run loses no graded scores.
+        results_file.write_text(json.dumps(results, indent=2) + "\n")
 
 if __name__ == "__main__":
     main()
