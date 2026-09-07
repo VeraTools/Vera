@@ -302,7 +302,7 @@ pub enum Commands {
     /// Index a codebase for search.
     #[command(long_about = "Index a codebase for search.\n\n\
                       Discovers source files (respecting .gitignore), parses them with \
-                      tree-sitter for 60+ languages, creates searchable chunks at symbol \
+                      tree-sitter for 61 languages, creates searchable chunks at symbol \
                       boundaries, generates embeddings using the current Vera mode, and \
                       stores everything in a local `.vera/` index directory.\n\n\
                       Use `vera setup` for Vera's built-in local models, or `vera setup \

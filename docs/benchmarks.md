@@ -177,7 +177,7 @@ A four-arm sweep with GLM-5.3 (high effort, free tokenrouter lane) added the Qwe
 | with-semble (Semble CLI) | 10.0/10 | 566 | 18.49 M (-12%) | 5 in 5 cells | 8.5 h |
 | control (neither) | 10.0/10 | 598 | 21.00 M | 0 | 7.7 h |
 
-Read: equal quality, and both Vera arms consumed materially less context than Semble's arm or the control; the Qwen embedding+reranker pair cut consumption almost in half. Activation was selective and question-dependent: agents acknowledged the tool instructions in reasoning, invoked `vera` on half the questions (5/10 local, 8/10 qwen), invoked Semble on 5/10, and skipped both on trace-style questions where following the file structure felt cheaper than search. The published per-cell scores and token numbers are in `results.glm-5.3-free-high.json`; raw transcripts are preserved under `.bench/agent-bench-sessions/` for skill and snippet work.
+Read: equal quality, and both Vera arms consumed materially less context than Semble's arm or the control; the Qwen embedding+reranker pair cut consumption almost in half. Activation was selective and question-dependent: agents acknowledged the tool instructions in reasoning, invoked `vera` on half the questions (5/10 local, 8/10 qwen), invoked Semble on 5/10, and skipped both on trace-style questions where following the file structure felt cheaper than search. The published per-cell scores and token numbers are in `results.glm-5.3-free-high.json`.
 
 Limitations: 10 questions, 1 repo, 1 run per cell, and no statistical power claims. The question set has reached its quality ceiling for this lane; discriminating on answer quality now needs harder questions, a lower effort budget, or tighter time caps where search efficiency matters.
 

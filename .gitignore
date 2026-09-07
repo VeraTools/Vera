@@ -6,6 +6,7 @@ or-management-key.env
 /AGENTS.md
 /HANDOFF.md
 /V1-STATUS.md
+/evidence/
 response.md
 .junie/
 .bench/
@@ -28,4 +29,8 @@ crates/tree-sitter-astro/
 .dev/
 .tmp/
 skills-lock.json
+
+# Untracked benchmark provenance JSONs (issue-evidence and screening runs;
+# referenced as "uncommitted" in docs/benchmarks.md and issue threads)
+/benchmarks/results/*.json
 .output.txt
