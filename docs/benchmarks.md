@@ -157,7 +157,7 @@ The baseline, C1, C2, and GA variant JSONs were pruned from the tree; they remai
 
 ### Agent-Level Benchmark
 
-This benchmark used 10 cross-file tracing questions about the Flask codebase. The question set and harness are documented in [benchmarks/agent-bench/README.md](../benchmarks/agent-bench/README.md). Each question was answered by a fresh `droid exec` agent in two arms: `with-vera`, with a Vera index and agent skill installed; and `control`, with the Vera CLI blocked and exiting 127. Answers were graded blind against a verified answer key by a judge model using a 0-10 rubric per question. Efficiency metrics came from the agent harness stream: tool calls, input tokens, and wall time.
+This benchmark used 10 cross-file tracing questions about the Flask codebase. The question set and harness are documented in [benchmarks/agent-bench/README.md](../benchmarks/agent-bench/README.md). Each question was answered by a fresh `droid exec` agent in up to four arms: `with-vera`, with a Vera index and agent skill installed; `with-vera-qwen`, the same integration built on the Qwen API embedding and reranker pair; `with-semble`, with a Semble index and CLI instructions; and `control`, with both tools blocked and exiting 127. Answers were graded blind against a verified answer key by a judge model using a 0-10 rubric per question. Efficiency metrics came from the agent harness stream: tool calls, input tokens, and wall time.
 
 | Tested model | Arm | Mean score | Tool calls | Input tokens | Wall time |
 |--------------|-----|------------|------------|--------------|-----------|
@@ -168,9 +168,18 @@ This benchmark used 10 cross-file tracing questions about the Flask codebase. Th
 
 The opus table's input-token counts include only non-cached tokens because nearly everything there was cache reads. The kimi lane is the honest context-size comparison: with Vera, the agent pulled 17% fewer input tokens (230.6k vs 278.0k) to reach the same answer quality.
 
-On a small, well-organized repo, a frontier model answers these questions perfectly with plain grep+read, so quality parity is expected. Vera's measurable effect at this scale is reduced context consumption for the mid-tier model, at roughly equal wall time with slightly more tool calls. Larger and less familiar codebases are where the retrieval advantage should grow. Treat this as a floor, not a ceiling.
+A four-arm sweep with GLM-5.3 (high effort, free tokenrouter lane) added the Qwen API pair and Semble CLI arms. At this effort budget GLM-5.3 saturates the question set with grep alone, so all four arms scored a perfect 10.0 on every valid cell and score cannot discriminate; the discriminating measures were context consumption and activation. Total prompt tokens (input plus cache reads, since the lane reports them disjoint):
 
-Limitations: 10 questions, 1 repo, 1 run per cell, and no statistical power claims.
+| Arm | Score | Tool calls | Prompt tokens | Vera/Semble activations | Wall |
+|-----|-------|------------|---------------|-------------------------|------|
+| with-vera (local Potion) | 10.0/10 | 521 | 15.39 M (-27%) | 10 in 5 cells | 6.9 h |
+| with-vera-qwen (Qwen API pair) | 10.0/10 | 453 | **10.91 M (-48%)** | 16 in 8 cells | 6.7 h |
+| with-semble (Semble CLI) | 10.0/10 | 566 | 18.49 M (-12%) | 5 in 5 cells | 8.5 h |
+| control (neither) | 10.0/10 | 598 | 21.00 M | 0 | 7.7 h |
+
+Read: equal quality, and both Vera arms consumed materially less context than Semble's arm or the control; the Qwen embedding+reranker pair cut consumption almost in half. Activation was selective and question-dependent: agents acknowledged the tool instructions in reasoning, invoked `vera` on half the questions (5/10 local, 8/10 qwen), invoked Semble on 5/10, and skipped both on trace-style questions where following the file structure felt cheaper than search. The published per-cell scores and token numbers are in `results.glm-5.3-free-high.json`; raw transcripts are preserved under `.bench/agent-bench-sessions/` for skill and snippet work.
+
+Limitations: 10 questions, 1 repo, 1 run per cell, and no statistical power claims. The question set has reached its quality ceiling for this lane; discriminating on answer quality now needs harder questions, a lower effort budget, or tighter time caps where search efficiency matters.
 
 ## Historical v0.7.0 Benchmark
 

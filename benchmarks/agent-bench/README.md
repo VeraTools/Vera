@@ -55,6 +55,8 @@ The `<lane-slug>` is the results-file tag (for example `custom-GLM-5.3-Free--Tok
 
 Running the script with no mode performs setup, the full sweep, and analysis sequentially.
 
+Published results live in `results/`: `results.claude-opus-5-medium.json`, `results.kimi-k3-medium.json`, and `results.glm-5.3-free-high.json` (the four-arm sweep).
+
 ## Limitations
 
 This is one model, one repository, and one set of 10 questions. The arms share provider, prompt, model, reasoning effort, and sequential execution, but provider timing and model variance still affect measurements. Tool-call count and token accounting depend on the stream schema and are not a measure of answer correctness. The experiment has no statistical power claims and should not be generalized beyond this workload.
