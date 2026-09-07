@@ -17,7 +17,7 @@ reviews:
         Ranking/retrieval changes must obey the repo's benchmark-integrity rules: no heuristic tuning that only helps isolated benchmark tasks, every signal needs a mechanism-level rationale grounded in how developers search code, and behavior changes require Semble benchmark verification. Flag any ranking change that lacks justification or tests.
     - path: "crates/**"
       instructions: |
-        Enforce the repo's Rust guidelines: minimal LOC, no duplicated logic (suggest extraction), simple readable code over clever code, anyhow::Result in CLI code and thiserror in vera-core, tracing for logging, tests in #[cfg(test)] modules at file bottom. Rust edition 2024, MSRV 1.85.
+        Enforce the repo's Rust guidelines: minimal LOC, no duplicated logic (suggest extraction), simple readable code over clever code, anyhow::Result in CLI code and thiserror in vera-core, tracing for logging, tests in #[cfg(test)] modules at file bottom. Rust edition 2024, MSRV 1.88.
     - path: "**/*.md"
       instructions: |
         Docs must follow the repo's documentation rules: no em-dashes in user-facing docs, no hedging or banned words (comprehensive, robust, seamless, leverage, utilize, facilitate, empower, cutting-edge, state-of-the-art, holistic), one fact in exactly one place, and docs must be updated in the same PR as the behavior they describe. Flag stale claims (test counts, version numbers) that contradict code.

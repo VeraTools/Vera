@@ -1349,8 +1349,9 @@ microcode\t: 0xb404038
         // On this host it should match the real CPU model.
         // Gracefully accept "unknown" on non-Linux, but on Linux check substring.
         if cpu != "unknown" {
+            let lower = cpu.to_lowercase();
             assert!(
-                cpu.contains("AMD") || cpu.contains("Intel") || cpu.contains("Ryzen"),
+                lower.contains("amd") || lower.contains("intel") || lower.contains("ryzen"),
                 "host CPU model should look like a real CPU string, got: {cpu}"
             );
         }

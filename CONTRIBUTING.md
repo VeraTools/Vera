@@ -7,6 +7,7 @@ Rust 1.88+ required (see `Cargo.toml` `rust-version` for exact MSRV).
 ```bash
 git clone https://github.com/VeraTools/Vera.git
 cd Vera
+bash scripts/bootstrap-vendored-grammars.sh  # Downloads the vendored tree-sitter grammars used by CI.
 cargo build
 ```
 
