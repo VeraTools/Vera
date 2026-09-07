@@ -51,12 +51,19 @@ fn entry_names() -> &'static [&'static str] {
     }
 }
 
-/// The two shapes of PATH entry that belong to Vera.
+/// The possible shapes of a PATH entry named `vera`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchEntry {
     /// Script shim written by the installers; remove directly.
     Shim,
     /// Real ELF/Mach-O/PE binary left by `cargo install` (#212); also ours.
     CargoBinary,
+    /// A Vera-looking launcher whose ownership cannot be proven. Report it,
+    /// but never remove it: a false positive here would delete another tool.
+    Ambiguous(&'static str),
+    /// An unreadable executable named `vera` outside cargo's bin directory.
+    /// It may be foreign, but it cannot be safely identified as such by bytes.
+    ForeignBinary,
 }
 
 impl LaunchEntry {
@@ -64,6 +71,16 @@ impl LaunchEntry {
         match self {
             Self::Shim => "PATH shim",
             Self::CargoBinary => "cargo-installed binary",
+            Self::Ambiguous(_) => "unproven launcher",
+            Self::ForeignBinary => "foreign binary",
+        }
+    }
+
+    fn left_in_place_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Ambiguous(reason) => Some(reason),
+            Self::ForeignBinary => Some("unreadable executable outside cargo's bin dir"),
+            Self::Shim | Self::CargoBinary => None,
         }
     }
 }
@@ -113,8 +130,8 @@ fn is_our_binary(target: &Path, recorded: Option<&Path>, vera_home: &Path) -> bo
         || is_inside(target, vera_home)
 }
 
-/// Recognizes a candidate path as a removable Vera launcher, or leaves it
-/// unclassified so unrelated files stay untouched.
+/// Recognizes a candidate path as a removable Vera launcher or a launcher that
+/// must be reported and left in place so unrelated files stay untouched.
 ///
 /// A shim is one of the two files the installers write, naming this
 /// installation's binary, or a symlink resolving to that binary. The
@@ -134,24 +151,157 @@ fn classify_launch_entry(
         .ok()
         .and_then(shim_target)
         .is_some_and(|target| is_our_binary(Path::new(target), recorded, vera_home));
-    if launches_vera || symlink_points_at_vera(entry, vera_home, recorded) {
+    if launches_vera {
         return Some(LaunchEntry::Shim);
     }
-    // Decodable text that is not one of our templates belongs to someone else.
-    //
+
+    // A symlink is classified by its complete target chain, not by the text
+    // reached through it. This keeps a dangling link into Vera's home
+    // removable after step 2 and lets a foreign Vera-looking link be reported.
+    if symlink_points_at_vera(entry, vera_home, recorded) {
+        return Some(LaunchEntry::Shim);
+    }
+    if let Some(resolved) = resolve_symlink_chain(entry) {
+        if symlink_chain_mentions_vera(entry) || mentions_vera(&resolved.to_string_lossy()) {
+            return Some(LaunchEntry::Ambiguous(
+                "symlink mentions Vera but resolves outside its data dir",
+            ));
+        }
+        return None;
+    }
+
+    if let Ok(contents) = read_as_text.as_deref() {
+        if text_mentions_vera(contents) {
+            return Some(LaunchEntry::Ambiguous(
+                "mentions Vera but is not a recognized launcher",
+            ));
+        }
+        return None;
+    }
+
     // The cargo arm needs evidence of its own, and the only evidence available
     // is where the file sits: `cargo install` writes to `~/.cargo/bin`, so an
     // unreadable executable named `vera` there is a cargo artifact by
     // construction. In the other candidate directories it is just somebody
     // else's program with the same name. Checking the executable *format*
     // would not help, because any binary named `vera` passes that too.
+    let is_executable_binary =
+        fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file()) && is_executable(entry);
     let is_cargo_binary = entry
         .parent()
         .is_some_and(|parent| is_cargo_bin_dir(parent, cargo_bin))
-        && read_as_text.is_err()
-        && fs::symlink_metadata(entry).is_ok_and(|meta| meta.is_file())
-        && is_executable(entry);
-    is_cargo_binary.then_some(LaunchEntry::CargoBinary)
+        && is_executable_binary;
+    if is_cargo_binary {
+        return Some(LaunchEntry::CargoBinary);
+    }
+
+    // Outside cargo's own bin directory, the same unreadable executable is
+    // indistinguishable from a foreign binary with Vera's entry name. Keep it
+    // in place, but surface it so it cannot disappear from the uninstall report.
+    is_executable_binary.then_some(LaunchEntry::ForeignBinary)
+}
+
+/// Whether a value names Vera, without treating case as an ownership signal.
+fn mentions_vera(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("vera")
+}
+
+/// Whether text contains a Vera-looking launch or mention that needs review.
+///
+/// Program-position scanning keeps the ownership parser from mistaking a Vera
+/// path in a comment or argument for the launched program. The whole-text
+/// fallback is intentional for reporting: even a comment-only mention is an
+/// unproven launcher and must not be silently ignored.
+fn text_mentions_vera(text: &str) -> bool {
+    let mentions_in_program_position = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !is_comment_line(line))
+        .filter_map(launched_program)
+        .any(|program| mentions_vera(&program));
+    mentions_in_program_position || mentions_vera(text)
+}
+
+/// Whether a launcher line is a comment in any of the shells that write shims.
+///
+/// `sh` uses `#`; batch uses `::`, `rem`, and `@rem`, none of which are
+/// case-sensitive. A comment that happens to name the data directory must not
+/// count as evidence that this launcher runs it.
+fn is_comment_line(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.starts_with('#') || line.starts_with("::") {
+        return true;
+    }
+    let lowered = line.to_ascii_lowercase();
+    let lowered = lowered.strip_prefix('@').unwrap_or(&lowered);
+    lowered == "rem" || lowered.starts_with("rem ") || lowered.starts_with("rem\t")
+}
+
+/// The program a launcher line executes, if the line executes one.
+///
+/// Only the program position counts. A foreign launcher can pass our binary
+/// path as an argument, and that is not our shim. Leading `exec`, `call`,
+/// `start`, `cmd /c` and environment assignments are skipped because every
+/// shim shape shipped today puts one of them before the program.
+fn launched_program(line: &str) -> Option<String> {
+    // Strip a trailing sh comment. Batch comment lines are handled by
+    // `is_comment_line`; batch has no inline comment form worth modelling.
+    let line = match line.find(" #") {
+        Some(at) => &line[..at],
+        None => line,
+    };
+
+    for token in launcher_tokens(line) {
+        let bare = token.trim_start_matches('@');
+        let lowered = bare.to_ascii_lowercase();
+        let is_prelude = matches!(
+            lowered.as_str(),
+            "" | "exec" | "call" | "start" | "cmd" | "/c" | "/d" | "sh" | "-c"
+        );
+        // `VAR=value` prefixes, but not a path that happens to contain `=`.
+        let is_assignment = !bare.contains(std::path::MAIN_SEPARATOR) && bare.contains('=');
+        if is_prelude || is_assignment {
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+/// Split a launcher line into candidate path tokens, keeping quoted runs whole.
+///
+/// `split_whitespace` alone would tear a quoted path containing spaces apart,
+/// so a real shim under such a home directory would stop being recognized.
+fn launcher_tokens(line: &str) -> impl Iterator<Item = String> + '_ {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in line.chars() {
+        match quote {
+            Some(open) if ch == open => {
+                quote = None;
+                tokens.push(std::mem::take(&mut current));
+            }
+            Some(_) => current.push(ch),
+            None if ch == '"' || ch == '\'' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                quote = Some(ch);
+            }
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens.into_iter()
 }
 
 /// Resolves `.` and `..` textually. Used instead of `canonicalize` because the
@@ -218,6 +368,31 @@ fn resolve_symlink_chain(entry: &Path) -> Option<PathBuf> {
 fn symlink_points_at_vera(entry: &Path, vera_home: &Path, recorded: Option<&Path>) -> bool {
     resolve_symlink_chain(entry)
         .is_some_and(|resolved| is_our_binary(&resolved, recorded, vera_home))
+}
+
+/// Whether any target in a symlink chain mentions Vera.
+///
+/// `resolve_symlink_chain` intentionally returns only the landing path. The
+/// classification also needs to retain the safety signal from an intermediate
+/// target such as `PATH/vera -> /opt/vera-alias -> /opt/other/tool`: it lands
+/// outside this installation, but silently ignoring the Vera-looking chain
+/// would make an unproven PATH entry disappear from the report.
+fn symlink_chain_mentions_vera(entry: &Path) -> bool {
+    let mut current = entry.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(target) = fs::read_link(&current) else {
+            return false;
+        };
+        if mentions_vera(&target.to_string_lossy()) {
+            return true;
+        }
+        current = if target.is_absolute() {
+            target
+        } else {
+            current.parent().unwrap_or(Path::new("")).join(target)
+        };
+    }
+    false
 }
 
 /// Where `cargo install` places binaries: `$CARGO_HOME/bin`, falling back to
@@ -380,6 +555,9 @@ fn run_at(
     // Removals that were skipped: the trailing report must name what stayed
     // instead of claiming a complete uninstall.
     let mut leftover_failures: Vec<(PathBuf, anyhow::Error)> = Vec::new();
+    // Entries whose ownership cannot be proven are deliberately never passed
+    // to `remove_file`, but they still make the uninstall incomplete.
+    let mut left_in_place: Vec<(PathBuf, &'static str)> = Vec::new();
     for dir in shim_candidates(home, user_bin_dir, cargo_bin) {
         for name in entry_names() {
             let entry = dir.join(name);
@@ -394,6 +572,11 @@ fn run_at(
                 // Not ours: leave it alone silently, as before.
                 continue;
             };
+            if let Some(reason) = kind.left_in_place_reason() {
+                writeln!(stderr, "  Left in place: {}: {reason}", entry.display())?;
+                left_in_place.push((entry, reason));
+                continue;
+            }
             match fs::remove_file(&entry) {
                 Ok(()) => {
                     if !removed_any_entry {
@@ -419,7 +602,9 @@ fn run_at(
 
     // Completion covers every phase that can strand files on disk: agent
     // skills and PATH entries.
-    let complete = skill_removal.failures.is_empty() && leftover_failures.is_empty();
+    let complete = skill_removal.failures.is_empty()
+        && leftover_failures.is_empty()
+        && left_in_place.is_empty();
 
     if json_output {
         let mut document = serde_json::json!({
@@ -438,6 +623,14 @@ fn run_at(
                     .collect::<Vec<_>>()
             );
         }
+        if !left_in_place.is_empty() {
+            document["left_in_place"] = serde_json::json!(
+                left_in_place
+                    .iter()
+                    .map(|(path, _)| path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
         writeln!(stdout, "{}", document)?;
     } else {
         writeln!(stderr)?;
@@ -446,6 +639,14 @@ fn run_at(
         } else {
             // The per-item stderr lines above carry the specifics.
             writeln!(stderr, "Vera was partially uninstalled.")?;
+            // The two reasons can hold at once, so neither branch may hide
+            // the other: the user needs every part that survived.
+            if !skill_removal.failures.is_empty() {
+                writeln!(stderr, "  Some skills could not be removed.")?;
+            }
+            if !left_in_place.is_empty() {
+                writeln!(stderr, "  A Vera binary is still on your PATH.")?;
+            }
         }
         writeln!(
             stderr,
@@ -604,6 +805,7 @@ mod tests {
         let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(document["removed"], serde_json::json!([]));
         assert_eq!(document["skills"], serde_json::json!([]));
+        assert!(document.get("left_in_place").is_none(), "{stdout}");
     }
 
     #[test]
@@ -888,6 +1090,129 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn classify_launch_entry_preserves_the_anchored_template_boundary() {
+        let roots = roots();
+        let cargo_bin = roots.home.join(".cargo").join("bin");
+        let target = roots.vera_home.join("bin").join("1.0.0").join("vera");
+
+        let ours = install_shim(
+            &roots.user_bin_dir,
+            &format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", target.display()),
+        );
+        assert!(matches!(
+            classify_launch_entry(&ours, &cargo_bin, &roots.vera_home, None),
+            Some(LaunchEntry::Shim)
+        ));
+
+        let ambiguous = roots.user_bin_dir.join("ambiguous");
+        fs::write(
+            &ambiguous,
+            format!(
+                "#!/bin/sh\n# see {}/config.json\nexec /opt/other/bin/tool \"$@\"\n",
+                roots.vera_home.display()
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_launch_entry(&ambiguous, &cargo_bin, &roots.vera_home, None),
+            Some(LaunchEntry::Ambiguous(_))
+        ));
+
+        let unrelated = roots.user_bin_dir.join("unrelated");
+        fs::write(&unrelated, "#!/bin/sh\necho hello\n").unwrap();
+        assert!(classify_launch_entry(&unrelated, &cargo_bin, &roots.vera_home, None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_launch_entry_distinguishes_cargo_and_foreign_binaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let roots = roots();
+        let cargo_bin = roots.home.join(".cargo").join("bin");
+        fs::create_dir_all(&cargo_bin).unwrap();
+
+        let cargo = cargo_bin.join("vera");
+        let foreign = roots.user_bin_dir.join("vera");
+        for path in [&cargo, &foreign] {
+            fs::write(path, [0x7f, b'E', b'L', b'F', 0xcf]).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert!(matches!(
+            classify_launch_entry(&cargo, &cargo_bin, &roots.vera_home, None),
+            Some(LaunchEntry::CargoBinary)
+        ));
+        assert!(matches!(
+            classify_launch_entry(&foreign, &cargo_bin, &roots.vera_home, None),
+            Some(LaunchEntry::ForeignBinary)
+        ));
+    }
+
+    #[test]
+    fn launcher_parser_skips_comments_and_arguments_when_finding_programs() {
+        assert!(is_comment_line("  # Vera launcher"));
+        assert!(is_comment_line(" REM Vera launcher"));
+        assert!(is_comment_line(" @REM Vera launcher"));
+        assert!(is_comment_line(" :: Vera launcher"));
+        assert!(!is_comment_line(" remote Vera launcher"));
+
+        assert_eq!(
+            launched_program("VERA_LOG=warn exec \"/opt/vera/bin/vera\" \"$@\""),
+            Some("/opt/vera/bin/vera".to_owned())
+        );
+        assert_eq!(
+            launched_program("exec /usr/bin/backup --runner \"/opt/vera/bin/vera\""),
+            Some("/usr/bin/backup".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_near_miss_target_is_never_deleted() {
+        let temp = tempdir().unwrap();
+        let vera_home = temp.path().join(".vera");
+        let cargo_bin = temp.path().join(".cargo").join("bin");
+        let target = temp.path().join("vera-tool");
+        fs::write(&target, "#!/bin/sh\necho other tool\n").unwrap();
+        let link = temp.path().join("vera");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(matches!(
+            classify_launch_entry(&link, &cargo_bin, &vera_home, None),
+            Some(LaunchEntry::Ambiguous(_))
+        ));
+    }
+
+    #[test]
+    fn an_ambiguous_shim_is_reported_and_blocks_the_complete_claim() {
+        let roots = roots();
+        let shim = roots.user_bin_dir.join("vera");
+        fs::write(
+            &shim,
+            "#!/bin/sh\nexec /opt/veracrypt/bin/veracrypt \"$@\"\n",
+        )
+        .unwrap();
+
+        let (stdout, stderr) = uninstall(&roots, true);
+
+        assert!(shim.exists(), "an unproven file must never be deleted");
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["complete"], serde_json::json!(false), "{stdout}");
+        assert_eq!(
+            document["left_in_place"],
+            serde_json::json!([shim.display().to_string()]),
+            "{stdout}"
+        );
+        assert!(document.get("left_behind").is_none(), "{stdout}");
+        assert!(
+            stderr.contains("Left in place") && stderr.contains(&shim.display().to_string()),
+            "{stderr}"
+        );
+    }
+
     /// The exact file `packages/npm-cli/bin/vera.js` and the Python wrapper
     /// write, built from the same Vera home the uninstall resolves.
     #[cfg(unix)]
@@ -1062,7 +1387,7 @@ mod tests {
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let (_, stderr) = uninstall(&roots, false);
+        let (stdout, stderr) = uninstall(&roots, true);
 
         assert!(
             !ours.exists(),
@@ -1071,6 +1396,17 @@ mod tests {
         assert!(
             theirs.exists(),
             "deleted an unreadable executable that cargo never wrote: {stderr}"
+        );
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["complete"], serde_json::json!(false), "{stdout}");
+        assert_eq!(
+            document["left_in_place"],
+            serde_json::json!([theirs.display().to_string()]),
+            "the foreign binary must be reported: {stdout}"
+        );
+        assert!(
+            stderr.contains("Left in place") && stderr.contains(&theirs.display().to_string()),
+            "the foreign binary must be named on stderr: {stderr}"
         );
     }
 
@@ -1308,7 +1644,12 @@ mod tests {
         let (_, stderr) = uninstall(&roots, false);
 
         assert!(link.symlink_metadata().is_ok(), "deleted a foreign symlink");
-        assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+        assert!(stderr.contains("Left in place"), "{stderr}");
+        assert!(
+            stderr.contains("Vera was partially uninstalled."),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Vera has been uninstalled."), "{stderr}");
     }
 
     /// The whole corpus of foreign launchers accumulated over ten review
@@ -1349,7 +1690,12 @@ mod tests {
             let (_, stderr) = uninstall(&roots, false);
 
             assert!(foreign.exists(), "claimed a foreign launcher: {body:?}");
-            assert!(stderr.contains("Vera has been uninstalled."), "{stderr}");
+            assert!(stderr.contains("Left in place"), "{stderr}");
+            assert!(
+                stderr.contains("Vera was partially uninstalled."),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("Vera has been uninstalled."), "{stderr}");
         }
     }
 
