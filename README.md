@@ -200,8 +200,6 @@ How to read this table honestly: the full-suite gap (`0.8437` vs `0.8514`) is me
 
 For agents in real coding sessions, the measurable effects are context and workflow, not just ranking: Vera returns symbol-bounded chunks (75-95% fewer tokens than file reads), ships incremental updates and watch mode so the index tracks edits, and in a blind-graded four-arm agent benchmark a mid-tier model reached the same answer quality while consuming 27% less context with local Potion defaults and 48% less with the Qwen API embedding+reranker pair.
 
-The Vera row is from the 9800X3D host and the Semble column predates the CPU change, so latency columns are indicative, not a controlled comparison. See [docs/benchmarks.md](docs/benchmarks.md) for the screening tables, the agent-level benchmark, and historical comparisons.
-
 Full methodology and version history: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Configure Your AI Agent
