@@ -1370,6 +1370,59 @@ mod tests {
         );
     }
 
+    /// Runs the real probe against this machine's `d3d12.dll` (#248). The
+    /// answer is hardware-dependent, so what is pinned is the plumbing: the
+    /// export resolves, the transmuted ABI returns a documented value for a
+    /// null `ppDevice` (`S_FALSE` or a failing `HRESULT`, never `S_OK`), and
+    /// the probe's verdict is that value's sign. The raw `HRESULT` is printed
+    /// so a CI log doubles as field evidence.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_real_probe_agrees_with_a_direct_d3d12createdevice_call() {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
+        };
+
+        let module = unsafe {
+            LoadLibraryExA(
+                c"d3d12.dll".as_ptr().cast(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        assert!(
+            !module.is_null(),
+            "d3d12.dll ships with every supported Windows"
+        );
+        let symbol = unsafe { GetProcAddress(module, c"D3D12CreateDevice".as_ptr().cast()) }
+            .expect("d3d12.dll exports D3D12CreateDevice");
+        let create_device: D3d12CreateDevice = unsafe { std::mem::transmute(symbol) };
+        let hresult = unsafe {
+            create_device(
+                std::ptr::null_mut(),
+                D3D_FEATURE_LEVEL_11_0,
+                &IID_ID3D12_DEVICE,
+                std::ptr::null_mut(),
+            )
+        };
+        println!(
+            "D3D12CreateDevice(null adapter, 11_0, ID3D12Device, null ppDevice) -> 0x{hresult:08x}"
+        );
+        assert_ne!(hresult, 0, "a null ppDevice never yields S_OK");
+        assert!(
+            hresult == 1 || hresult < 0,
+            "expected S_FALSE or a failing HRESULT, got 0x{hresult:08x}"
+        );
+
+        let supported = hresult >= 0;
+        assert_eq!(has_directx12_adapter(), supported);
+        assert_eq!(
+            directml_provider_for_d3d12(has_directx12_adapter()),
+            supported.then_some(OnnxExecutionProvider::DirectMl)
+        );
+        println!("has_directx12_adapter() -> {supported}");
+    }
+
     /// Every non-Windows target answers "no" without a probe, so auto-detect
     /// reaches the shared Potion Code fallback rather than a backend that
     /// cannot load.
