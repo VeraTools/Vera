@@ -989,36 +989,50 @@ pub fn vera_home_dir() -> Result<PathBuf> {
     }
 
     let home = dirs::home_dir().context("Could not find home directory")?;
-    Ok(resolve_vera_home_dir(&home, dirs::data_dir()))
+    resolve_vera_home_dir(&home, dirs::data_dir())
 }
 
 /// Files a stray `~/.vera` may contain without counting as an installation.
 /// Older releases wrote the update-check cache there unconditionally, which
-/// must not shadow a populated XDG data directory.
+/// must not shadow a populated XDG data directory. Hidden files (`.DS_Store`,
+/// editor swap files) are incidental as well.
 const LEGACY_HOME_INCIDENTAL_FILES: &[&str] = &["update-check.json"];
 
-fn resolve_vera_home_dir(home: &Path, data_dir: Option<PathBuf>) -> PathBuf {
+fn resolve_vera_home_dir(home: &Path, data_dir: Option<PathBuf>) -> Result<PathBuf> {
     let legacy = home.join(".vera");
-    if is_legacy_installation(&legacy) {
-        return legacy;
+    if is_legacy_installation(&legacy)? {
+        return Ok(legacy);
     }
 
-    match data_dir {
+    Ok(match data_dir {
         Some(data) => data.join("vera"),
         None => legacy,
-    }
+    })
 }
 
-fn is_legacy_installation(legacy: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(legacy) else {
-        return false;
+fn is_legacy_installation(legacy: &Path) -> Result<bool> {
+    let entries = match std::fs::read_dir(legacy) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("Could not read legacy Vera directory {}", legacy.display())
+            });
+        }
     };
-    entries.flatten().any(|entry| {
-        let name = entry.file_name();
-        !LEGACY_HOME_INCIDENTAL_FILES
-            .iter()
-            .any(|incidental| name == *incidental)
-    })
+    for entry in entries {
+        let name = entry
+            .with_context(|| format!("Could not read entry in {}", legacy.display()))?
+            .file_name();
+        let incidental = name.to_string_lossy().starts_with('.')
+            || LEGACY_HOME_INCIDENTAL_FILES
+                .iter()
+                .any(|incidental| name == *incidental);
+        if !incidental {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1032,11 +1046,34 @@ mod home_dir_tests {
         let data = temp.path().join("data");
         std::fs::create_dir_all(home.join(".vera")).unwrap();
         std::fs::write(home.join(".vera").join("update-check.json"), "{}").unwrap();
+        std::fs::write(home.join(".vera").join(".DS_Store"), "").unwrap();
 
         assert_eq!(
-            resolve_vera_home_dir(&home, Some(data.clone())),
+            resolve_vera_home_dir(&home, Some(data.clone())).unwrap(),
             data.join("vera")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_legacy_dir_is_an_error_not_a_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let legacy = home.join(".vera");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("config.json"), "{}").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&legacy).is_ok() {
+            // Running as root; permissions are not enforced.
+            std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let result = resolve_vera_home_dir(&home, Some(temp.path().join("data")));
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1048,7 +1085,10 @@ mod home_dir_tests {
         std::fs::write(home.join(".vera").join("update-check.json"), "{}").unwrap();
         std::fs::write(home.join(".vera").join("config.json"), "{}").unwrap();
 
-        assert_eq!(resolve_vera_home_dir(&home, Some(data)), home.join(".vera"));
+        assert_eq!(
+            resolve_vera_home_dir(&home, Some(data)).unwrap(),
+            home.join(".vera")
+        );
     }
 
     #[test]
@@ -1058,10 +1098,13 @@ mod home_dir_tests {
         let data = temp.path().join("data");
 
         assert_eq!(
-            resolve_vera_home_dir(&home, Some(data.clone())),
+            resolve_vera_home_dir(&home, Some(data.clone())).unwrap(),
             data.join("vera")
         );
-        assert_eq!(resolve_vera_home_dir(&home, None), home.join(".vera"));
+        assert_eq!(
+            resolve_vera_home_dir(&home, None).unwrap(),
+            home.join(".vera")
+        );
     }
 }
 
