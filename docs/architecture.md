@@ -45,6 +45,8 @@ Structural search:
 
 ### `storage/`: Persistent storage
 
+#### Vector storage
+
 - `metadata.rs`: SQLite: chunk metadata, file paths, content hashes, and persisted file-level index state used for health reporting
 - `bm25.rs`: Tantivy: full-text BM25 index
 - `vector.rs`: dual sqlite-vec and flat SIMD embedding storage. The default

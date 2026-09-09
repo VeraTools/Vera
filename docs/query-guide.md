@@ -169,4 +169,4 @@ See [features: output formats](features.md#multiple-output-formats) for all opti
 
 ## Keeping Results Fresh
 
-If results feel stale after code changes, run `vera update .`. See [troubleshooting](troubleshooting.md#results-feel-stale-or-outdated) for details.
+If results feel stale after code changes, run `vera update .`. See [troubleshooting](troubleshooting.md#results-are-stale) for details.

@@ -44,7 +44,7 @@ CPU, CUDA, ROCm, and OpenVINO images available. See [docker.md](docker.md).
 
 Vera's index and search always run locally. The "backend" only controls where embedding and reranking models run.
 
-The default embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives.
+The default embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU on any supported machine. Jina ONNX and CodeRankEmbed are opt-in alternatives.
 
 ### API Mode
 
@@ -103,7 +103,7 @@ Only model calls leave your machine. Indexing, storage, and search remain local.
 
 ### CPU Local Mode
 
-The default `minishlab/potion-code-16M-v2` model runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed.
+The default `minishlab/potion-code-16M-v2` model runs locally on CPU on any supported machine.
 
 ```bash
 vera setup --potion-code

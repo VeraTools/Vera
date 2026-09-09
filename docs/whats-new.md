@@ -7,7 +7,7 @@ Release highlights from v1.0 onward. For the current benchmark tables and method
 ### Filtered search latency
 
 - Filter-during-scan is now the default for filtered vector searches. When a query carries path, glob, or language filters, the flat SIMD vector scan skips ineligible chunks before hydration instead of hydrating the whole index and filtering afterward. Measured on the full 1,251-task Semble suite (AMD Ryzen 7 9800X3D, local Potion Code embeddings, three interleaved runs per arm): full-suite p50 dropped from 12.00 ms to 6.35 ms and p95 from 139.12 ms to 65.03 ms, with ranking unchanged (same-head nDCG parity within 0.000005, well inside the ±0.001 noise band). Results are byte-identical to the unfiltered path, verified by the differential exactness suite. Disable or force with `retrieval.vector_filter_during_scan` in config or `VERA_VECTOR_FILTER_DURING_SCAN` in the environment. The evidence chain and decision record: [adr/008-filter-during-scan-default.md](adr/008-filter-during-scan-default.md). The originating investigation closed in [issue #197](https://github.com/VeraTools/Vera/issues/197).
-- The shipped full-suite nDCG is about 0.0011 lower than the state when the latency investigation opened (0.844852 to about 0.8437). That delta is attributed to intentional quality work shipped in between (split symbols, the filtered-vector truncation fix, ranking signals), not to this flag; the same measurement with the flag off shows the identical shortfall. Absolute parity with the old baseline was never the acceptance bar for this change; same-head parity was, and it passed.
+- The shipped full-suite nDCG is about 0.0011 lower than the investigation-opening state; [ADR 008](adr/008-filter-during-scan-default.md) records the same-head parity result and attribution.
 
 ### Agent-level benchmark
 
@@ -29,13 +29,13 @@ A four-arm sweep ran GLM-5.3 (high effort) against 10 cross-file Flask questions
 
 ### Indexing progress and reuse
 
-- The embedding progress bar is now honest. While parsing is still in progress it shows open-ended work so far with no percentage, then switches to a fixed total at `ParsingDone` and fills monotonically to 100%. Cancellation and mid-run failures no longer imply success, small single-window repos show a fixed total directly, and non-TTY, `--no-progress` and `--json` modes are unchanged.
+- The embedding progress bar reports open-ended work during parsing and switches to a fixed total at `ParsingDone`. While parsing is still in progress it shows open-ended work so far with no percentage, then switches to a fixed total at `ParsingDone` and fills monotonically to 100%. Cancellation and mid-run failures no longer imply success, small single-window repos show a fixed total directly, and non-TTY, `--no-progress` and `--json` modes are unchanged.
 - Evaluation lanes can reuse a current index when identity gates pass. `reuse_index: true` skips indexing only when the on-disk index matches embedding model name (including `model_aliases` and `VERA_EMBEDDING_MODEL_ALIASES`), document prefix, staleness, embedding dimension, content-affecting indexing config, and format version, with correct size accounting and BM25 never reusing.
 
 ### Ranking and retrieval
 
 - Three ranking signals for issue #196 are now toggleable with mechanism-first rationales: filename-stem boost, definition boost, and recall-pool expansion. Each has a config knob and `VERA_RANKING_*` env override, implemented separately from measurement and proven by dual-set ablations on the 320-task subset and 180-task independent set with full-suite confirmation before any quality claim.
-- Three additional hypotheses (multiplicative path penalties, candidate-pool multiplier, 750-char chunks) are implemented as default-off knobs with correct index-identity wiring. Dual-set ablations on the 320-task subset and 180-task independent set plus full 1,251-task confirmation showed each below the 0.5% full-suite aggregate bar or with regression, so all three stay default off with honest negatives recorded. The chunk arm cites the prior 2048 window and cap negatives and reports its own index-time and storage cost.
+- Three additional hypotheses (multiplicative path penalties, candidate-pool multiplier, 750-char chunks) are implemented as default-off knobs with correct index-identity wiring. Dual-set ablations on the 320-task subset and 180-task independent set plus full 1,251-task confirmation showed each below the 0.5% full-suite aggregate bar or with regression, so all three stay default off with negative results recorded. The chunk arm cites the prior 2048 window and cap negatives and reports its own index-time and storage cost.
 - Reranker protocol now cleanly separates generic (`top_n` / `results`) from Voyage (`top_k` / `data`) with explicit config override over hostname auto-detection, and resilience covers permanent 4xx no-retry, capped `Retry-After` and `X-RateLimit-Reset` waits, cancellation, and graceful degradation.
 
 ### Setup and first-run
@@ -45,8 +45,7 @@ A four-arm sweep ran GLM-5.3 (high effort) against 10 cross-file Flask questions
 
 ### Evaluation and provenance
 
-- Result JSONs now record host CPU model from `/proc/cpuinfo` and the three `VERA_RANKING_*` env values in `version_info.environment`, so future hardware changes and signals arms are detectable from artifacts alone with a graceful non-Linux fallback.
-- `docs/197-profiling.md` now carries a hardware caveat: the 9.93 ms p50 and 73.26 ms p95 numbers were measured on Ryzen 7 7600X3D and are not comparable to post-2026-08-28 measurements on Ryzen 7 9800X3D without the same-host re-baseline (mean 7.88 ms p50 and 60.88 ms p95 on three `072c725` runs).
+Benchmark methodology and provenance are maintained in [Benchmarks](benchmarks.md).
 
 ### Compatibility
 
