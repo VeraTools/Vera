@@ -701,14 +701,11 @@ async fn val_015_missing_stale_fallback() {
 
 // Helper to check that overcap fixture exists — env override for CI portability.
 fn overcap_path() -> Option<std::path::PathBuf> {
-    let Some(env_path) = std::env::var_os("VERA_OVERCAP_FIXTURE")
+    let env_path = std::env::var_os("VERA_OVERCAP_FIXTURE")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             dirs::home_dir().map(|home| home.join(".cache/vera-validation/fixtures/overcap/.vera"))
-        })
-    else {
-        return None;
-    };
+        })?;
     if env_path.exists() {
         Some(env_path)
     } else {
