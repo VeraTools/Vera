@@ -90,3 +90,37 @@ jobs:
 
       - name: Check compilation against MSRV
         run: cargo check --workspace --all-targets
+
+  windows-probe:
+    name: Windows D3D12 probe (windows-2025)
+    runs-on: blacksmith-16vcpu-windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+      - name: Set MSVC CRT flags
+        shell: bash
+        run: |
+          echo "CFLAGS=/MD" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=/MD" >> "$GITHUB_ENV"
+
+      - name: Download vendored grammars
+        shell: bash
+        run: bash scripts/bootstrap-vendored-grammars.sh
+
+      # Executes has_directx12_adapter against the runner's real d3d12.dll and
+      # prints the raw HRESULT, so the log is field evidence for #248.
+      - name: Run setup probe tests on real Windows
+        run: cargo test -p vera-cli --bin vera setup -- --nocapture
