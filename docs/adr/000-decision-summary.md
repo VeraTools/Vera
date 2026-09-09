@@ -9,6 +9,11 @@ These are the main technical choices behind Vera's current architecture. Earlier
 | Embedding | Potion Code local default; API and Jina ONNX opt in | [003](003-embedding-model.md) |
 | Chunking | Symbol-aware via tree-sitter AST | [004](004-chunking-strategy.md) |
 | Retrieval | BM25 + Vector + RRF + Query-aware ranking + optional reranking | [005](005-query-aware-retrieval.md) |
+| Ranking signals | Toggleable ranking signals, implemented separately from measurement | [006](006-ranking-signals.md) |
+| Ranking hypotheses | Candidate-pool, path-penalty, and chunk-size hypotheses (tested, kept default-off) | [007](007-ranking-hypotheses.md) |
+| Filter-scan default | Filtered vector scans enabled by default after profiling | [008](008-filter-during-scan-default.md) |
+| Filter-scan profiling | Persistent-index query-latency profile and bounded resident state | [009](009-filter-scan-profiling.md) |
+| Reranker batching | Client-side batch setting retained as the batching contract | [010](010-reranker-server-batching.md) |
 
 ADR 003 records the original spike evaluation. Its default-model conclusion was superseded in v1.1.0; the table above reflects the current default.
 

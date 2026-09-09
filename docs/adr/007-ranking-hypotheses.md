@@ -1,6 +1,6 @@
-# ADR 007: Issue #196 Remaining Hypotheses: Multiplicative Path Penalty, Candidate-Pool Multiplier, 750-Char Chunks (DEFAULT OFF)
+# ADR 007: Ranking Hypotheses: Multiplicative Path Penalty, Candidate-Pool Multiplier, 750-Char Chunks (DEFAULT OFF)
 
-Status: implemented behind toggleable knobs, DEFAULT OFF; measurement owned by `issue-196-hypotheses-measurement` (separate PR)
+Status: implemented behind toggleable knobs, DEFAULT OFF; measurement owned by `ranking-hypotheses-measurement` (separate PR)
 
 ## Context
 
@@ -48,7 +48,7 @@ Parameter `5` is carried from the mechanism hypothesis (5× top_k as named in th
 
 ### 3. ~750-character chunks: finer embedding locality (touches index format / identity)
 
-**Prior negative (#67):** two larger-window / larger-cap experiments were run and kept as honest negatives with cost columns:
+**Prior negative (#67):** two larger-window / larger-cap experiments were run and kept as negative results with cost columns:
 
 - **window-2048 on jina:** `-0.23%` nDCG for `+88%` index time (stored, hypothesis rejected)
 - **2048-byte cap on potion:** `-1.24%` subset / `-0.21%` full nDCG, `+24%` index time, `+15%` storage (kept status quo `512/24576`)
@@ -68,7 +68,7 @@ Parameter `750` is carried from the mechanism hypothesis (finer locality than 24
 Per VAL-ISSUE-025 / VAL-ISSUE-026:
 
 - No `benchmarks/results/*.json` was committed in this PR; no measured quality claim (subset, full-suite, or independent) appears here.
-- No with/without ablation was executed to tune knobs; every new knob defaults **OFF** so the signals-off reference (post-m8 rebaseline, `issue-196-measurement` will evaluate hypotheses against that baseline on the 320-task subset and 180-task independent set at named commits with `vera_git_sha` provenance).
+- No with/without ablation was executed to tune knobs; every new knob defaults **OFF** so the signals-off reference (post-m8 rebaseline, `ranking-signals-measurement` will evaluate hypotheses against that baseline on the 320-task subset and 180-task independent set at named commits with `vera_git_sha` provenance).
 - No heuristic constants (0.3, 5, 750) were derived from ground-truth inspection or score-chasing; they are carried from the issue's mechanism reasoning.
 - No tuning of existing signals (`KEYWORD_PATH_WEIGHT`, `COVERAGE_WEIGHT`, `FILE_SATURATION`, etc.) occurred.
 - The PR is implementation-only; measurement artifacts (result JSONs with `index_time_secs` / `storage_size_bytes` cost columns, and the chunk-arm's explicit cross-reference to #67's `-0.23%` / `+88%` and `-1.24%/ -0.21%` / `+24%` / `+15%` numbers) belong to the separate measurement PR which also satisfies VAL-ISSUE-027 through VAL-ISSUE-030.

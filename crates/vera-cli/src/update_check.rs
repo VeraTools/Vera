@@ -4,8 +4,8 @@
 //! 1. **Skill staleness** — compares binary version against `.version` files
 //!    written by `vera agent install` into each agent client's skill directory.
 //! 2. **Binary staleness** — fetches the latest release tag from GitHub (cached
-//!    for 24 hours in `~/.vera/update-check.json`) and compares against the
-//!    running binary version.
+//!    for 24 hours in `update-check.json` in the Vera data directory) and compares
+//!    against the running binary version.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -235,7 +235,9 @@ struct UpdateCache {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".vera").join("update-check.json"))
+    crate::state::vera_dir()
+        .ok()
+        .map(|dir| dir.join("update-check.json"))
 }
 
 fn check_binary_staleness() {

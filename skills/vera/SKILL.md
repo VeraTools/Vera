@@ -14,7 +14,7 @@ Ranked code search over an indexed repository. Results are markdown codeblocks: 
 | Read files to find where something lives | `vera search "config object construction"` |
 | Read files to understand how something works | `vera search "env file loading decision"` |
 | Find documentation on a topic | `vera search "deploying behind proxy" --scope docs` |
-| Find every occurrence of a pattern | `vera grep "TODO\|FIXME"` |
+| Find every occurrence of a pattern | `vera grep "TODO|FIXME"` |
 | `vera grep` with `--path` matches nothing | Check stderr: when every `--path` pattern matches zero indexed files, Vera suggests a wildcard directory alternative (for example `src/**/` instead of `src/`) |
 | Find callers or callees of a symbol | `vera references make_config` |
 | Find definitions, routes, env reads | `vera structural env` / `vera structural routes` |

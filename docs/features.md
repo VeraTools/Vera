@@ -21,7 +21,7 @@ After fusion, Vera can send the top candidates to a cross-encoder that reads que
 
 Vera supports local cross-encoders (Jina) and remote reranking endpoints (Jina, Cohere, or Voyage AI `rerank-2` with `RERANKER_MODEL_BASE_URL=https://api.voyageai.com/v1`). The reranker wire protocol is configured via `retrieval.reranker_protocol` (`generic` with `top_n`/`results` or `voyage` with `top_k`/`data`); Vera auto-detects the variant from the reranker hostname and `retrieval.reranker_protocol` overrides it explicitly.
 
-The 2026-08-23 dual-set screening found no cross-encoder improvement over the no-reranker baseline. See [models.md](models.md#reranking) for the scores and the recommended `mxbai-rerank-xsmall-v1` local override.
+The 2026-08-23 dual-set screening found no cross-encoder improvement over the no-reranker baseline. See [models.md](models.md#reranking) for the scores and optional reranking guidance.
 
 Large candidate sets are automatically batched (default 20 per request, configurable via `VERA_MAX_RERANK_BATCH`). Individual documents exceeding the reranker's context window are truncated at the last newline boundary before the character limit (default 4800, configurable via `VERA_MAX_RERANK_DOC_CHARS`). Both settings work automatically with no required configuration.
 
@@ -166,13 +166,15 @@ Use this as the default structural workflow. Use `vera references` for exact cal
 
 Indexing, storage, and search always stay on your machine. The backend choice only affects where embeddings and reranking run:
 
-- **Potion Code**: `vera setup --potion-code` selects the default `minishlab/potion-code-16M-v2` static embedding model. It runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed.
+- **Potion Code**: `vera setup --potion-code` selects the default `minishlab/potion-code-16M-v2` static embedding model. It runs locally on CPU on any supported machine.
 - **Jina ONNX GPU**: `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag selects an opt-in ONNX embedding backend. The local pipeline runs without external calls.
 - **API mode (Qwen preset, recommended)**: `qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` with a single shared key and the generic rerank protocol (auto-detected). Or point at any OpenAI-compatible endpoint (remote APIs or local servers like llama.cpp). Only model calls leave your machine. Query prefixes for asymmetric embedding models (Qwen3, CodeRankEmbed, E5, BGE) are auto-detected from the model ID. Override with `EMBEDDING_QUERY_PREFIX` for unsupported models. See [llama-cpp-setup.md](llama-cpp-setup.md) for a step-by-step guide.
 
 ### Curated Local Models
 
-The default local embedding model is `minishlab/potion-code-16M-v2`, a static embedding model that runs locally on CPU:
+Vera includes a default local embedding model and opt-in Jina and CodeRankEmbed alternatives. See [Models and Backends](models.md) for model roles, screening results, and setup details.
+
+The default local embedding model is `minishlab/potion-code-16M-v2`:
 
 | Model | Role |
 |-------|------|
@@ -193,7 +195,7 @@ Auto-detected during setup. Supported backends:
 
 | Flag | Hardware |
 |------|----------|
-| `--potion-code` | Default local inference, runs locally on CPU; no GPU or ONNX Runtime needed |
+| `--potion-code` | Default local inference, runs locally on CPU |
 | `--onnx-jina-cuda` | NVIDIA (CUDA 12+) |
 | `--onnx-jina-rocm` | AMD (Linux, ROCm) |
 | `--onnx-jina-directml` | Any DirectX 12 GPU (Windows) |
@@ -208,7 +210,7 @@ Local ONNX indexing shapes micro-batches from actual token lengths rather than u
 
 ### Custom Local Embeddings
 
-Swap the opt-in Jina ONNX embedding model without changing the rest of that pipeline. Point at a Hugging Face repo, a direct URL, or a local directory with custom pooling, query prefix, and dimension settings. Local rerankers support Hugging Face repository, revision, ONNX file, and tokenizer overrides through `LOCAL_RERANKER_*` environment variables. See [models.md](models.md#reranking) for the recommended model.
+Swap the opt-in Jina ONNX embedding model without changing the rest of that pipeline. Point at a Hugging Face repo, a direct URL, or a local directory with custom pooling, query prefix, and dimension settings. Local rerankers support Hugging Face repository, revision, ONNX file, and tokenizer overrides through `LOCAL_RERANKER_*` environment variables; see [Configuration](configuration.md) for the complete reference.
 
 ## Output and Integration
 
@@ -249,9 +251,9 @@ Docker images available for CPU, CUDA, ROCm, and OpenVINO. Details: [docker.md](
 
 ## Agent Integration
 
-### Skill Files for 31 Agent Clients
+### Skill Files for Agent Clients
 
-`vera agent install` installs skill files that teach AI agents how to write effective queries, when to use semantic search vs regex, and how to interpret results. Supports Junie, Claude Code, Cursor, Windsurf, Copilot, Cline, Roo Code, and 24 more agent clients. Skills install globally or per-project.
+`vera agent install` installs skill files that teach AI agents how to write effective queries, when to use semantic search vs regex, and how to interpret results. Supports Junie, Claude Code, Cursor, Windsurf, Copilot, Cline, Roo Code, and 30+ agent clients. Skills install globally or per-project.
 
 ### Agent Config Snippets
 
@@ -259,7 +261,8 @@ During setup, Vera offers to add a usage snippet to your project's agent config 
 
 ### Syncing Stale Skills
 
-`vera agent sync` refreshes stale agent skill installs to match the current binary version and updates Vera-owned project markdown snippets: sections wrapped in `<!-- vera:begin -->` / `<!-- vera:end -->` markers, plus unmarked legacy sections whose text still matches the generated snippet exactly (these are migrated into markers on sync). Editing anything in the section, or deleting it, takes it out of sync scope permanently. When Vera notices stale installs during normal CLI use, it refreshes skill files only, silently, and leaves project markdown unchanged.
+`vera agent sync` refreshes stale skill installs and updates Vera-owned project snippets marked with `<!-- vera:begin -->` / `<!-- vera:end -->`.
+
 
 ## CLI Tooling
 
@@ -283,7 +286,7 @@ Key flags:
 - `--port <PORT>`: TCP port to listen on (default: 3000)
 - `--host <HOST>`: bind address (default: 127.0.0.1)
 - `--api-key <KEY>`: require Bearer token authentication (or set `VERA_SERVE_KEY`)
-- `--idle-timeout <SECS>`: seconds of inactivity before unloading a model from memory (default: 300). Any negative value, `-1` included, keeps models loaded for the lifetime of the process. `0` disables the cache, rebuilding the model on every request and holding one live model per concurrent request; it exists to pick up model files replaced under a running server, and makes indexing through the server far slower.
+- `--idle-timeout <SECS>` controls model eviction after inactivity; the default is 300 seconds and negative values keep models loaded.
 - Backend flags: `--potion-code`, `--onnx-jina-cuda`, `--onnx-jina-rocm`, `--onnx-jina-coreml`, `--onnx-jina-openvino`, `--onnx-jina-directml`, or `--api`
 
 The embedding model is loaded before the server accepts connections and kept, so the first request does not pay for a load. It is then subject to the same idle eviction as any other resident model, so under the default it is unloaded after 300 seconds with no requests and reloaded on the next one.
@@ -312,8 +315,8 @@ To allow switching between equivalent embedding model names without triggering a
 
 Single static binary for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64). Install via npm (`bunx @vera-ai/cli install`), pip (`uvx vera-ai install`), prebuilt binary, Docker, or build from source.
 
-A fully static musl-linked binary (`x86_64-unknown-linux-musl`) is available for environments without standard shared libraries (NixOS, Alpine, minimal containers). It has zero runtime dependencies. The npm and pip wrappers auto-detect musl-based systems and select the correct binary. To override target selection manually, set `VERA_TARGET` (e.g., `VERA_TARGET=x86_64-unknown-linux-musl bunx @vera-ai/cli install`). The chosen target is stored in `~/.vera/install.json` so upgrades preserve it.
+A fully static musl-linked binary (`x86_64-unknown-linux-musl`) is available for environments without standard shared libraries (NixOS, Alpine, minimal containers). It has zero runtime dependencies. The npm and pip wrappers auto-detect musl-based systems and select the correct binary. To override target selection manually, set `VERA_TARGET` (e.g., `VERA_TARGET=x86_64-unknown-linux-musl bunx @vera-ai/cli install`). The chosen target is stored in the Vera data directory (see [Installation](installation.md#install-the-binary)) so upgrades preserve it.
 
 ## Benchmarks
 
-See the [current Semble comparison](benchmarks.md#2026-08-23-semble-comparison) for the current aggregate results.
+See the [current Semble comparison](benchmarks.md#current-results) for the aggregate results.

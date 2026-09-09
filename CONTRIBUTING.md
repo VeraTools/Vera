@@ -21,7 +21,7 @@ cargo test -p vera-core      # core crate only
 ## Lint & Format
 
 ```bash
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 

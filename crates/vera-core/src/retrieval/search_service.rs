@@ -57,7 +57,7 @@ impl From<crate::retrieval::hybrid::HybridTimings> for SearchTimings {
 /// Max number of indexed repositories kept resident in `SearchContext`.
 ///
 /// Each entry holds an `Arc<SearchStores>` (BM25 reader, metadata handles,
-/// mmap vector store). Profiling (`docs/197-profiling.md`): cross-repo agent
+/// mmap vector store). Profiling (`docs/adr/009-filter-scan-profiling.md`): cross-repo agent
 /// sessions that round-robin 4 repos paid ~5–10 ms per switch from reopen
 /// cost; a bounded LRU of 4 keeps hot repos resident while capping memory
 /// (4× BM25 readers + mmap handles). LRU eviction guarantees bounded
@@ -273,7 +273,7 @@ impl SearchContext {
 
         let mut stored_dim = config.embedding.max_stored_dim;
 
-        // Profiling: docs/197-profiling.md — three `get_index_meta` reads per
+        // Profiling: docs/adr/009-filter-scan-profiling.md — three `get_index_meta` reads per
         // query cost ~0.45 ms warm p50, served from stamp-guarded cache.
         // Propagate cache errors to BM25-only rather than silently skipping
         // compatibility checks (vector space mismatch would otherwise be missed).
@@ -1576,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn staleness_proof_modify_file_requery_never_returns_stale_chunk() {
-        // Profiling: docs/197-profiling.md — cached state must never serve stale chunks.
+        // Profiling: docs/adr/009-filter-scan-profiling.md — cached state must never serve stale chunks.
         // This test proves cycle-state keying: modify a file, re-index, re-query without
         // restarting SearchContext; the pre-modification chunk is impossible to return.
         use crate::indexing::{index_dir, index_repository};
@@ -1655,7 +1655,7 @@ mod tests {
 
     #[test]
     fn memory_bounded_across_multiple_indexed_repos_with_recorded_envelope() {
-        // Profiling: docs/197-profiling.md — cross-repo resident store can grow
+        // Profiling: docs/adr/009-filter-scan-profiling.md — cross-repo resident store can grow
         // unbounded with single-slot toggle behavior; LRU of 4 caps memory.
         use crate::indexing::{index_dir, index_repository};
         let rt = tokio::runtime::Runtime::new().unwrap();

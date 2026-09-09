@@ -1,19 +1,19 @@
-# Local Models
+# Models and Backends
 
 Vera runs in two modes, and both start from the same setup wizard:
 
 - **API mode with the Qwen preset (recommended)**: `qwen/qwen3-embedding-8b` plus `qwen/qwen3-reranker-8b` through OpenRouter with a single shared API key. Measured on the 320-task Semble subset, the Qwen pair with reranking scored `0.8647` nDCG@10 versus `0.8538` for local-only defaults, with recall@1 up three points: the strongest quality configuration Vera ships. Setup is one key entry and the wizard fills the rest.
-- **Local mode with Potion Code (the easy default)**: `minishlab/potion-code-16M-v2` runs locally on CPU on any supported machine, no GPU or ONNX Runtime needed, and indexes the 63-repository Semble corpus in about two minutes. It is what you get with no API key, no account, and no GPU or ONNX Runtime requirement.
+- **Local mode with Potion Code (the easy default)**: `minishlab/potion-code-16M-v2` runs locally on CPU on any supported machine, and indexes the 63-repository Semble corpus in about two minutes. It is what you get with no API key, no account, and no GPU or ONNX Runtime requirement.
 
-The Qwen numbers above are screening measurements on the tuning subset, not full-suite claims; the honest comparison is that API mode trades a paid endpoint and network latency for measured reranker gains, while local mode is free, private, and fast enough for interactive use.
+The Qwen numbers above are screening measurements on the tuning subset, not full-suite claims. API mode trades a paid endpoint and network latency for measured reranker gains, while local mode is private and runs without an API key.
 
-`vera setup` downloads model assets into the Vera data directory (`$XDG_DATA_HOME/vera/models/`, or `~/.vera/models/` on existing installs). Jina ONNX backends also install the matching ONNX Runtime library into `lib/`.
+`vera setup` downloads model assets into the Vera data directory (see [Installation](installation.md#set-up-a-backend)). Jina ONNX backends also install the matching ONNX Runtime library into `lib/`.
 
 ## Curated Embedding Options
 
 | Option | Command | Notes |
 | --- | --- | --- |
-| Potion Code | `vera setup --potion-code` | Default local embedding model: [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2). Runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. |
+| Potion Code | `vera setup --potion-code` | Default local embedding model: [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2). Runs locally on CPU on any supported machine. |
 | Jina v5 nano retrieval | `vera setup --onnx-jina-cuda` or another `--onnx-jina-*` flag | Opt-in GPU local backend. The retrieval variant is asymmetric, so Vera prefixes queries with `Query:` and indexed passages with `Document:`. |
 | CodeRankEmbed | `vera setup --onnx-jina-cuda --code-rank-embed` | Optional ONNX embedding preset for code-specific or embedding-only experiments. Current screening results are below. |
 
@@ -50,7 +50,7 @@ In the 2026-08-23 dual-set screening, every tested cross-encoder scored below th
 | `mxbai-rerank-xsmall-v1` | 0.8497 / 0.7564 |
 | `gte-reranker-modernbert-base` | 0.8472 / 0.7525 |
 
-`mxbai-rerank-xsmall-v1` is the recommended opt-in reranker when you need a cross-encoder. Configure the local model with:
+Reranking is off by default. Use an API reranker, including the Qwen preset, when you want optional reranking; tested local cross-encoders scored below the no-rerank baseline, with `mxbai-rerank-xsmall-v1` the closest. Configure a local model with:
 
 ```bash
 vera config set retrieval.reranking_enabled true
@@ -63,7 +63,7 @@ export LOCAL_RERANKER_TOKENIZER_FILE=tokenizer.json
 
 ## CodeRankEmbed Comparison
 
-See the [canonical CodeRankEmbed comparison](benchmarks.md#optional-coderankembed-preset) for the 6-task results and context.
+See the [canonical CodeRankEmbed comparison](benchmarks-history.md#optional-coderankembed-preset) for the 6-task results and context.
 
 ## Custom Local Embedding Models
 
@@ -136,11 +136,15 @@ If your model uses different names, pass the matching `--embedding-*` flags.
 
 The default Potion Code model runs on all supported machines. Use Jina ONNX with CUDA, ROCm, CoreML, DirectML, or OpenVINO when you want an opt-in alternative. After the first index, `vera update .` only re-embeds changed files, so updates are fast on any backend.
 
-| Backend | Hardware | Time | Notes |
-|---------|----------|------|-------|
-| CUDA | RTX 4080 | **~8 s** | Recommended for large repos |
-| API mode | Remote GPU | ~56 s | Requires API key, no local compute |
-| Jina ONNX CPU | Ryzen 5 7600X3D (6c/12t) | ~6 min | Compatibility path. Use Potion Code for CPU-only machines |
+Reference points, each measured on a different corpus:
+
+| Backend | Hardware | Corpus | Index time |
+|---------|----------|--------|------------|
+| Potion Code (default) | AMD Ryzen 7 9800X3D, CPU | Semble suite, 63 repositories | 115 s |
+| Jina ONNX, CUDA | RTX 4080 | Vera's own codebase (239 files, ~3,100 chunks) | ~8 s |
+| Jina ONNX, CPU | Ryzen 5 7600X3D (6c/12t) | Vera's own codebase (239 files, ~3,100 chunks) | ~6 min |
+
+Jina ONNX on CPU is a compatibility path; use Potion Code on CPU-only machines.
 
 ## API Mode
 
