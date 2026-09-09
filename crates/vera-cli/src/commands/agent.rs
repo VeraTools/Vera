@@ -1181,25 +1181,29 @@ fn sync_with_options(
 const VERA_SNIPPET_BEGIN_MARKER: &str = "<!-- vera:begin -->";
 const VERA_SNIPPET_END_MARKER: &str = "<!-- vera:end -->";
 const AGENTS_MD_SNIPPET_HEADING: &str = "## Code Search";
-const AGENTS_MD_SNIPPET_INTRO: &str = "Before reading files to answer \"where is X\", \"how does Y work\", or \"find Z\", search first with Vera.";
+const AGENTS_MD_SNIPPET_INTRO: &str = "Your first search in this repository goes through Vera, not grep, rg, or file reads: run `vera overview` when you have not searched this repository yet, then `vera search \"<what the code does>\"`. Fall back to grep or rg only after a Vera call has missed.";
 
 const AGENTS_MD_SNIPPET: &str = r#"## Code Search
 
 <!-- vera:begin -->
 
-Before reading files to answer "where is X", "how does Y work", or "find Z", search first with Vera.
+Your first search in this repository goes through Vera, not grep, rg, or file reads: run `vera overview` when you have not searched this repository yet, then `vera search "<what the code does>"`. Fall back to grep or rg only after a Vera call has missed.
 
-- `vera search "query"` for semantic code search. Describe behavior: "JWT validation", not "auth". If one phrasing misses, try 2-3 varied queries or add `--intent "goal"`.
-- `vera grep "pattern"` for exact text or regex in indexed files
-- `vera references <symbol>` for callers and `vera references <symbol> --callees` for callees; add `--receiver <name>` when several definitions share a name
-- `vera structural definitions <symbol>`, `vera structural env <NAME>`, `vera structural routes`, or `vera structural impls <symbol>` for common structural tasks
-- `vera explain-path path/to/file` to explain why a file is or is not indexed
-- `vera overview` for a project summary (languages, entry points, hotspots). Add `--changed`, `--since <rev>`, or `--base <rev>` to scope it to modified files.
-- `vera stats --json` for index health, including tree-sitter error, parse-failure, and Tier 0 fallback counts
-- `vera search --deep "query"` for RAG-fusion query expansion + merged ranking
-- Narrow `vera search` or `vera grep` with `--lang`, `--path`, `--type`, or `--scope docs`
-- `vera watch .` to auto-update the index, or `vera update .` after edits (`vera index .` if `.vera/` is missing)
-- For detailed usage, query patterns, and troubleshooting, read the Vera skill file installed by `vera agent install`
+Route by question type:
+
+- How or where something works: `vera search "request teardown ordering"`. Describe behavior ("JWT validation"), not nouns ("auth"). If a phrasing misses, add `--intent "<goal>"` or use `--deep`.
+- The question names a function, class, or config key: `vera structural definitions <symbol>` for the definition, `vera references <symbol>` for callers (`--callees` for callees). One call returns ranked definitions or call sites, not raw matching lines.
+- Exact text or regex: `vera grep "pattern"`. Line numbers are always shown; cap results with `--limit <N>`.
+- Enumerate every X (signals, routes, env reads, implementations): `vera structural routes`, `vera structural env <NAME>`, `vera structural impls <symbol>`, or `vera grep "X" --lang <lang>`.
+
+Working with results:
+
+- Hits are `path:start-end kind:name` plus the code. Cite from the hit; open a file only for lines the hit did not include.
+- If the top hit is a usage site, re-run with the symbol name or `vera structural definitions <symbol>` instead of trying more phrasings.
+- `--path` is relative to the repository root (`--path src/flask`, not an absolute path). Narrow with `--lang`, `--path`, `--type`, or `--scope docs`; widen with `--limit 8`.
+- Vera indexes this repository only. For dependency sources (site-packages, uv or pip caches) use rg, then return to Vera for repository code.
+- A stale-index warning does not invalidate hits. After editing files, run `vera update .` (`vera index .` if `.vera/` is missing).
+- `vera explain-path <file>`, `vera stats --json`, and detailed usage are in the Vera skill installed by `vera agent install`.
 <!-- vera:end -->
 "#;
 
@@ -1772,7 +1776,7 @@ mod tests {
     #[test]
     fn refresh_vera_snippet_in_markdown_skips_edited_legacy_section() {
         let edited = legacy_agents_md_snippet().replace(
-            "- `vera grep \"pattern\"` for exact text or regex in indexed files",
+            "- Exact text or regex: `vera grep \"pattern\"`. Line numbers are always shown; cap results with `--limit <N>`.",
             "- Use my preferred search tool instead",
         );
         let existing = format!(

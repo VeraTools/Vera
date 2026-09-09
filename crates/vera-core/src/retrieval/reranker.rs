@@ -355,7 +355,7 @@ impl ApiReranker {
                     if matches!(e, RerankerError::AuthError { .. }) || !is_retryable_error(&e) {
                         return Err(e);
                     }
-                    warn!(
+                    debug!(
                         attempt = attempt + 1,
                         max = self.config.max_retries + 1,
                         error = %e,

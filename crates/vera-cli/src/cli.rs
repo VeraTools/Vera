@@ -553,8 +553,9 @@ pub enum Commands {
         #[command(flatten)]
         filters: crate::helpers::SearchFilterArgs,
 
-        /// Maximum number of results (default: 20).
-        #[arg(long, short = 'n')]
+        /// Maximum number of results (default: 20). A bare `-n` is accepted and
+        /// treated as the default, since line numbers are always printed.
+        #[arg(long, short = 'n', num_args = 0..=1, default_missing_value = "20")]
         limit: Option<usize>,
 
         /// Case-insensitive matching.

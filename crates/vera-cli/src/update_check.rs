@@ -240,10 +240,19 @@ fn cache_path() -> Option<PathBuf> {
         .map(|dir| dir.join("update-check.json"))
 }
 
+/// Whether the "vera vX is available" hint should print: only on an
+/// interactive terminal, so agent sessions with piped stderr do not get a hint
+/// appended to every result.
+fn should_print_binary_hint(stderr_is_terminal: bool) -> bool {
+    stderr_is_terminal
+}
+
 fn check_binary_staleness() {
+    use std::io::IsTerminal;
     let status = binary_version_status(false);
     if let Some(latest) = status.latest_version.as_deref()
         && status.update_available()
+        && should_print_binary_hint(std::io::stderr().is_terminal())
     {
         print_binary_nudge(latest, &status);
     }
@@ -725,6 +734,12 @@ mod tests {
         )
         .expect("cache written");
         path
+    }
+
+    #[test]
+    fn binary_hint_only_prints_on_a_terminal() {
+        assert!(should_print_binary_hint(true));
+        assert!(!should_print_binary_hint(false));
     }
 
     #[test]
