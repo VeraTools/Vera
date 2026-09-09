@@ -55,7 +55,11 @@ The `<lane-slug>` is the results-file tag (for example `custom-GLM-5.3-Free--Tok
 
 Running the script with no mode performs setup, the full sweep, and analysis sequentially.
 
-Published results live in `results/`: `results.claude-opus-5-medium.json`, `results.kimi-k3-medium.json`, and `results.glm-5.3-free-high.json` (the four-arm sweep).
+## Published results
+
+`results/` holds three lanes. The current lane is `results.glm-5.3-free-high.json` (GLM-5.3 Free via tokenrouter, high effort, 2026-09-05): all 40 cells scored 10/10; prompt tokens (input plus cache reads) were 21.00M control, 15.39M with-vera (-27%), 10.91M with-vera-qwen (-48%), 18.49M with-semble (-12%). Only the Qwen arm's saving is statistically significant across the 10 paired questions (paired t = -3.6, Wilcoxon p = 0.037); the other two arms' confidence intervals span zero. Activation (cells with at least one tool call): 5/10 with-vera, 8/10 with-vera-qwen, 5/10 with-semble; every activation happened at or before the first search action of the cell, and no cell that skipped the tool picked it up later.
+
+The two older two-arm lanes (`results.claude-opus-5-medium.json`, `results.kimi-k3-medium.json`, 2026-08-16, medium effort) ran an earlier integration surface (no AGENTS.md snippet, an earlier skill revision, no factory-home isolation) and did not reproduce the savings direction; they are kept as history, not as cross-model evidence.
 
 ## Limitations
 
