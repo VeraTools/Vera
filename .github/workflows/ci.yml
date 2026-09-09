@@ -12,11 +12,16 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# CI runs on every push and PR, so it uses stock GitHub-hosted runners (free
+# for public repos) and never draws down Blacksmith minutes; those are
+# reserved for the tag-triggered release workflow. Stock runners are 4-vcpu
+# against Blacksmith's 8/16-vcpu labels, so timeouts are padded for the
+# slower cold builds.
 jobs:
   validate:
     name: Validate (stable)
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -63,8 +68,8 @@ jobs:
 
   msrv:
     name: MSRV Check (1.88)
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -93,8 +98,8 @@ jobs:
 
   windows-probe:
     name: Windows D3D12 probe (windows-2025)
-    runs-on: blacksmith-16vcpu-windows-2025
-    timeout-minutes: 30
+    runs-on: windows-2025
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
