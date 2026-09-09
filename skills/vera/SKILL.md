@@ -21,7 +21,7 @@ The first search action in a task decides whether Vera gets used at all; later s
 | How or where does something work | `vera search "env file loading decision"` |
 | The question names a function, class, or config key | `vera structural definitions make_config`, then `vera references make_config` for callers |
 | Who calls or what is called by a symbol | `vera references make_config` / `vera references make_config --callees` |
-| Exact text or regex | `vera grep "TODO\|FIXME"` (line numbers always shown; `--limit <N>` caps results) |
+| Exact text or regex | `vera grep "before_request"` (line numbers always shown; `--limit <N>` caps results) |
 | Enumerate every route, env read, implementation | `vera structural routes` / `vera structural env` / `vera structural impls <symbol>` |
 | Documentation on a topic | `vera search "deploying behind proxy" --scope docs` |
 | Files changed in this branch | add `--changed`, `--since <rev>`, or `--base <rev>` to any of the above |

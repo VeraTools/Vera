@@ -13,14 +13,18 @@ pub fn run(
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
     let config = state::load_runtime_config()?;
 
+    // An ancestor's `.vera/` index covers this directory too; without one the
+    // existing no-index behavior is unchanged.
+    let repo_root = crate::helpers::resolve_index_root(&cwd).unwrap_or_else(|| cwd.clone());
+
     let exact_paths = if let Some(scope) = git_scope.as_ref() {
-        Some(vera_core::git_scope::resolve_scope(&cwd, scope)?)
+        Some(vera_core::git_scope::resolve_scope(&repo_root, scope)?)
     } else {
         None
     };
-    warn_if_index_stale(&cwd, &config.indexing);
+    warn_if_index_stale(&repo_root, &config.indexing);
 
-    let overview = stats::collect_overview_filtered(&cwd, exact_paths.as_ref())?;
+    let overview = stats::collect_overview_filtered(&repo_root, exact_paths.as_ref())?;
 
     if json_output {
         let json = serde_json::to_string_pretty(&overview)

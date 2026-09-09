@@ -392,17 +392,24 @@ pub fn missing_index_message(cwd: &Path) -> String {
     )
 }
 
+/// Resolve the index root for `cwd` via [`find_index_root`], printing the
+/// `note: using index at <root>` line once when the root is an ancestor.
+pub fn resolve_index_root(cwd: &Path) -> Option<PathBuf> {
+    let root = find_index_root(cwd)?;
+    if root != cwd {
+        eprintln!("note: using index at {}", root.display());
+    }
+    Some(root)
+}
+
 pub fn prepare_indexed_repo(
     indexing_config: &vera_core::config::IndexingConfig,
 ) -> anyhow::Result<(PathBuf, PathBuf)> {
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
-    let Some(repo_root) = find_index_root(&cwd) else {
+    let Some(repo_root) = resolve_index_root(&cwd) else {
         anyhow::bail!(missing_index_message(&cwd));
     };
-    if repo_root != cwd {
-        eprintln!("note: using index at {}", repo_root.display());
-    }
     let index_dir = vera_core::indexing::index_dir(&repo_root);
     // Index format version must match: legacy suffixed rows would be silently wrong.
     {
@@ -470,6 +477,18 @@ enum PathFilterRewrite {
 /// Windows-style separators and drive-letter paths are normalized to `/` so
 /// the same rule holds whatever produced the path.
 fn absolute_path_filter_rewrite(pattern: &str, roots: &[PathBuf]) -> PathFilterRewrite {
+    absolute_path_filter_rewrite_inner(pattern, roots, cfg!(windows))
+}
+
+/// Comparison core for [`absolute_path_filter_rewrite`]. `case_insensitive`
+/// models Windows path semantics where `C:\Repo` and `c:\repo` are the same
+/// directory; the rewritten suffix is always sliced from the original pattern
+/// so its casing is preserved.
+fn absolute_path_filter_rewrite_inner(
+    pattern: &str,
+    roots: &[PathBuf],
+    case_insensitive: bool,
+) -> PathFilterRewrite {
     let normalized = pattern.replace('\\', "/");
     let bytes = normalized.as_bytes();
     let is_absolute = normalized.starts_with('/')
@@ -480,13 +499,24 @@ fn absolute_path_filter_rewrite(pattern: &str, roots: &[PathBuf]) -> PathFilterR
     if !is_absolute {
         return PathFilterRewrite::Keep;
     }
+    let matches = |a: &str, b: &str| {
+        if case_insensitive {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
     for root in roots {
         let root = root.to_string_lossy().replace('\\', "/");
         let root = root.trim_end_matches('/');
-        if normalized == root {
+        if matches(&normalized, root) {
             return PathFilterRewrite::Drop;
         }
-        if let Some(rel) = normalized.strip_prefix(&format!("{root}/")) {
+        if normalized.len() > root.len()
+            && normalized.as_bytes()[root.len()] == b'/'
+            && matches(&normalized[..root.len()], root)
+        {
+            let rel = &normalized[root.len() + 1..];
             return if rel.is_empty() {
                 PathFilterRewrite::Drop
             } else {
@@ -1224,6 +1254,24 @@ mod tests {
         assert!(matches!(
             absolute_path_filter_rewrite("C:\\repo\\src", &[PathBuf::from("C:\\repo")]),
             PathFilterRewrite::Rewrite(rel) if rel == "src"
+        ));
+        // Windows path comparison is case-insensitive; the rewritten glob keeps
+        // the pattern's own casing.
+        assert!(matches!(
+            absolute_path_filter_rewrite_inner(
+                "C:\\Repo\\Src",
+                &[PathBuf::from("c:\\repo")],
+                true
+            ),
+            PathFilterRewrite::Rewrite(rel) if rel == "Src"
+        ));
+        assert!(matches!(
+            absolute_path_filter_rewrite_inner(
+                "C:\\Repo\\Src",
+                &[PathBuf::from("c:\\repo")],
+                false
+            ),
+            PathFilterRewrite::Keep
         ));
         // The root itself becomes an empty filter and is dropped.
         assert!(matches!(
