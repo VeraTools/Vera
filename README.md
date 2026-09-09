@@ -5,10 +5,14 @@
 # Vera
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/VeraTools/Vera/blob/master/LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![CI](https://github.com/VeraTools/Vera/actions/workflows/ci.yml/badge.svg)](https://github.com/VeraTools/Vera/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@vera-ai/cli)](https://www.npmjs.com/package/@vera-ai/cli)
+[![PyPI](https://img.shields.io/pypi/v/vera-ai)](https://pypi.org/project/vera-ai/)
 [![GitHub release](https://img.shields.io/github/v/release/VeraTools/Vera?include_prereleases&sort=semver)](https://github.com/VeraTools/Vera/releases)
 [![Languages](https://img.shields.io/badge/languages-65%2B-green.svg)](docs/supported-languages.md)
 
+[Docs](docs/README.md)
+·
 [Install Guide](docs/installation.md)
 ·
 [Features](docs/features.md)
@@ -23,15 +27,15 @@
 ·
 [Supported Languages](docs/supported-languages.md)
 
-**V**ector **E**nhanced **R**eranking **A**gent
+**Local, symbol-aware code search for developers and AI agents.**
 
-Code search that combines BM25 keyword matching, vector similarity, and optional cross-encoder reranking. Supports 65 languages (61 with tree-sitter parsing), runs locally, returns structured results with file paths, line ranges, symbol metadata, and relevance scores.
+Hybrid BM25 + vector search with optional reranking, 65 languages, one static binary. Indexes stay on your machine; results come back as symbol-bounded chunks with file paths, line ranges, and scores.
+
+<sub>**V**ector **E**nhanced **R**eranking **A**gent</sub>
 
 </div>
 
-## What's New
-
-See [What's New](docs/whats-new.md) for release highlights from v1.0 onward, including search-quality measurements, local model changes, agent workflows, performance work, and reliability fixes.
+![vera search demo](docs/assets/vera-demo.gif)
 
 ## Quick Start
 
@@ -40,19 +44,20 @@ See [What's New](docs/whats-new.md) for release highlights from v1.0 onward, inc
 bunx @vera-ai/cli install   # or: npx -y @vera-ai/cli install / uvx vera-ai install
 ```
 
-**2. Set up and index** (pick one)
+**2. Set up and index**
 
-Recommended: the Qwen preset via OpenRouter (best measured search quality, single API key):
-```bash
-vera setup --api --index .          # choose the Qwen preset, paste one key
-```
-
-The zero-setup local option (runs on CPU, no key, no GPU):
+Zero-setup local (CPU, no key, no GPU):
 ```bash
 vera setup --potion-code --index .
 ```
 
-Other backends:
+Best measured search quality (one OpenRouter key, Qwen preset):
+```bash
+vera setup --api --index .
+```
+
+<details><summary>GPU and other backends</summary>
+
 ```bash
 vera setup                                  # Interactive wizard, indexes this project by default
 vera setup --onnx-jina-coreml --index .     # Apple Silicon (M1/M2/M3/M4)
@@ -61,7 +66,10 @@ vera setup --onnx-jina-rocm --index .       # AMD GPU (ROCm, Linux)
 vera setup --onnx-jina-openvino --index .   # Intel GPU (OpenVINO, Linux)
 vera setup --onnx-jina-directml --index .   # DirectX 12 GPU (Windows)
 ```
+
 The wizard also offers presets for OpenAI, Jina, and Voyage. The Qwen preset uses `qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1` with a single shared key and the generic reranker protocol.
+
+</details>
 
 **3. Search**
 ```bash
@@ -70,47 +78,88 @@ vera search "authentication logic"
 
 If the current project has no index, interactive search offers to create one. JSON and non-interactive searches still return the missing-index error.
 
-The default local embedding model is [`minishlab/potion-code-16M-v2`](https://huggingface.co/minishlab/potion-code-16M-v2), a static embedding model that runs locally on CPU on any supported machine; no GPU or ONNX Runtime needed. Jina ONNX and CodeRankEmbed are opt-in alternatives. For the highest measured search quality, use the Qwen preset through OpenRouter instead; see [docs/models.md](docs/models.md).
+**4. Keep `.vera/` out of git**
+```bash
+echo '.vera/' >> .gitignore
+```
+The index can be large and is machine-local.
+
+See [What's New](docs/whats-new.md) for release notes.
 
 ## What Sets Vera Apart
 
 | | |
 |---|---|
-| **Wins where it was never tuned** | Trails Semble by 0.008 nDCG on Semble's own benchmark set, but leads on the independent contamination set (10 fresh repositories, locally generated ground truth) and on recall@5. Vera refuses ground-truth-specific tuning, which costs home-field points and buys generalization. |
-| **Fast at query time, tiny on disk** | 6.4 ms median query latency on the 1,251-task suite (local Potion Code defaults) with a 4.7 GB index for 63 repositories (6.8x smaller than Semble's 32 GB). Filter-during-scan, enabled by default in v1.4.0, halves filtered-query latency with ranking unchanged. |
-| **Updates, not just re-indexes** | Incremental updates and watch mode keep the index current as files change. Persistent indexes survive restarts and are reused when identity checks pass. |
-| **Single binary, 65 languages** | One static binary with 61 tree-sitter grammars compiled in. No Python, no language servers, no per-language toolchains. |
-| **Built-in code intelligence** | Call graph analysis, reference finding, dead code detection, and project overview, all from the same index. |
 | **Token-efficient for agents** | Returns symbol-bounded chunks, not entire files. 75-95% fewer tokens on typical queries. In a blind-graded agent benchmark, a mid-tier model with Vera reached the same answer quality while consuming 27-48% less context (48% with the Qwen API embedding+reranker pair, 27% with local Potion defaults). |
+| **Single binary, 65 languages** | One static binary with 61 tree-sitter grammars compiled in. No Python, no language servers, no per-language toolchains. |
+| **Fast at query time, tiny on disk** | 6.4 ms median query latency on the 1,251-task suite (local Potion Code defaults) with a 4.7 GB index for 63 repositories (6.8x smaller than Semble's 32 GB). |
+| **Updates, not just re-indexes** | Incremental updates and watch mode keep the index current as files change. Persistent indexes survive restarts and are reused when identity checks pass. |
+| **Built-in code intelligence** | Call graph analysis, reference finding, dead code detection, and project overview, all from the same index. |
+| **Generalizes off its training set** | Leads Semble on the independent contamination set (10 fresh repositories, locally generated ground truth) and on recall@5, while trailing by 0.008 nDCG on Semble's own 63-repo benchmark. Details in [Benchmarks](#benchmarks). |
 
-Vera started after weeks of working on Pampax, a project I forked because it and other similar tools were missing what I wanted. I kept running into deep-rooted bugs, less-than-ideal design decisions, and thought I could build something better from the ground up. Every design choice comes from careful research, learning from other projects, benchmarking and evaluation. Take a look at the full [feature list](docs/features.md) to see everything Vera can do.
+Vera started as a fork of Pampax. When the design stopped fitting what I wanted from a code search tool, I rebuilt it from the ground up, with each choice backed by research, benchmarking, and the [ADRs](docs/adr/000-decision-summary.md) in this repo. The full [feature list](docs/features.md) covers everything Vera can do.
 
-## Installation
+## Choosing a Backend
 
-Use the quick start above if you just want to get going. This section helps you pick the right backend.
+Vera itself is always local: the index lives in `.vera/` per project, config and models in the Vera data directory (see [Installation](docs/installation.md#set-up-a-backend)). The backend choice only affects where embeddings and reranking run.
+
+API mode works with any OpenAI-compatible endpoint and needs no local compute. The [models guide](docs/models.md) and [installation guide](docs/installation.md) cover provider options, setup flags, Docker, and building from source.
+
+## Requirements
+
+- Linux x86_64/aarch64 (glibc or musl), macOS x86_64/arm64, or Windows x86_64.
+- No runtime dependencies; Python and Node are only needed to run the installer wrappers.
+- The default local Potion model runs on CPU.
+- `.vera/` size scales with the repository; the 63-repository benchmark used 4.7 GB.
+
+## Privacy
+
+Local modes send nothing off-machine. API mode sends chunk text and queries to the configured endpoint. The update check contacts GitHub once a day and is disabled with `VERA_NO_UPDATE_CHECK=1`.
+
+## Vera vs. Other Tools
+
+| Tool | Concept queries | Exact/regex | Offline | Works for agents (MCP/CLI) |
+|---|---|---|---|---|
+| ripgrep | No | Yes | Yes | CLI |
+| LSP “find references” | Limited to language-server semantics | Symbol-aware | Yes | Client-dependent |
+| Editor semantic search or Sourcegraph-style | Often | Varies | Varies | Client-dependent |
+| Vera | Yes, through hybrid search | Yes, through `vera grep` and structural queries | Yes in local modes | MCP and CLI |
+
+## Use with AI Agents
+
+`vera agent install` installs the Vera skill for supported coding agents and can add a short usage snippet to your project's `AGENTS.md`, `CLAUDE.md`, `COPILOT.md`, or editor rules file.
 
 ```bash
-bunx @vera-ai/cli install   # or: npx -y @vera-ai/cli install / uvx vera-ai install
+vera agent install
+vera agent install --client all
 ```
 
-### Pick Your Backend
+### MCP
 
-Vera itself is always local: the index lives in `.vera/` per project, config and models in `$XDG_DATA_HOME/vera` (or `~/.vera` for existing installs). The backend choice only affects where embeddings and reranking run.
+Claude Code:
+```bash
+claude mcp add vera -- vera mcp
+```
 
-Pick the `vera setup` flag that matches your hardware from the quick start above. The full hardware-to-command matrix, step-by-step instructions, API provider options, Docker, and building from source live in the [Installation Guide](docs/installation.md).
+Cursor, Windsurf, and generic MCP clients:
+```json
+{"mcpServers":{"vera":{"command":"vera","args":["mcp"]}}}
+```
 
-API mode works with any OpenAI-compatible endpoint and needs no local compute. Use `vera setup --api --yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. The Qwen preset (`qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1`) needs only one shared key and configures the generic reranker protocol automatically. Jina ONNX and CodeRankEmbed are opt-in alternatives. Reranking is opt-in and disabled by default. After the first index, `vera update .` only re-embeds changed files, so incremental updates are fast on any backend. Full details: [docs/models.md](docs/models.md).
+Codex:
+```toml
+[mcp_servers.vera]
+command = "vera"
+args = ["mcp"]
+```
 
-<details>
-<summary>MCP server</summary>
+Vera exposes `search_code`, `get_stats`, `get_overview`, `regex_search`, `structural_search`, `find_references`, and `explain_path`. See [MCP integration](docs/mcp.md) for client-specific setup and tool details.
+
+If you use the [skills CLI](https://github.com/vercel-labs/skills), you can install Vera there too:
 
 ```bash
-vera mcp   # or: bunx @vera-ai/cli mcp / uvx vera-ai mcp
+npx skills add VeraTools/Vera
 ```
-Exposes `search_code`, `get_stats`, `get_overview`, `regex_search`, `structural_search`, `find_references`, and `explain_path`. `search_code`, `structural_search`, and `find_references` auto-index and start a file watcher on first use if no index exists.
-The MCP surface stays intentionally small; use the CLI skill path when you need the full command set.
-
-</details>
 
 ## Usage
 
@@ -196,28 +245,15 @@ Semble benchmark comparison on 1,251 tasks across 63 repositories (Vera v1.4.0 r
 
 Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, graded relevance, and suffix-corrected path matching in the scorer.
 
-How to read this table honestly: the full-suite gap (`0.8437` vs `0.8514`) is measured on Semble's own benchmark, whose 63 repositories are also the development corpus Semble's ranker was tuned against; MinishLab publishes both Semble and the Potion embedding model. On the 320-task tuning subset Vera scores `0.8538` against `0.8494`, and on the independent contamination set, 10 repositories disjoint from Semble's 63 with locally generated ground truth, Vera scores `0.7674` against `0.7655`. Vera deliberately tunes ranking signals only through preregistered ablations and refuses ground-truth-specific rules, which costs home-field points on this table and is the same discipline that shows up as a win the moment the evaluation leaves Semble's corpus. Recall@5, the metric that matters most for feeding candidates to a model or reranker, favors Vera on the full suite (`0.9189` vs `0.9177`).
+The full-suite gap is on Semble's own development corpus. On the 320-task tuning subset and the independent 10-repository contamination set, Vera leads (`0.8538` vs `0.8494`, `0.7674` vs `0.7655`); Recall@5 favors Vera on the full suite. See [full benchmark results](docs/benchmarks.md#current-results).
 
-For agents in real coding sessions, the measurable effects are context and workflow, not just ranking: Vera returns symbol-bounded chunks (75-95% fewer tokens than file reads), ships incremental updates and watch mode so the index tracks edits, and in a blind-graded four-arm agent benchmark a mid-tier model reached the same answer quality while consuming 27% less context with local Potion defaults and 48% less with the Qwen API embedding+reranker pair.
+For agents in real coding sessions, Vera returns symbol-bounded chunks (75-95% fewer tokens than file reads), ships incremental updates and watch mode so the index tracks edits, and in a blind-graded four-arm agent benchmark a mid-tier model reached the same answer quality while consuming 27% less context with local Potion defaults and 48% less with the Qwen API embedding+reranker pair.
 
-Full methodology and version history: [docs/benchmarks.md](docs/benchmarks.md).
+## Status and Community
 
-## Configure Your AI Agent
+Vera has a stable v1.x CLI. The MCP surface is intentionally small.
 
-`vera agent install` installs the Vera skill for supported coding agents and can add a short usage snippet to your project's `AGENTS.md`, `CLAUDE.md`, `COPILOT.md`, or editor rules file.
-
-```bash
-vera agent install
-vera agent install --client all
-```
-
-If you use the [skills CLI](https://github.com/vercel-labs/skills), you can install Vera there too:
-
-```bash
-npx skills add VeraTools/Vera
-```
-
-If you skipped the prompt and want to add the instructions manually, use the snippet in the [Installation Guide](docs/installation.md#set-up-agent-skills).
+Report problems in [Issues](https://github.com/VeraTools/Vera/issues).
 
 ## Contributing
 
