@@ -978,7 +978,7 @@ pub use ort::{
 ///
 /// Resolution order:
 /// 1. `VERA_HOME` env var (explicit override)
-/// 2. `~/.vera` if it already exists (backward compatibility)
+/// 2. `~/.vera` if it holds a real installation (backward compatibility)
 /// 3. `$XDG_DATA_HOME/vera` (XDG standard, defaults to `~/.local/share/vera`)
 /// 4. `~/.vera` as final fallback
 pub fn vera_home_dir() -> Result<PathBuf> {
@@ -989,16 +989,80 @@ pub fn vera_home_dir() -> Result<PathBuf> {
     }
 
     let home = dirs::home_dir().context("Could not find home directory")?;
+    Ok(resolve_vera_home_dir(&home, dirs::data_dir()))
+}
+
+/// Files a stray `~/.vera` may contain without counting as an installation.
+/// Older releases wrote the update-check cache there unconditionally, which
+/// must not shadow a populated XDG data directory.
+const LEGACY_HOME_INCIDENTAL_FILES: &[&str] = &["update-check.json"];
+
+fn resolve_vera_home_dir(home: &Path, data_dir: Option<PathBuf>) -> PathBuf {
     let legacy = home.join(".vera");
-    if legacy.exists() {
-        return Ok(legacy);
+    if is_legacy_installation(&legacy) {
+        return legacy;
     }
 
-    if let Some(data) = dirs::data_dir() {
-        return Ok(data.join("vera"));
+    match data_dir {
+        Some(data) => data.join("vera"),
+        None => legacy,
+    }
+}
+
+fn is_legacy_installation(legacy: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(legacy) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        !LEGACY_HOME_INCIDENTAL_FILES
+            .iter()
+            .any(|incidental| name == *incidental)
+    })
+}
+
+#[cfg(test)]
+mod home_dir_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_dir_with_only_update_cache_does_not_shadow_xdg_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(home.join(".vera")).unwrap();
+        std::fs::write(home.join(".vera").join("update-check.json"), "{}").unwrap();
+
+        assert_eq!(
+            resolve_vera_home_dir(&home, Some(data.clone())),
+            data.join("vera")
+        );
     }
 
-    Ok(legacy)
+    #[test]
+    fn populated_legacy_dir_is_preferred() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(home.join(".vera")).unwrap();
+        std::fs::write(home.join(".vera").join("update-check.json"), "{}").unwrap();
+        std::fs::write(home.join(".vera").join("config.json"), "{}").unwrap();
+
+        assert_eq!(resolve_vera_home_dir(&home, Some(data)), home.join(".vera"));
+    }
+
+    #[test]
+    fn missing_legacy_dir_falls_back_to_xdg_then_legacy() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let data = temp.path().join("data");
+
+        assert_eq!(
+            resolve_vera_home_dir(&home, Some(data.clone())),
+            data.join("vera")
+        );
+        assert_eq!(resolve_vera_home_dir(&home, None), home.join(".vera"));
+    }
 }
 
 #[cfg(test)]
