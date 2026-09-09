@@ -51,7 +51,7 @@ These are the paired lanes for VAL-SCREEN-002 (only reranker delta).
 
 ## Cost and reserve
 
-- Cost log `/home/lamim/.cache/vera-away/cost-log.md` itemizes every paid call: probe, Qwen embed, Qwen rerank (successful + two aborted attempts), Nemotron free attempt, transient gaps. Sum 2.612845650 + 0.01242959 gap = 2.62527524 matches overall balance delta 10-0.68307 →10-3.30834. Minimum post-balance 6.691652828 > floor 1.8633856136, never breached. One cargo process at a time respected (TMPDIR=/home/lamim/.local/tmp, bench worktree only). No duplicate full-corpus paid lanes (VAL-SCREEN-005).
+- Cost log `~/.cache/vera-away/cost-log.md` itemizes every paid call: probe, Qwen embed, Qwen rerank (successful + two aborted attempts), Nemotron free attempt, transient gaps. Sum 2.612845650 + 0.01242959 gap = 2.62527524 matches overall balance delta 10-0.68307 →10-3.30834. Minimum post-balance 6.691652828 > floor 1.8633856136, never breached. One cargo process at a time respected (TMPDIR=~/.local/tmp, bench worktree only). No duplicate full-corpus paid lanes (VAL-SCREEN-005).
 
 ## Full suite and independent set (VAL-SCREEN-007/009)
 

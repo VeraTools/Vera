@@ -6,11 +6,11 @@
 `Flask.__call__` delegates to `wsgi_app`. `wsgi_app` creates one `AppContext` carrying request data, pushes it, calls `full_dispatch_request`, returns the response through WSGI, and always calls `ctx.pop(error)` in `finally`. Pushing sets `_cv_app`, emits `appcontext_pushed`, opens the session, and only then matches the URL. Dispatch emits `request_started`, runs preprocessing and the view, then finalization runs response processing and emits `request_finished`. The active context therefore supplies `current_app`, `g`, `request`, and the session proxy while the request context has request data. A repeated push increments `_push_count` and does not repeat signals, session opening, or matching; cleanup runs only when the matching number of pops reaches zero. `wsgi_app` stores exceptions escaping dispatch in `error` and passes that value to `ctx.pop`.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1501-1515`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1566-1617`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/ctx.py:416-444`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:992-1051`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/globals.py:40-62`
+- `flask/src/flask/app.py:1501-1515`
+- `flask/src/flask/app.py:1566-1617`
+- `flask/src/flask/ctx.py:416-444`
+- `flask/src/flask/app.py:992-1051`
+- `flask/src/flask/globals.py:40-62`
 
 ### Likely wrong answers
 - Flask creates a separate request context and only creates an app context if one is not already active.
@@ -29,11 +29,11 @@ The current tree has merged `AppContext` and `RequestContext`; do not penalize a
 On the final pop of a request context, Flask first runs request teardown callbacks, then closes the request object, then runs app-context teardown callbacks. Within request teardown, `ctx.request.blueprints` is traversed from the most specific dotted name toward its parents, followed by `None` for app callbacks; each scope's callbacks run in reverse registration order. The request teardown signal is sent after those callbacks. App-context callbacks also run in reverse registration order, followed by the app-context teardown signal. Only after both teardown phases does Flask reset `_cv_app`, then it emits `appcontext_popped`. Teardown errors are collected so later callbacks and the other teardown phase still run; on Python 3.11 or later they are raised as nested `BaseExceptionGroup` values. A handled exception converted to a response inside `full_dispatch_request` normally leaves `wsgi_app`'s `error` as `None`, while an exception escaping dispatch is passed to `ctx.pop` and reaches teardown callbacks. The context pop implementation also collects errors from request close and the popped signal.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/ctx.py:446-504`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1420-1479`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1566-1617`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/wrappers.py:161-195`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/tests/test_appctx.py:216-265`
+- `flask/src/flask/ctx.py:446-504`
+- `flask/src/flask/app.py:1420-1479`
+- `flask/src/flask/app.py:1566-1617`
+- `flask/src/flask/wrappers.py:161-195`
+- `flask/tests/test_appctx.py:216-265`
 
 ### Likely wrong answers
 - App-context teardown runs before request teardown, and the request teardown signal is the final cleanup event.
@@ -52,12 +52,12 @@ The exact outer exception type for collected teardown failures differs by Python
 The application constructor creates `self.config` through `make_config`. `make_config` chooses `self.root_path` or `self.instance_path` for relative file loading, copies `default_config`, and replaces the default `DEBUG` entry with `get_debug_flag()`. The defaults include `TESTING=False`, `PROPAGATE_EXCEPTIONS=None`, no secret key, a 31-day permanent lifetime, and the session and exception settings shown in `Flask.default_config`. The constructor does not call a file or environment loader; external sources are opt-in method calls. Each loader updates the same mapping, so a later successful update overwrites an earlier value. `from_object`, `from_pyfile`, and `from_mapping` accept only uppercase keys; `from_file` delegates to `from_mapping`; `from_envvar` delegates to `from_pyfile`; and `from_prefixed_env` writes keys after stripping its prefix, including lowercase or mixed-case suffixes because it does not apply `isupper()`.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/app.py:279-316`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/app.py:479-493`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:206-237`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/config.py:94-100`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/config.py:304-321`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/config.py:154-185`
+- `flask/src/flask/sansio/app.py:279-316`
+- `flask/src/flask/sansio/app.py:479-493`
+- `flask/src/flask/app.py:206-237`
+- `flask/src/flask/config.py:94-100`
+- `flask/src/flask/config.py:304-321`
+- `flask/src/flask/config.py:154-185`
 
 ### Likely wrong answers
 - Flask automatically loads `.env`, an instance config file, or a package config file in the constructor.
@@ -76,11 +76,11 @@ The phrase "precedence" means call order for these mutable loaders, not a hidden
 `from_object` imports a string with `import_string`, iterates `dir(obj)`, and copies only names for which `key.isupper()` is true. `from_pyfile` joins the filename to `root_path`, reads and executes it in a temporary module namespace, then calls `from_object`; its silent mode suppresses `ENOENT`, `EISDIR`, and `ENOTDIR`. `from_file` joins the filename to `root_path`, opens text or binary mode, calls the supplied loader, and passes the result to `from_mapping`; its silent mode suppresses `ENOENT` and `EISDIR`. `from_mapping` combines the mapping and keyword arguments with keywords applied second, then keeps only uppercase keys. `from_envvar` reads the named environment variable, raises `RuntimeError` when it is unset unless silent, and otherwise delegates to `from_pyfile`. `from_prefixed_env` sorts all environment names, selects the computed prefix, strips it, attempts `json.loads` by default, keeps the original string when conversion raises, and writes nested `A__B` paths by creating missing intermediate dictionaries. It does not silently ignore arbitrary loader or execution errors.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/config.py:102-124`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/config.py:126-185`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/config.py:187-216`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/config.py:218-254`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/config.py:256-321`
+- `flask/src/flask/config.py:102-124`
+- `flask/src/flask/config.py:126-185`
+- `flask/src/flask/config.py:187-216`
+- `flask/src/flask/config.py:218-254`
+- `flask/src/flask/config.py:256-321`
 
 ### Likely wrong answers
 - `from_pyfile` imports the file as a normal installed module and silently suppresses every exception from executing it.
@@ -99,12 +99,12 @@ The exact `from_pyfile` and `from_file` silent error sets differ. Do not penaliz
 An app route decorator calls `Scaffold.route`, whose decorator calls the app's `add_url_rule` immediately. The app implementation chooses the function name when no endpoint is supplied, normalizes methods, adds automatic `OPTIONS` when configured, creates a `Rule`, adds it to `url_map`, and stores the view in `view_functions`, rejecting a different function for an existing endpoint. A blueprint route instead records a deferred callback. At registration, the blueprint computes its dotted registration name, creates `BlueprintSetupState`, merges previously registered callback data, and invokes deferred callbacks. `BlueprintSetupState.add_url_rule` joins the registration prefix with the route, combines URL defaults, and calls the app's `add_url_rule` with an endpoint formed from `name_prefix`, blueprint name, and endpoint. Nested blueprints combine URL prefixes and dotted names. Registering the same effective name twice raises `ValueError`; registering the same blueprint under a different name is allowed, with `record_once` callbacks only applying on the first registration of that blueprint object.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/scaffold.py:340-365`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/app.py:601-658`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/blueprints.py:34-116`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/blueprints.py:224-253`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/blueprints.py:273-335`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/blueprints.py:349-410`
+- `flask/src/flask/sansio/scaffold.py:340-365`
+- `flask/src/flask/sansio/app.py:601-658`
+- `flask/src/flask/sansio/blueprints.py:34-116`
+- `flask/src/flask/sansio/blueprints.py:224-253`
+- `flask/src/flask/sansio/blueprints.py:273-335`
+- `flask/src/flask/sansio/blueprints.py:349-410`
 
 ### Likely wrong answers
 - A blueprint owns a separate URL map and dispatches its route without copying anything to the app.
@@ -123,13 +123,13 @@ Answers may describe the endpoint as `name.endpoint` or as the fully dotted `nam
 Methods inherited from `Scaffold` register app or blueprint-local callbacks under the local `None` key. When a blueprint is merged, its local `None` key is rewritten to the registered blueprint name, while already scoped keys receive the registered name as a prefix. `before_app_request`, `after_app_request`, and `teardown_app_request` use `record_once` to append directly to the app's `None` lists, so they apply to every request. `app_errorhandler` similarly records an app-level error handler. For preprocessing, Flask searches `(None, *reversed(req.blueprints))`, so app callbacks run before the parent and most-specific blueprint callbacks. For after processing and request teardown, it searches `req.blueprints` followed by `None`, and reverses each scope's registration list, so the most-specific blueprint scope is processed before its parents and the app scope. Error lookup searches blueprint names from most specific to parent to app, tries the HTTP code bucket before the class bucket, and walks the exception class MRO within each bucket. Thus a blueprint code handler beats an app code handler, which beats a blueprint class handler, which beats an app class handler; a local blueprint handler is only considered for that blueprint's request.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/scaffold.py:459-555`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/blueprints.py:379-410`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/blueprints.py:613-692`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/wrappers.py:161-195`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1366-1392`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1407-1416`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/app.py:865-888`
+- `flask/src/flask/sansio/scaffold.py:459-555`
+- `flask/src/flask/sansio/blueprints.py:379-410`
+- `flask/src/flask/sansio/blueprints.py:613-692`
+- `flask/src/flask/wrappers.py:161-195`
+- `flask/src/flask/app.py:1366-1392`
+- `flask/src/flask/app.py:1407-1416`
+- `flask/src/flask/sansio/app.py:865-888`
 
 ### Likely wrong answers
 - A blueprint's ordinary `before_request` or `errorhandler` is copied into the app-wide `None` scope and applies to every route.
@@ -148,11 +148,11 @@ For a nested request, `req.blueprints` is most-specific first because `_split_bl
 The signed-cookie implementation uses `URLSafeTimedSerializer`. If there is no `secret_key`, `get_signing_serializer` returns `None`. Otherwise it builds a key list from configured `SECRET_KEY_FALLBACKS` followed by the current key, uses salt `cookie-session`, HMAC key derivation, the lazy SHA-1 digest, and `TaggedJSONSerializer`. Saving calls `dumps(dict(session))`; loading calls `loads` with `max_age` equal to the configured permanent-session lifetime in seconds. The tagged serializer recursively converts supported values and supports dicts, tuples, bytes, `Markup`, UUIDs, and datetimes. A missing cookie creates an empty `SecureCookieSession`. A tampered or otherwise invalid cookie raises an `itsdangerous` `BadSignature`, which is caught and replaced with a new empty session. An expired timed signature raises `SignatureExpired`, which is a `BadSignature` subclass in itsdangerous, so it follows the same catch and also becomes a new empty session. Neither condition is surfaced by this implementation as a request exception.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sessions.py:273-335`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sessions.py:284-321`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sessions.py:323-335`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sessions.py:337-374`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/json/tag.py:219-327`
+- `flask/src/flask/sessions.py:273-335`
+- `flask/src/flask/sessions.py:284-321`
+- `flask/src/flask/sessions.py:323-335`
+- `flask/src/flask/sessions.py:337-374`
+- `flask/src/flask/json/tag.py:219-327`
 
 ### Likely wrong answers
 - Flask stores the session as unsigned JSON and validates it only when the view accesses `session`.
@@ -171,12 +171,12 @@ The Flask source imports and catches `BadSignature` rather than naming `Signatur
 `AppContext._get_session` calls `open_session` once and, when it returns `None`, replaces the result with `make_null_session`. The default `NullSession` is readable but all mutating mapping operations raise a `RuntimeError` explaining that a secret key is missing. `process_response` skips `save_session` for a null session. Accessing the session through `ctx.session` sets `session.accessed`, and the signed-cookie saver adds `Vary: Cookie` when accessed. If the session is empty and modified, it deletes the cookie and adds the vary header; if empty and unmodified, it does nothing. A non-empty session is saved only when modified or when it is permanent and `SESSION_REFRESH_EACH_REQUEST` is true. Permanent sessions receive an expiration based on `PERMANENT_SESSION_LIFETIME`; non-permanent sessions do not. Response processing runs after after-request callbacks and before request teardown, so session saving occurs before teardown callbacks and the request is closed.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/ctx.py:381-403`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sessions.py:83-97`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sessions.py:150-166`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sessions.py:223-247`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1394-1418`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sessions.py:337-385`
+- `flask/src/flask/ctx.py:381-403`
+- `flask/src/flask/sessions.py:83-97`
+- `flask/src/flask/sessions.py:150-166`
+- `flask/src/flask/sessions.py:223-247`
+- `flask/src/flask/app.py:1394-1418`
+- `flask/src/flask/sessions.py:337-385`
 
 ### Likely wrong answers
 - A missing secret key makes every request fail while opening the session, and the null session is still serialized on the response.
@@ -195,16 +195,16 @@ The session interface contract says `save_session` is skipped for a null session
 Flask creates a Blinker `Namespace` and defines template, request, app-context, exception, and flash signals in `signals.py`. The request path emits `request_started` before preprocessing, `request_finished` after response processing and session saving, `request_tearing_down` after request teardown callbacks, and `got_request_exception` from `handle_exception`. Context push emits `appcontext_pushed`; context pop runs app teardown, resets the context variable, and then emits `appcontext_popped`; app teardown emits `appcontext_tearing_down` after its callbacks. Template rendering emits `before_render_template` before rendering and `template_rendered` after rendering, while streaming sends the latter when generation completes. `flash` updates the session and emits `message_flashed` with message and category. These source files define signals and send them, but do not connect built-in receivers, so there are no default Flask subscribers in the current source. Applications or extensions observe them by calling `.connect(receiver, app)` or equivalent; receivers receive the sender and the signal keyword arguments, such as `response`, `exception`, `exc`, `template`, `context`, `message`, or `category`.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/signals.py:1-16`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/ctx.py:428-444`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/ctx.py:486-504`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1012-1019`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1039-1044`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1420-1479`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:925-926`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/templating.py:123-178`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/helpers.py:348-357`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/tests/test_signals.py:50-92`
+- `flask/src/flask/signals.py:1-16`
+- `flask/src/flask/ctx.py:428-444`
+- `flask/src/flask/ctx.py:486-504`
+- `flask/src/flask/app.py:1012-1019`
+- `flask/src/flask/app.py:1039-1044`
+- `flask/src/flask/app.py:1420-1479`
+- `flask/src/flask/app.py:925-926`
+- `flask/src/flask/templating.py:123-178`
+- `flask/src/flask/helpers.py:348-357`
+- `flask/tests/test_signals.py:50-92`
 
 ### Likely wrong answers
 - Flask ships default receivers that log every request signal or automatically enable signal handling only in debug mode.
@@ -223,14 +223,14 @@ Flask creates a Blinker `Namespace` and defines template, request, app-context, 
 `full_dispatch_request` catches exceptions from request-start, preprocessing, routing dispatch, and the view and passes them to `handle_user_exception`. An `HTTPException` that is not trapped goes to `handle_http_exception`; routing exceptions are returned unchanged for Werkzeug's routing behavior, and other HTTP exceptions use code-first and MRO-based handler lookup, falling back to the exception response itself. A generic exception with no handler is re-raised from `handle_user_exception`, reaches the outer `wsgi_app` handler, and enters `handle_exception`. `handle_exception` always emits `got_request_exception`; if `PROPAGATE_EXCEPTIONS` is unset it derives propagation from `testing or debug`, and if propagation is true it re-raises. Otherwise it logs the original exception, wraps it in `InternalServerError(original_exception=e)`, applies a 500 handler if present, and safely finalizes that response. `TRAP_HTTP_EXCEPTIONS` traps all HTTP exceptions, while unset `TRAP_BAD_REQUEST_ERRORS` in debug mode traps `BadRequestKeyError`; trapped exceptions continue through ordinary exception handling. The proxies are `LocalProxy` objects backed by the `_cv_app` context variable. `current_app` resolves the active context's `app`; `request` resolves its `request` property. An app-only context can resolve `current_app` but its request property and `request` proxy fail; with no context both proxies fail with their configured runtime messages.
 
 ### Decisive source paths
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:830-895`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:897-948`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:992-1019`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1566-1617`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/sansio/app.py:865-918`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/globals.py:33-62`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/ctx.py:370-403`
-- `/home/lamim/Development/Tools/Vera/.bench/semble-repos/flask/src/flask/app.py:1481-1515`
+- `flask/src/flask/app.py:830-895`
+- `flask/src/flask/app.py:897-948`
+- `flask/src/flask/app.py:992-1019`
+- `flask/src/flask/app.py:1566-1617`
+- `flask/src/flask/sansio/app.py:865-918`
+- `flask/src/flask/globals.py:33-62`
+- `flask/src/flask/ctx.py:370-403`
+- `flask/src/flask/app.py:1481-1515`
 
 ### Likely wrong answers
 - Every exception, including an unhandled `HTTPException`, is always converted by `handle_exception` into a new 500 response.

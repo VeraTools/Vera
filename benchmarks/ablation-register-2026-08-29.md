@@ -3,14 +3,14 @@
 **Vera commit:** `7efdbfc` (screening at 7efdbfc; Qwen embed at 24b063e is throughput-only delta, see screening run notes)
 **Semble subset task revision:** `60bac08d1e9d71f6d9208f6c15fcc7c354fab85d2eca5a95b6da9b6dc6608190` (320 tasks) — harness `task_set` recomputed as `c4be588d4a0c9b0e8b3d6fc10c58fa567baae2f76e309a6cf76c3b8108398ff9`
 **Corpus:** `eval/semble-subset-corpus.toml` (16 repos, public Semble only)
-**Cost log:** `/home/lamim/.cache/vera-away/cost-log.md` (reserve floor $1.863 never breached, min post 6.691)
+**Cost log:** `~/.cache/vera-away/cost-log.md` (reserve floor $1.863 never breached, min post 6.691)
 **Decision:** `benchmarks/nemotron-decision-2026-08-29.md` REJECT
 
 Per `features.json:reranker-screening` and `validation-contract VAL-SCREEN-008`, each item is executed-with-results or deferred-with-reason. Full 1,251-task suite only for finalists (none yet, per VAL-SCREEN-007).
 
 ## Harness context
 
-- Candidate depth default 50, document budget `reranker_max_doc_chars` 4800, `max_rerank_batch` 20, `retrieval.max_retries` 5, timeout 120, `VERA_RERANK_RATE_LIMIT_WAIT_SECS` 65, `VERA_MAX_IN_FLIGHT_INPUTS` 1024 (clamped otherwise to 16, causing hang). Metrics contract `vera-graded-2-1-task-mean-v1`. All lanes use `harrier-screening` naming, `version_info` provenance, and run logs under `/home/lamim/.cache/vera-lanes/`.
+- Candidate depth default 50, document budget `reranker_max_doc_chars` 4800, `max_rerank_batch` 20, `retrieval.max_retries` 5, timeout 120, `VERA_RERANK_RATE_LIMIT_WAIT_SECS` 65, `VERA_MAX_IN_FLIGHT_INPUTS` 1024 (clamped otherwise to 16, causing hang). Metrics contract `vera-graded-2-1-task-mean-v1`. All lanes use `harrier-screening` naming, `version_info` provenance, and run logs under `~/.cache/vera-lanes/`.
 
 ## Ablations
 
@@ -62,4 +62,4 @@ Per `features.json:reranker-screening` and `validation-contract VAL-SCREEN-008`,
 - Deferred with reason: batch 20 vs 0, doc budget, doc format, candidate-depth sweep beyond 50, prior weight, ordering/fusion, no-instruction control, CoREB/zerank unresolved
 - All deferred items have a concrete reason (cost, latency p95 ceiling, free-tier instability, ship gate requiring full+indep evidence) and an execution sketch for future work. No reranker-related default changed (VAL-SCREEN-009 satisfied trivially).
 
-Artifacts for executed lanes: `benchmarks/results/harrier-screening-20260829T100935Z-subset-qwen-embed.json` and `harrier-screening-20260829T111141Z-subset-qwen-embed-rerank.json` plus logs and specs under `/home/lamim/.cache/vera-lanes/`. Cost and provenance as above.
+Artifacts for executed lanes: `benchmarks/results/harrier-screening-20260829T100935Z-subset-qwen-embed.json` and `harrier-screening-20260829T111141Z-subset-qwen-embed-rerank.json` plus logs and specs under `~/.cache/vera-lanes/`. Cost and provenance as above.

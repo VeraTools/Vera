@@ -62,7 +62,7 @@ The 0.800 floor ensures Nemotron reranked output is not below the current hybrid
 ### 5) Cost and integrity gates (not reranker-specific but required for decision validity)
 
 - No duplicate full-corpus paid lanes for this decision (320 only for screening).
-- Reserve floor $1.863... never breached; every paid call (screening lanes + direct probes + VAL-SETUP-011/VAL-FIRST-002 traffic) appears itemized in `/home/lamim/.cache/vera-away/cost-log.md` and reconciles with overall OpenRouter balance delta.
+- Reserve floor $1.863... never breached; every paid call (screening lanes + direct probes + VAL-SETUP-011/VAL-FIRST-002 traffic) appears itemized in `~/.cache/vera-away/cost-log.md` and reconciles with overall OpenRouter balance delta.
 - Free reranker lanes only touch public Semble corpus (affirmatively logged).
 
 ## Decision Template
@@ -72,7 +72,7 @@ The post-screening decision record (under `benchmarks/` or `.agents/`, cited by 
 > **Decision:** {INCLUDE | REJECT}
 > **Bar:** this file `benchmarks/nemotron-acceptance-bar-2026-08-29.md` commit `<sha>` dated 2026-08-29
 > **Measured:** list the four numbers above vs thresholds, naming the two paired result JSONs (`harrier-screening-<UTC>Z-subset-nemotron-embed-free.json` and `harrier-screening-<UTC>Z-subset-nemotron-embed-free-rerank.json` or equivalent harrier-screening naming) plus any Qwen reference lanes.
-> **Artifacts:** absolute paths to result JSONs, run-note logs under `/home/lamim/.cache/vera-lanes/`, cost-log entries.
+> **Artifacts:** absolute paths to result JSONs, run-note logs under `~/.cache/vera-lanes/`, cost-log entries.
 
 If INCLUDE, the record also cites full-suite (1,251) + independent-set (180) follow-up evidence before any default is flipped (ship gate VAL-SCREEN-009).
 

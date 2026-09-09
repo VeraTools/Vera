@@ -20,7 +20,7 @@ Bar requires ALL of 1–4 to PASS for INCLUDE (see acceptance bar). Nemotron fre
 - **Measured Nemotron:** no paired result. Attempts:
   - `harrier-screening-20260829T074051Z` (not produced) — panic `input length 4527 exceeds model maximum 4096` on axum (pre-fix 899e6c3)
   - `harrier-screening-20260829T080155Z` (not produced) — 503 `image inputs require VLM serving to be enabled` on requests/zod after fix 24b063e
-  - `harrier-screening-20260829T112820Z` (not produced) — same 503 on requests at 7efdbfc, log `/home/lamim/.cache/vera-lanes/run-screening-nemotron-embed-free-20260829T112820Z.log`, cost delta 0.001540840 (free). Direct probe at 07:38:29Z showed embedding dim 2048 and rerank HTTP200 cost 0, but bulk indexing of Semble repos triggers provider-side VLM error.
+  - `harrier-screening-20260829T112820Z` (not produced) — same 503 on requests at 7efdbfc, log `~/.cache/vera-lanes/run-screening-nemotron-embed-free-20260829T112820Z.log`, cost delta 0.001540840 (free). Direct probe at 07:38:29Z showed embedding dim 2048 and rerank HTTP200 cost 0, but bulk indexing of Semble repos triggers provider-side VLM error.
 - **Conclusion:** gate not evidenced; shortfall is `no measurement` (required +0.007, actual unavailable). Provider instability (84 retries previously, now 503 VLM) is a reliability failure under gate 3 as well.
 
 ### Gate 2 — Secondary R@1 gain and non-regression
@@ -51,7 +51,7 @@ Bar requires ALL of 1–4 to PASS for INCLUDE (see acceptance bar). Nemotron fre
 
 ## Cost and Ship Gates
 
-- Cost log `/home/lamim/.cache/vera-away/cost-log.md` itemizes probe (0.00003023), Qwen embed (0.37566346), Qwen rerank (0.95880791 successful + 0.214/0.735 aborted attempts), Nemotron free attempt (0.00154084), and transient failures (0.09506217 + 0.232). Sum reconciles with overall balance delta 2.62527524 (start 9.316928068 → end 6.691652828). Minimum post-balance 6.691 > floor 1.863, never breached. No duplicate full-corpus paid lanes (all subset). Free lanes only public corpus.
+- Cost log `~/.cache/vera-away/cost-log.md` itemizes probe (0.00003023), Qwen embed (0.37566346), Qwen rerank (0.95880791 successful + 0.214/0.735 aborted attempts), Nemotron free attempt (0.00154084), and transient failures (0.09506217 + 0.232). Sum reconciles with overall balance delta 2.62527524 (start 9.316928068 → end 6.691652828). Minimum post-balance 6.691 > floor 1.863, never breached. No duplicate full-corpus paid lanes (all subset). Free lanes only public corpus.
 - Ship gate VAL-SCREEN-009: no reranker-related default changed. Any future INCLUDE would require full 1,251-task Semble + independent-set (180) evidence at the shipping commit showing clear win and no material regression. This decision explicitly does NOT authorize a default change; it is a REJECT.
 - No full 1,251 run was executed for this screening (correct per VAL-SCREEN-007 — full only for finalists or explicit quality claims). Qwen is not a finalist pending latency p95 and independent-set validation.
 
@@ -71,8 +71,8 @@ Bar requires ALL of 1–4 to PASS for INCLUDE (see acceptance bar). Nemotron fre
 
 - Bar: `benchmarks/nemotron-acceptance-bar-2026-08-29.md` (commit 899e6c3)
 - Results: `benchmarks/results/harrier-screening-20260829T100935Z-subset-qwen-embed.json`, `benchmarks/results/harrier-screening-20260829T111141Z-subset-qwen-embed-rerank.json`
-- Logs: `/home/lamim/.cache/vera-lanes/probe-2026-08-29T0738Z.log`, `/home/lamim/.cache/vera-lanes/run-screening-qwen-embed-20260829T100935Z.log`, `/home/lamim/.cache/vera-lanes/run-screening-qwen-embed-rerank-20260829T111141Z.log`, `/home/lamim/.cache/vera-lanes/run-screening-nemotron-embed-free-20260829T112820Z.log`
-- Specs: `/home/lamim/.cache/vera-lanes/screening-*-2026-08-29.json`
-- Cost log: `/home/lamim/.cache/vera-away/cost-log.md`
+- Logs: `~/.cache/vera-lanes/probe-2026-08-29T0738Z.log`, `~/.cache/vera-lanes/run-screening-qwen-embed-20260829T100935Z.log`, `~/.cache/vera-lanes/run-screening-qwen-embed-rerank-20260829T111141Z.log`, `~/.cache/vera-lanes/run-screening-nemotron-embed-free-20260829T112820Z.log`
+- Specs: `~/.cache/vera-lanes/screening-*-2026-08-29.json`
+- Cost log: `~/.cache/vera-away/cost-log.md`
 - Run notes: `benchmarks/screening-run-notes-2026-08-29.md`
 - Ablation register: `benchmarks/ablation-register-2026-08-29.md`

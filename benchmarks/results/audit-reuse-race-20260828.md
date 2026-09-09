@@ -4,8 +4,8 @@ Audit of per-repo `.vera` indexes under bench worktree corpus produced by earlie
 
 Checks per repo: `metadata.db` opens, `chunks`/`file_index_state` tables exist, chunk counts, vector counts consistent, identity meta keys present and matching current config (`model_name`, `document_prefix`, `embedding_dim`, `indexing_config`, `index_format_version`, `index_complete`).
 
-Corpus: `/home/lamim/Development/Tools/Vera/.bench/semble-repos` — 63 repos (full Semble corpus). Subset manifest `/home/lamim/.cache/vera-lanes/semble-corpus-subset.toml` defines 16 repos.
-Lane logs: `/home/lamim/.cache/vera-lanes/run_v130.log`, `run_v131.log` (jina-cuda success, qwen3-8b-combo panicked zig), `run_v132_qwen.log` (terminated).
+Corpus: `.bench/semble-repos` — 63 repos (full Semble corpus). Subset manifest `~/.cache/vera-lanes/semble-corpus-subset.toml` defines 16 repos.
+Lane logs: `~/.cache/vera-lanes/run_v130.log`, `run_v131.log` (jina-cuda success, qwen3-8b-combo panicked zig), `run_v132_qwen.log` (terminated).
 
 All indexes below were built before `feat(eval): ship reuse_index with identity gates (#223)` and before the completeness marker `index_complete=1` / `index_format_version=1` were introduced. The current reuse gate (`index_is_current`) therefore correctly refuses them and will rebuild on next `reuse_index=true` run. This is the expected verified→rebuild verdict.
 
