@@ -1,6 +1,6 @@
 {
   "name": "@vera-ai/cli",
-  "version": "0.4.0",
+  "version": "1.4.0",
   "description": "Bootstrap installer and wrapper for the Vera CLI",
   "license": "MIT",
   "homepage": "https://github.com/VeraTools/Vera#readme",
