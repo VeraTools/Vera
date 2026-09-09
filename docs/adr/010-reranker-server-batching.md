@@ -1,3 +1,13 @@
+# ADR 010: Reranker server batching
+
+## Summary
+
+The reranker batching decision keeps batching as a client-side retrieval setting rather than adding a separate server capability field. `retrieval.max_rerank_batch` already expresses the boundary between request batches and server handling. A new capability field would duplicate that contract without changing request behavior. The accepted outcome is to retain the existing configuration and protocol surface.
+
+Status: Accepted
+
+## Record
+
 # Reranker server-side batching decision
 
 **Date:** 2026-08-29

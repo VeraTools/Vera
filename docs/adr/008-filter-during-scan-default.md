@@ -54,3 +54,5 @@ Shipped full-suite nDCG is about 0.0011 below the issue-opening state (0.844852 
 - Result JSONs: `benchmarks/results/issue197r5-20260903T*-full-98e6e50-*.json` (bench worktree, untracked)
 - Implementation: `crates/vera-core/src/config.rs`, `crates/vera-core/src/retrieval/hybrid.rs`, `crates/vera-core/src/retrieval/search_service.rs`, `crates/vera-core/src/storage/eligibility.rs`
 - ADR 006 / ADR 007 for the toggleable-knob and implementation/measurement-separation patterns this flip followed
+- [ADR 009: Filter-scan profiling](009-filter-scan-profiling.md)
+- [ADR 010: Reranker server batching](010-reranker-server-batching.md)

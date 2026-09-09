@@ -271,7 +271,7 @@ impl SearchStores {
     /// Index metadata (model_name, embedding_dim, document_prefix) cached
     /// against the metadata database stamp.
     ///
-    /// Profiling (`docs/197-profiling.md`): `SearchContext::search` performs
+    /// Profiling (`docs/adr/009-filter-scan-profiling.md`): `SearchContext::search` performs
     /// three `get_index_meta` SQLite reads per query (~0.45 ms per query,
     /// 4-5% of warm p50). This cache serves warm queries from memory and
     /// refreshes only when `metadata.db` or its WAL changes, checked via the

@@ -13,3 +13,9 @@ These are the main technical choices behind Vera's current architecture. Earlier
 ADR 003 records the original spike evaluation. Its default-model conclusion was superseded in v1.1.0; the table above reflects the current default.
 
 Early spike code was removed from the tree before v1.0; it remains in git history under `spikes/`.
+
+| Ranking signals | Toggleable ranking signals and measurement separation | [006](006-ranking-signals.md) |
+| Ranking hypotheses | Candidate-pool, path-penalty, and chunking hypotheses | [007](007-ranking-hypotheses.md) |
+| Filter-scan default | Filtered vector scans enabled by default after profiling | [008](008-filter-during-scan-default.md) |
+| Filter-scan profiling | Persistent-index query-latency profile and bounded resident state | [009](009-filter-scan-profiling.md) |
+| Reranker batching | Existing client-side batch setting retained as the batching contract | [010](010-reranker-server-batching.md) |

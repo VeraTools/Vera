@@ -113,7 +113,7 @@ fn search_bm25_with_stores_inner(
 
     let mut results = Vec::with_capacity(limit.min(bm25_results.len()));
 
-    // Profiling (`docs/197-profiling.md`): the head originally did N
+    // Profiling (`docs/adr/009-filter-scan-profiling.md`): the head originally did N
     // single-row `get_chunk` round trips (up to `limit` per query). Batching
     // the head into one `get_chunks_by_ids` call collapses N round trips to
     // 1 when head <=900 (typical limit 10 to 20, paged otherwise),

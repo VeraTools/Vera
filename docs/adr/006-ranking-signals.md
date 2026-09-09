@@ -1,6 +1,6 @@
-# ADR 006: Issue #196 Ranking Signals (Implementation Only, No Measurement)
+# ADR 006: Ranking Signals (Implementation Only, No Measurement)
 
-Status: implemented behind toggleable flags; measurement owned by `issue-196-measurement`
+Status: implemented behind toggleable flags; measurement owned by `ranking-signals-measurement`
 
 ## Context
 
@@ -54,7 +54,7 @@ Parameter `result_limit * 8` and the NL word-count thresholds (≥4) are carried
 
 ## What Was NOT Done (Implementation/Measurement Separation)
 
-This PR is implementation only. The following are explicitly out of scope and owned by `issue-196-measurement`:
+This PR is implementation only. The following are explicitly out of scope and owned by `ranking-signals-measurement`:
 
 - No benchmark runs (320-task subset, 1,251-task full suite, or 180-task independent contamination set) were executed to tune or select signals.
 - No ablation with/without measurements were recorded here; every signal defaults `true` so existing behavior is preserved, and env flags allow the measurement PR to run cheap ablations without code changes.

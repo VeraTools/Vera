@@ -1,3 +1,13 @@
+# ADR 009: Filter-scan profiling
+
+## Summary
+
+The profiling record identifies persistent-index query latency costs and evaluates the filter-scan path. It documents the storage, cache, and resident-store behavior that shaped the implementation. The record supports bounded caching and avoids serving stale chunks while keeping cross-repository query state bounded. The outcome is the filter-scan design documented in the retained profiling record.
+
+Status: Accepted
+
+## Record
+
 # Issue #197: Persistent-index query-latency profile
 
 **Workload (stated in #197):** Persistent stores: Tantivy BM25 (`<repo>/.vera/bm25/`), SQLite metadata (`metadata.db` hydration), flat mmap vector sidecar (`vectors.f32` + `vectors.db` vec0 fallback). Queries reuse `SearchContext`/`SearchStores` within a process. Embedding via Potion is sub-millisecond and not the bottleneck.
