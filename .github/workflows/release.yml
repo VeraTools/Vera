@@ -29,15 +29,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: blacksmith-8vcpu-ubuntu-2404
             archive: tar.gz
+            zig: true
+            glibc: "2.28"
 
           - target: x86_64-unknown-linux-musl
             os: blacksmith-16vcpu-ubuntu-2404
             archive: tar.gz
-            musl: true
+            zig: true
 
           - target: aarch64-unknown-linux-gnu
             os: blacksmith-16vcpu-ubuntu-2404-arm
             archive: tar.gz
+            zig: true
+            glibc: "2.28"
 
           # Blacksmith macOS runners are Apple Silicon; x86_64-apple-darwin is cross-compiled via the rust target.
           - target: x86_64-apple-darwin
@@ -87,19 +91,18 @@ jobs:
         shell: bash
         run: bash scripts/bootstrap-vendored-grammars.sh
 
-      - name: Install musl tools
-        if: matrix.musl
+      # Linux targets build through zig's C/C++ toolchain so the glibc binaries
+      # link against an old glibc (portable to Ubuntu 20.04, Debian 10, RHEL 8)
+      # and the musl binary gets a real musl C++ runtime for the C++ tree-sitter
+      # scanners instead of the host glibc libstdc++.
+      - name: Install cargo-zigbuild
+        if: matrix.zig
         shell: bash
         run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
-          # esaxx-rs (tokenizers dep) needs a C++ compiler for musl target.
-          # musl-tools only provides musl-gcc; create a musl-g++ wrapper that
-          # invokes g++ with the musl libc spec so cc-rs can find it.
-          sudo ln -s /usr/bin/g++ /usr/local/bin/x86_64-linux-musl-g++
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
-          echo "CXX_x86_64_unknown_linux_musl=g++" >> "$GITHUB_ENV"
+          pipx install cargo-zigbuild || python3 -m pip install --user cargo-zigbuild
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo zigbuild --help >/dev/null
           # sqlite-vec uses BSD u_int8_t/u_int16_t/u_int64_t types unavailable in musl.
-          # Define them via CFLAGS so the C compiler can resolve them.
           echo "CFLAGS_x86_64_unknown_linux_musl=-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t" >> "$GITHUB_ENV"
 
       - name: Set MSVC CRT flags
@@ -109,8 +112,31 @@ jobs:
           echo "CFLAGS=/MD" >> "$GITHUB_ENV"
           echo "CXXFLAGS=/MD" >> "$GITHUB_ENV"
 
+      - name: Build (zig)
+        if: matrix.zig
+        shell: bash
+        run: |
+          TARGET="${{ matrix.target }}"
+          if [[ -n "${{ matrix.glibc }}" ]]; then TARGET="${TARGET}.${{ matrix.glibc }}"; fi
+          cargo zigbuild --release --target "$TARGET" -p vera-cli
+
       - name: Build (native)
+        if: ${{ !matrix.zig }}
         run: cargo build --release --target ${{ matrix.target }} -p vera-cli
+
+      - name: Check Linux binary portability
+        if: matrix.zig
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/vera"
+          file "$BIN"
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            MAX=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+            echo "highest glibc symbol version: $MAX"
+            [[ "$(printf '%s\n' "${MAX#GLIBC_}" "${{ matrix.glibc }}" | sort -V | tail -1)" == "${{ matrix.glibc }}" ]]
+          else
+            file "$BIN" | grep -q 'static'
+          fi
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
