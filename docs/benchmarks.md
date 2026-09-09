@@ -1,6 +1,6 @@
 # Vera Benchmarks
 
-This page tracks the current Semble comparison first, then historical snapshots and ablations.
+This page holds the current Semble comparison and methodology. Older snapshots and ablations are in [Benchmark history](benchmarks-history.md).
 
 ## Provenance
 

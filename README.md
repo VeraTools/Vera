@@ -95,7 +95,7 @@ See [What's New](docs/whats-new.md) for release notes.
 | **Fast at query time, tiny on disk** | 6.4 ms median query latency on the 1,251-task suite (local Potion Code defaults) with a 4.7 GB index for 63 repositories (6.8x smaller than Semble's 32 GB). |
 | **Updates, not just re-indexes** | Incremental updates and watch mode keep the index current as files change. Persistent indexes survive restarts and are reused when identity checks pass. |
 | **Built-in code intelligence** | Call graph analysis, reference finding, dead code detection, and project overview, all from the same index. |
-| **Generalizes off its training set** | Leads Semble on the independent contamination set (10 fresh repositories, locally generated ground truth) and on recall@5, while trailing by 0.008 nDCG on Semble's own 63-repo benchmark. Details in [Benchmarks](#benchmarks). |
+| **Holds up off the benchmark** | Leads Semble on the independent contamination set (10 fresh repositories, locally generated ground truth) and on recall@5, while trailing by 0.008 nDCG on Semble's own 63-repo benchmark. Details in [Benchmarks](#benchmarks). |
 
 Vera started as a fork of Pampax. When the design stopped fitting what I wanted from a code search tool, I rebuilt it from the ground up, with each choice backed by research, benchmarking, and the [ADRs](docs/adr/000-decision-summary.md) in this repo. The full [feature list](docs/features.md) covers everything Vera can do.
 
@@ -118,12 +118,16 @@ Local modes send nothing off-machine. API mode sends chunk text and queries to t
 
 ## Vera vs. Other Tools
 
-| Tool | Concept queries | Exact/regex | Offline | Works for agents (MCP/CLI) |
+| | ripgrep | Language server | Hosted code search | Vera |
 |---|---|---|---|---|
-| ripgrep | No | Yes | Yes | CLI |
-| LSP “find references” | Limited to language-server semantics | Symbol-aware | Yes | Client-dependent |
-| Editor semantic search or Sourcegraph-style | Often | Varies | Varies | Client-dependent |
-| Vera | Yes, through hybrid search | Yes, through `vera grep` and structural queries | Yes in local modes | MCP and CLI |
+| Find code by describing what it does | No | No | Yes | Yes |
+| Exact text and regex | Yes | No | Yes | Yes (`vera grep`) |
+| Callers, references, dead code | No | Yes, per language | Yes | Yes, 65 languages from one index |
+| Works offline, nothing uploaded | Yes | Yes | No | Yes (local backends) |
+| Setup | None | One server per language | Account and indexing service | One binary, one command |
+| Built for agents (MCP, token-bounded output) | No | Partial | Varies | Yes |
+
+Vera complements ripgrep rather than replacing it: use `rg` when you know the exact string, Vera when you know what the code does but not what it is called.
 
 ## Use with AI Agents
 
@@ -247,13 +251,11 @@ Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, gra
 
 The full-suite gap is on Semble's own development corpus. On the 320-task tuning subset and the independent 10-repository contamination set, Vera leads (`0.8538` vs `0.8494`, `0.7674` vs `0.7655`); Recall@5 favors Vera on the full suite. See [full benchmark results](docs/benchmarks.md#current-results).
 
-For agents in real coding sessions, Vera returns symbol-bounded chunks (75-95% fewer tokens than file reads), ships incremental updates and watch mode so the index tracks edits, and in a blind-graded four-arm agent benchmark a mid-tier model reached the same answer quality while consuming 27% less context with local Potion defaults and 48% less with the Qwen API embedding+reranker pair.
+The agent-context numbers in [What Sets Vera Apart](#what-sets-vera-apart) come from a blind-graded four-arm agent benchmark; methodology and per-arm results are in [Benchmarks](docs/benchmarks.md).
 
 ## Status and Community
 
-Vera has a stable v1.x CLI. The MCP surface is intentionally small.
-
-Report problems in [Issues](https://github.com/VeraTools/Vera/issues).
+Vera is at v1.x: the CLI, output formats, and MCP tool surface are stable, and changes are listed in [What's New](docs/whats-new.md). Bug reports and feature requests go to [Issues](https://github.com/VeraTools/Vera/issues).
 
 ## Contributing
 

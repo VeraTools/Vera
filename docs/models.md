@@ -136,11 +136,15 @@ If your model uses different names, pass the matching `--embedding-*` flags.
 
 The default Potion Code model runs on all supported machines. Use Jina ONNX with CUDA, ROCm, CoreML, DirectML, or OpenVINO when you want an opt-in alternative. After the first index, `vera update .` only re-embeds changed files, so updates are fast on any backend.
 
-| Backend | Hardware | Time | Notes |
-|---------|----------|------|-------|
-| CUDA | RTX 4080 | **~8 s** | Recommended for large repos |
-| Potion Code | CPU | 56 s on the 320-task subset | Default local embedding model; 26 s on the independent set |
-| Jina ONNX CPU | Ryzen 5 7600X3D (6c/12t) | ~6 min | Compatibility path. Use Potion Code for CPU-only machines |
+Reference points, each measured on a different corpus:
+
+| Backend | Hardware | Corpus | Index time |
+|---------|----------|--------|------------|
+| Potion Code (default) | AMD Ryzen 7 9800X3D, CPU | Semble suite, 63 repositories | 115 s |
+| Jina ONNX, CUDA | RTX 4080 | Vera's own codebase (239 files, ~3,100 chunks) | ~8 s |
+| Jina ONNX, CPU | Ryzen 5 7600X3D (6c/12t) | Vera's own codebase (239 files, ~3,100 chunks) | ~6 min |
+
+Jina ONNX on CPU is a compatibility path; use Potion Code on CPU-only machines.
 
 ## API Mode
 

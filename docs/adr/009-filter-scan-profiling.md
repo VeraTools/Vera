@@ -8,7 +8,7 @@ Status: Accepted
 
 ## Record
 
-# Issue #197: Persistent-index query-latency profile
+### Issue #197: Persistent-index query-latency profile
 
 **Workload (stated in #197):** Persistent stores: Tantivy BM25 (`<repo>/.vera/bm25/`), SQLite metadata (`metadata.db` hydration), flat mmap vector sidecar (`vectors.f32` + `vectors.db` vec0 fallback). Queries reuse `SearchContext`/`SearchStores` within a process. Embedding via Potion is sub-millisecond and not the bottleneck.
 

@@ -29,7 +29,7 @@ A four-arm sweep ran GLM-5.3 (high effort) against 10 cross-file Flask questions
 
 ### Indexing progress and reuse
 
-- The embedding progress bar reports open-ended work during parsing and switches to a fixed total at `ParsingDone`. While parsing is still in progress it shows open-ended work so far with no percentage, then switches to a fixed total at `ParsingDone` and fills monotonically to 100%. Cancellation and mid-run failures no longer imply success, small single-window repos show a fixed total directly, and non-TTY, `--no-progress` and `--json` modes are unchanged.
+- The embedding progress bar shows open-ended progress with no percentage while parsing is still running, then switches to a fixed total at `ParsingDone` and fills monotonically to 100%. Cancellation and mid-run failures no longer imply success, small single-window repos show a fixed total directly, and non-TTY, `--no-progress` and `--json` modes are unchanged.
 - Evaluation lanes can reuse a current index when identity gates pass. `reuse_index: true` skips indexing only when the on-disk index matches embedding model name (including `model_aliases` and `VERA_EMBEDDING_MODEL_ALIASES`), document prefix, staleness, embedding dimension, content-affecting indexing config, and format version, with correct size accounting and BM25 never reusing.
 
 ### Ranking and retrieval

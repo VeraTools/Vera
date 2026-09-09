@@ -61,21 +61,17 @@ git rm -r --cached .vera
 
 The index is machine-local and can be large.
 
-
 ## Does code leave the machine?
 
 Local embedding and reranking modes send nothing off-machine. API mode sends chunk text and queries to the configured endpoint. The update check contacts GitHub once a day and can be disabled with `VERA_NO_UPDATE_CHECK=1`. See [Privacy](../README.md#privacy).
-
 
 ## MCP server does not appear
 
 Verify that `vera` is on the MCP client's `PATH`. If the client uses a restricted environment, set `command` to the absolute path of the Vera binary. Run `vera mcp` directly and inspect the client's MCP logs. See [MCP](mcp.md).
 
-
 ## Indexing is slow on a large monorepo
 
 Use `.veraignore` for generated trees and vendor directories, and index the relevant project directory rather than the monorepo root. `vera update . --max-files 250` bounds one update run; use the value appropriate for the repository.
-
 
 ## Windows PATH after installation
 
@@ -87,7 +83,6 @@ vera --version
 ```
 
 If the command is not found, add the installer-reported user bin directory to the user `PATH`, then open a new shell.
-
 
 ## API errors
 

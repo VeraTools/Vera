@@ -50,10 +50,10 @@ args = ["mcp"]
 
 ### VS Code Copilot
 
-Add the server to the MCP configuration used by VS Code:
+Add the server to `.vscode/mcp.json` (VS Code uses a `servers` key rather than `mcpServers`):
 
 ```json
-{"mcpServers":{"vera":{"command":"vera","args":["mcp"]}}}
+{"servers":{"vera":{"type":"stdio","command":"vera","args":["mcp"]}}}
 ```
 
 For a local inference server, configure the backend separately and run `vera mcp`. See [llama.cpp setup](llama-cpp-setup.md) for the local endpoint example.

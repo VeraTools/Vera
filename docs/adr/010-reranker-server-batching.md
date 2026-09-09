@@ -8,7 +8,7 @@ Status: Accepted
 
 ## Record
 
-# Reranker server-side batching decision
+### Reranker server-side batching decision
 
 **Date:** 2026-08-29
 **Status:** Declined. No separate capability field
