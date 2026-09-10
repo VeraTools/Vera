@@ -14,6 +14,7 @@ Release highlights from v1.0 onward. For the current benchmark tables and method
 - The agent instructions shipped by `vera agent install` were rewritten around observed failure modes: first-search routing, per-question-type command table, recovery path from usage-site hits, and root-relative `--path` guidance.
 - `vera setup` on Windows executes the Direct3D 12 probe on real Windows in CI (the `windows-probe` job), pinning the probe plumbing for every future run.
 - `vera launcher list` reports unproven launchers instead of silently ignoring them.
+- Linux release binaries link glibc 2.28 through cargo-zigbuild (portable to Ubuntu 20.04, Debian 10, RHEL 8), and the musl binary now bundles a real musl C++ runtime, fixing the v1.4.0 musl segfault on repositories containing `.sql` files.
 
 ### Docs
 
