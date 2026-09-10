@@ -134,6 +134,7 @@
 | Name | Default | What it does |
 |---|---:|---|
 | `VERA_LOG` | info | Sets the logging filter. |
+| `VERA_STALE_WARNING_ALWAYS` | unset | Prints the stale-index warning on every run instead of at most once per 10 minutes per index. |
 | `VERA_NO_UPDATE_CHECK` | unset | Disables the daily GitHub update check when set to `1`. |
 | `VERA_USER_BIN_DIR` | platform default | Selects the user binary directory used by installers. |
 | `VERA_USER_HOME` | platform default | Overrides the user home used by the CLI. |

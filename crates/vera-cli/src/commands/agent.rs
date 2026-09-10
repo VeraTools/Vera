@@ -1202,7 +1202,7 @@ Working with results:
 - If the top hit is a usage site, re-run with the symbol name or `vera structural definitions <symbol>` instead of trying more phrasings.
 - `--path` is relative to the repository root (`--path src/flask`, not an absolute path). Narrow with `--lang`, `--path`, `--type`, or `--scope docs`; widen with `--limit 8`.
 - Vera indexes this repository only. For dependency sources (site-packages, uv or pip caches) use rg, then return to Vera for repository code.
-- A stale-index warning does not invalidate hits. After editing files, run `vera update .` from wherever you are (it uses the repository root's index; `vera index .` from the repository root if none exists).
+- A stale-index warning does not invalidate hits. After editing files, run `vera update .` from any directory (it refreshes the repository root's index; `vera index .` from the repository root if none exists).
 - `vera explain-path <file>`, `vera stats --json`, and detailed usage are in the Vera skill installed by `vera agent install`.
 <!-- vera:end -->
 "#;

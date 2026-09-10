@@ -30,7 +30,8 @@ crates/tree-sitter-astro/
 .tmp/
 skills-lock.json
 
-# Untracked benchmark provenance JSONs (issue-evidence and screening runs;
-# referenced as "uncommitted" in docs/benchmarks.md and issue threads)
+# Local benchmark result JSONs (screening and issue-evidence runs kept on the
+# machine that produced them; published results live in
+# benchmarks/agent-bench/results/ and benchmarks/results/ subdirectories)
 /benchmarks/results/*.json
 .output.txt

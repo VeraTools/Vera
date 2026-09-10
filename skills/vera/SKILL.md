@@ -50,7 +50,7 @@ The first search action in a task decides whether Vera gets used at all; later s
 
 - A hit is a lead, not evidence. Verify behavior against the hit's code; open the file only for lines the hit did not include.
 - Cite `path:line` from code you actually read.
-- A stale-index warning does not invalidate hits. After editing files, run `vera update .` before searching again; it updates the repository root's index from any subdirectory.
+- A stale-index warning does not invalidate hits. After editing files, run `vera update .` from any directory; it refreshes the repository root's index.
 
 ## Recovery
 

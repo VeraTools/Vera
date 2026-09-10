@@ -50,8 +50,8 @@ Shipped full-suite nDCG is about 0.0011 below the issue-opening state (0.844852 
 ## References
 
 - Issue #197 and its r3/r4/r5 preregistration comments (5503479257, 5504100591, 5532835495)
-- Comparison artifact: `~/.cache/vera-lanes/issue197r5-comparison.json` and `.md` (means, stdevs, gates, margins)
-- Result JSONs: `benchmarks/results/issue197r5-20260903T*-full-98e6e50-*.json` (bench worktree, untracked)
+- Comparison artifact: `issue197r5-comparison.json` and `.md` (run-machine local; means, stdevs, gates, margins)
+- Result JSONs: `benchmarks/results/issue197r5-20260903T*-full-98e6e50-*.json` (run-machine local, not retained in-tree)
 - Implementation: `crates/vera-core/src/config.rs`, `crates/vera-core/src/retrieval/hybrid.rs`, `crates/vera-core/src/retrieval/search_service.rs`, `crates/vera-core/src/storage/eligibility.rs`
 - ADR 006 / ADR 007 for the toggleable-knob and implementation/measurement-separation patterns this flip followed
 - [ADR 009: Filter-scan profiling](009-filter-scan-profiling.md)
