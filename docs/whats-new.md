@@ -2,6 +2,24 @@
 
 Release highlights from v1.0 onward. For the current benchmark tables and methodology, see [benchmarks.md](benchmarks.md). For the full command surface, see [features.md](features.md).
 
+## v1.4.1
+
+### Agent ergonomics and correctness
+
+- Commands now work from subdirectories: search, grep, structural, references, overview, stats, and update resolve the nearest `.vera/` index up the directory tree and operate on the repository root, so agents no longer need to `cd` to the root. A bare `.vera/` directory without an index (including the legacy Vera home) is never mistaken for an index.
+- Absolute `--path` filters inside the repository are rewritten to root-relative form instead of silently matching nothing.
+- `vera grep "pattern" -n` (a habitual grep invocation) no longer errors: a trailing bare `-n` means the default limit of 20. Parse errors mentioning `--limit` print a one-line hint.
+- Stale-index warnings are deduplicated per index: an identical warning prints at most once every 10 minutes (`VERA_STALE_WARNING_ALWAYS=1` restores per-run printing).
+- The binary-update hint only prints on an interactive terminal, and reranker retry logs moved to debug level so agent output stays clean.
+- The agent instructions shipped by `vera agent install` were rewritten around observed failure modes: first-search routing, per-question-type command table, recovery path from usage-site hits, and root-relative `--path` guidance.
+- `vera setup` on Windows executes the Direct3D 12 probe on real Windows in CI (the `windows-probe` job), pinning the probe plumbing for every future run.
+- `vera launcher list` reports unproven launchers instead of silently ignoring them.
+
+### Docs
+
+- Agent-benchmark claims are scoped to what the data supports: only the Qwen arm's context saving is statistically significant; the older kimi/opus lanes are labeled as history.
+- README's agent section now leads with the CLI plus skill as the preferred integration, with the MCP server documented as an optional dropdown.
+
 ## v1.4.0
 
 ### Filtered search latency

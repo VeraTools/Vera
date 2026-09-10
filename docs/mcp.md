@@ -1,5 +1,7 @@
 # MCP
 
+MCP is the optional integration path: most agents work best with the Vera CLI and the skill installed by `vera agent install` (see [Installation](installation.md) and the [README](../README.md#use-with-ai-agents)). Use `vera mcp` when your client is MCP-first or your team standardizes on one server config.
+
 `vera mcp` runs a JSON-RPC MCP server over standard input and output. It exposes:
 
 | Tool | Description |

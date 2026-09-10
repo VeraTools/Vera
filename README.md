@@ -125,45 +125,41 @@ Local modes send nothing off-machine. API mode sends chunk text and queries to t
 | Callers, references, dead code | No | Yes, per language | Yes | Yes, 65 languages from one index |
 | Works offline, nothing uploaded | Yes | Yes | No | Yes (local backends) |
 | Setup | None | One server per language | Account and indexing service | One binary, one command |
-| Built for agents (MCP, token-bounded output) | No | Partial | Varies | Yes |
+| Built for agents (CLI, skill, MCP) | No | Partial | Varies | Yes |
 
 Vera complements ripgrep rather than replacing it: use `rg` when you know the exact string, Vera when you know what the code does but not what it is called.
 
 ## Use with AI Agents
 
-`vera agent install` installs the Vera skill for supported coding agents and can add a short usage snippet to your project's `AGENTS.md`, `CLAUDE.md`, `COPILOT.md`, or editor rules file.
+The preferred agent integration is the CLI plus the Vera skill: `vera agent install` installs it for supported coding agents and can add a short usage snippet to your project's `AGENTS.md`, `CLAUDE.md`, `COPILOT.md`, or editor rules file.
 
 ```bash
 vera agent install
 vera agent install --client all
 ```
 
-### MCP
-
-Claude Code:
-```bash
-claude mcp add vera -- vera mcp
-```
-
-Cursor, Windsurf, and generic MCP clients:
-```json
-{"mcpServers":{"vera":{"command":"vera","args":["mcp"]}}}
-```
-
-Codex:
-```toml
-[mcp_servers.vera]
-command = "vera"
-args = ["mcp"]
-```
-
-Vera exposes `search_code`, `get_stats`, `get_overview`, `regex_search`, `structural_search`, `find_references`, and `explain_path`. See [MCP integration](docs/mcp.md) for client-specific setup and tool details.
-
 If you use the [skills CLI](https://github.com/vercel-labs/skills), you can install Vera there too:
 
 ```bash
 npx skills add VeraTools/Vera
 ```
+
+<details>
+<summary><strong>Optional: MCP server</strong> (for MCP-first clients or teams standardizing on MCP)</summary>
+
+```bash
+claude mcp add vera -- vera mcp      # Claude Code
+```
+
+Cursor, Windsurf, and generic MCP clients:
+
+```json
+{"mcpServers":{"vera":{"command":"vera","args":["mcp"]}}}
+```
+
+Vera exposes `search_code`, `get_stats`, `get_overview`, `regex_search`, `structural_search`, `find_references`, and `explain_path`. Client-specific setup and tool details: [MCP integration](docs/mcp.md).
+
+</details>
 
 ## Usage
 
