@@ -90,7 +90,7 @@ See [What's New](docs/whats-new.md) for release notes.
 
 | | |
 |---|---|
-| **Token-efficient for agents** | Returns symbol-bounded chunks, not entire files. 75-95% fewer tokens on typical queries. In a blind-graded agent benchmark, a mid-tier model with Vera reached the same answer quality while consuming 27-48% less context (48% with the Qwen API embedding+reranker pair, 27% with local Potion defaults). |
+| **Token-efficient for agents** | Returns symbol-bounded chunks, not entire files. 75-95% fewer tokens on typical queries. In a blind-graded four-arm agent benchmark (GLM-5.3, high effort, 10 cross-file questions, one repository), the Qwen embedding+reranker pair consumed 48% less prompt context than a no-tool control at equal 10/10 answer quality, the only per-arm figure statistically significant at that sample size; the local Potion default consumed 27% less on the same lane, within run-to-run noise at N=10. Method and per-arm data: [Benchmark history](docs/benchmarks-history.md#agent-level-benchmark). |
 | **Single binary, 65 languages** | One static binary with 61 tree-sitter grammars compiled in. No Python, no language servers, no per-language toolchains. |
 | **Fast at query time, tiny on disk** | 6.4 ms median query latency on the 1,251-task suite (local Potion Code defaults) with a 4.7 GB index for 63 repositories (6.8x smaller than Semble's 32 GB). |
 | **Updates, not just re-indexes** | Incremental updates and watch mode keep the index current as files change. Persistent indexes survive restarts and are reused when identity checks pass. |
@@ -251,7 +251,7 @@ Both tools used the same `minishlab/potion-code-16M-v2` embeddings, harness, gra
 
 The full-suite gap is on Semble's own development corpus. On the 320-task tuning subset and the independent 10-repository contamination set, Vera leads (`0.8538` vs `0.8494`, `0.7674` vs `0.7655`); Recall@5 favors Vera on the full suite. See [full benchmark results](docs/benchmarks.md#current-results).
 
-The agent-context numbers in [What Sets Vera Apart](#what-sets-vera-apart) come from a blind-graded four-arm agent benchmark; methodology and per-arm results are in [Benchmarks](docs/benchmarks.md).
+The agent-context numbers in [What Sets Vera Apart](#what-sets-vera-apart) come from a blind-graded four-arm agent benchmark; methodology and per-arm results are in [Benchmark history](docs/benchmarks-history.md#agent-level-benchmark).
 
 ## Status and Community
 
