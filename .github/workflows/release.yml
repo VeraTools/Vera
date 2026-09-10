@@ -99,9 +99,20 @@ jobs:
         if: matrix.zig
         shell: bash
         run: |
-          pipx install cargo-zigbuild || python3 -m pip install --user cargo-zigbuild
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          cargo zigbuild --help >/dev/null
+          # cargo-zigbuild locates zig through `python3 -m ziglang`, so the
+          # binary and its ziglang dependency must be importable by the same
+          # interpreter. pipx hides ziglang inside an isolated venv whose
+          # python3 is never probed ("Failed to find zig"), and the pip
+          # --user fallback trips PEP 668 on Ubuntu 24.04. Install both into
+          # one venv, put it on PATH, and pin the interpreter explicitly.
+          VENV="$HOME/.cargo-zigbuild-venv"
+          python3 -m venv "$VENV"
+          "$VENV/bin/pip" install -q cargo-zigbuild
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+          echo "CARGO_ZIGBUILD_PYTHON_PATH=$VENV/bin/python" >> "$GITHUB_ENV"
+          # Fail fast in this step if zig is unreachable, not at build time.
+          "$VENV/bin/python" -m ziglang version
+          PATH="$VENV/bin:$PATH" cargo zigbuild --help >/dev/null
           # sqlite-vec uses BSD u_int8_t/u_int16_t/u_int64_t types unavailable in musl.
           echo "CFLAGS_x86_64_unknown_linux_musl=-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t" >> "$GITHUB_ENV"
 
