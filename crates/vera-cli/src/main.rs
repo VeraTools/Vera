@@ -41,7 +41,17 @@ fn main() {
             // flag), which clap rejects because `-n` expects a value. Give
             // that case one extra hint line; everything else keeps clap's
             // standard behavior (including --help/--version exiting 0).
-            if err.to_string().contains("--limit") {
+            // Help/version errors must not take this path: their Display
+            // output is the full help text, which contains `--limit` for
+            // grep/search/structural/references and would print the hint
+            // after a perfectly good `--help`.
+            let is_help_or_version = matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayVersion
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            if !is_help_or_version && err.to_string().contains("--limit") {
                 let _ = err.print();
                 eprintln!(
                     "hint: in vera, -n is short for --limit <N>; line numbers are always shown. Put -n after the pattern or use --limit."

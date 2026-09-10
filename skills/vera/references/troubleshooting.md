@@ -1,11 +1,11 @@
 # Troubleshooting
 
-## `no index found in current directory`
+## `no index found ... or any parent directory`
 
 Cause:
 
 - the repository has not been indexed yet
-- the command is running from the wrong directory
+- the command is running outside any indexed directory
 
 Fix:
 
@@ -13,7 +13,7 @@ Fix:
 vera index .
 ```
 
-Or run from the repository root that contains `.vera/`.
+Run it from the repository root. Search, grep, structural, references, overview, stats, and update commands resolve the nearest `.vera/` up the directory tree, so they work from subdirectories too.
 
 ## Results Are Stale
 
@@ -26,6 +26,8 @@ Fix:
 ```sh
 vera update .
 ```
+
+Works from any subdirectory; it refreshes the repository root's index.
 
 ## Local ONNX Inference Fails
 

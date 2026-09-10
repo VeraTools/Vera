@@ -4,8 +4,11 @@
 pub fn run(json_output: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
+    // Match the read commands: an ancestor `.vera/` index covers this
+    // subdirectory too.
+    let repo_root = crate::helpers::resolve_index_root(&cwd).unwrap_or_else(|| cwd.clone());
 
-    let stats = vera_core::stats::collect_stats(&cwd)?;
+    let stats = vera_core::stats::collect_stats(&repo_root)?;
 
     if json_output {
         let json = serde_json::to_string_pretty(&stats)

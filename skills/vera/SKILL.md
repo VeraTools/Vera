@@ -50,7 +50,7 @@ The first search action in a task decides whether Vera gets used at all; later s
 
 - A hit is a lead, not evidence. Verify behavior against the hit's code; open the file only for lines the hit did not include.
 - Cite `path:line` from code you actually read.
-- A stale-index warning does not invalidate hits. After editing files, run `vera update .` before searching again.
+- A stale-index warning does not invalidate hits. After editing files, run `vera update .` before searching again; it updates the repository root's index from any subdirectory.
 
 ## Recovery
 
@@ -58,7 +58,7 @@ The first search action in a task decides whether Vera gets used at all; later s
 |---------|-----|
 | `no index found` | `vera index .` from the repository root, then rerun the search |
 | `no indexed file matches <path>` | Use a root-relative `--path`; stderr suggests a wildcard directory form when one applies |
-| Stale results after edits | `vera update .` (or `vera watch .`) |
+| Stale results after edits | `vera update .` (or `vera watch .`); works from any subdirectory |
 | A file is missing from results | `vera explain-path path/to/file` |
 | Local model or ONNX error | `vera doctor --probe`, then `references/troubleshooting.md` |
 | Missing local assets | `vera repair` |
