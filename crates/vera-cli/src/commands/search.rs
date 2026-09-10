@@ -40,7 +40,7 @@ pub fn run(
 
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
-    if !vera_core::indexing::index_dir(&cwd).exists()
+    if crate::helpers::find_index_root(&cwd).is_none()
         && should_offer_auto_index(
             json_output,
             std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),

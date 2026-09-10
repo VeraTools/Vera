@@ -64,14 +64,81 @@ pub fn warn_if_index_stale(repo_path: &Path, indexing_config: &vera_core::config
     match vera_core::indexing::detect_staleness(repo_path, indexing_config) {
         Ok(freshness) => {
             if let Some(warning) = freshness.stale_warning() {
-                let stderr = std::io::stderr();
-                let mut err = stderr.lock();
-                let _ = writeln!(err, "{warning}");
+                print_stale_warning(
+                    &vera_core::indexing::index_dir(repo_path),
+                    &freshness.summary(),
+                    &warning,
+                );
             }
         }
         Err(err) => {
             tracing::debug!(error = %err, "failed to check index freshness");
         }
+    }
+}
+
+/// Name of the dedupe record persisted inside the index directory.
+const STALE_WARNING_FILE: &str = "stale-warning.json";
+/// Window in which an identical stale warning is printed at most once.
+const STALE_WARNING_DEDUP_SECS: u64 = 600;
+
+#[derive(serde::Deserialize)]
+struct StaleWarningRecord {
+    summary: String,
+    warned_at_unix_secs: u64,
+}
+
+/// Whether the stale-index warning should print again: only when the stored
+/// summary differs from the current one or the last print is older than the
+/// dedupe window.
+fn stale_warning_should_print(
+    stored: Option<(&str, u64)>,
+    current_summary: &str,
+    now_unix_secs: u64,
+) -> bool {
+    match stored {
+        Some((summary, warned_at)) => {
+            summary != current_summary
+                || now_unix_secs.saturating_sub(warned_at) >= STALE_WARNING_DEDUP_SECS
+        }
+        None => true,
+    }
+}
+
+/// Print the stale-index warning, deduplicated per index: an identical warning
+/// that was printed within [`STALE_WARNING_DEDUP_SECS`] is suppressed, and the
+/// `{summary, warned_at_unix_secs}` record is rewritten on each print.
+/// `VERA_STALE_WARNING_ALWAYS=1` bypasses the dedupe; any IO failure falls
+/// back to printing.
+fn print_stale_warning(index_dir: &Path, summary: &str, warning: &str) {
+    let always = std::env::var("VERA_STALE_WARNING_ALWAYS").is_ok_and(|v| v == "1");
+    if !always {
+        let record_path = index_dir.join(STALE_WARNING_FILE);
+        let stored = std::fs::read_to_string(&record_path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<StaleWarningRecord>(&data).ok());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if !stale_warning_should_print(
+            stored
+                .as_ref()
+                .map(|r| (r.summary.as_str(), r.warned_at_unix_secs)),
+            summary,
+            now,
+        ) {
+            return;
+        }
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        let _ = writeln!(err, "{warning}");
+        let record = serde_json::json!({"summary": summary, "warned_at_unix_secs": now});
+        let _ = std::fs::write(&record_path, record.to_string());
+    } else {
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        let _ = writeln!(err, "{warning}");
     }
 }
 
@@ -302,15 +369,54 @@ impl GitScopeFlags {
     }
 }
 
+/// Walk up from `start` and return the nearest directory containing a `.vera/`
+/// index. Indexed paths are stored relative to that root, so commands run in a
+/// subdirectory must resolve the ancestor, not the cwd. A bare `.vera/`
+/// directory is not an index: the legacy Vera home (`~/.vera`) and stray or
+/// partially created directories must not match, or read commands would
+/// fabricate an empty metadata store inside them.
+pub fn find_index_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(candidate) = dir {
+        if vera_core::indexing::index_dir(candidate)
+            .join("metadata.db")
+            .is_file()
+        {
+            return Some(candidate.to_path_buf());
+        }
+        dir = candidate.parent();
+    }
+    None
+}
+
+/// The paste-ready error shown when no `.vera/` index exists in `cwd` or any
+/// parent directory.
+pub fn missing_index_message(cwd: &Path) -> String {
+    format!(
+        "no index found in {} or any parent directory.\nRun `vera index .` from the repository root, then rerun this command.",
+        cwd.display()
+    )
+}
+
+/// Resolve the index root for `cwd` via [`find_index_root`], printing the
+/// `note: using index at <root>` line once when the root is an ancestor.
+pub fn resolve_index_root(cwd: &Path) -> Option<PathBuf> {
+    let root = find_index_root(cwd)?;
+    if root != cwd {
+        eprintln!("note: using index at {}", root.display());
+    }
+    Some(root)
+}
+
 pub fn prepare_indexed_repo(
     indexing_config: &vera_core::config::IndexingConfig,
 ) -> anyhow::Result<(PathBuf, PathBuf)> {
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
-    let index_dir = vera_core::indexing::index_dir(&cwd);
-    if !index_dir.exists() {
-        anyhow::bail!(MISSING_INDEX_MESSAGE);
-    }
+    let Some(repo_root) = resolve_index_root(&cwd) else {
+        anyhow::bail!(missing_index_message(&cwd));
+    };
+    let index_dir = vera_core::indexing::index_dir(&repo_root);
     // Index format version must match: legacy suffixed rows would be silently wrong.
     {
         let metadata_path = index_dir.join("metadata.db");
@@ -324,16 +430,13 @@ pub fn prepare_indexed_repo(
                 store
                     .get_index_meta(vera_core::indexing::freshness::INDEX_FORMAT_VERSION_KEY)
                     .unwrap_or(None),
-                cwd.display()
+                repo_root.display()
             );
         }
     }
-    warn_if_index_stale(&cwd, indexing_config);
-    Ok((cwd, index_dir))
+    warn_if_index_stale(&repo_root, indexing_config);
+    Ok((repo_root, index_dir))
 }
-
-pub const MISSING_INDEX_MESSAGE: &str = "no index found in current directory.\n\
-Hint: run `vera index <path>` first to create an index.";
 
 pub fn should_offer_auto_index(json_output: bool, is_terminal: bool) -> bool {
     !json_output && is_terminal
@@ -356,9 +459,102 @@ pub fn prepare_indexed_search(
     filters: &vera_core::types::SearchFilters,
     git_scope: Option<&vera_core::git_scope::GitScope>,
 ) -> anyhow::Result<(PathBuf, vera_core::types::SearchFilters)> {
-    let (cwd, index_dir) = prepare_indexed_repo(indexing_config)?;
-    let filters = apply_git_scope(&cwd, filters, git_scope)?;
+    let (repo_root, index_dir) = prepare_indexed_repo(indexing_config)?;
+    let mut filters = apply_git_scope(&repo_root, filters, git_scope)?;
+    rewrite_absolute_path_filters(&repo_root, &mut filters.path_glob);
     Ok((index_dir, filters))
+}
+
+/// What to do with a `--path` filter entry that turns out to be an absolute
+/// path.
+enum PathFilterRewrite {
+    /// Not an absolute path, or absolute but outside the index root: leave it
+    /// untouched (`path_filter_hint` covers the all-miss case).
+    Keep,
+    /// The entry pointed at the index root itself: it admits everything, so
+    /// drop it.
+    Drop,
+    /// The entry pointed inside the index root: replace it with the
+    /// root-relative form using forward slashes.
+    Rewrite(String),
+}
+
+/// Rewrite one absolute `--path` entry against the candidate index roots.
+/// Windows-style separators and drive-letter paths are normalized to `/` so
+/// the same rule holds whatever produced the path.
+fn absolute_path_filter_rewrite(pattern: &str, roots: &[PathBuf]) -> PathFilterRewrite {
+    absolute_path_filter_rewrite_inner(pattern, roots, cfg!(windows))
+}
+
+/// Comparison core for [`absolute_path_filter_rewrite`]. `case_insensitive`
+/// models Windows path semantics where `C:\Repo` and `c:\repo` are the same
+/// directory; the rewritten suffix is always sliced from the original pattern
+/// so its casing is preserved.
+fn absolute_path_filter_rewrite_inner(
+    pattern: &str,
+    roots: &[PathBuf],
+    case_insensitive: bool,
+) -> PathFilterRewrite {
+    let normalized = pattern.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    let is_absolute = normalized.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'/');
+    if !is_absolute {
+        return PathFilterRewrite::Keep;
+    }
+    let matches = |a: &str, b: &str| {
+        if case_insensitive {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    for root in roots {
+        let root = root.to_string_lossy().replace('\\', "/");
+        let root = root.trim_end_matches('/');
+        if matches(&normalized, root) {
+            return PathFilterRewrite::Drop;
+        }
+        if normalized.len() > root.len()
+            && normalized.as_bytes()[root.len()] == b'/'
+            && matches(&normalized[..root.len()], root)
+        {
+            let rel = &normalized[root.len() + 1..];
+            return if rel.is_empty() {
+                PathFilterRewrite::Drop
+            } else {
+                PathFilterRewrite::Rewrite(rel.to_string())
+            };
+        }
+    }
+    PathFilterRewrite::Keep
+}
+
+/// Rewrite every absolute `--path` entry that resolves under the index root to
+/// its root-relative form, since indexed paths are stored relative to it. The
+/// root is tried as-is and canonicalized so symlinked invocations work.
+fn rewrite_absolute_path_filters(repo_root: &Path, patterns: &mut Vec<String>) {
+    if patterns.is_empty() {
+        return;
+    }
+    let mut roots = vec![repo_root.to_path_buf()];
+    if let Ok(canonical) = repo_root.canonicalize()
+        && canonical != repo_root
+    {
+        roots.push(canonical);
+    }
+    let mut rewritten = Vec::with_capacity(patterns.len());
+    for pattern in patterns.drain(..) {
+        match absolute_path_filter_rewrite(&pattern, &roots) {
+            PathFilterRewrite::Keep => rewritten.push(pattern),
+            PathFilterRewrite::Drop => {}
+            PathFilterRewrite::Rewrite(rel) => rewritten.push(rel),
+        }
+    }
+    *patterns = rewritten;
 }
 
 impl LocalBackendFlags {
@@ -1000,10 +1196,130 @@ mod tests {
 
     #[test]
     fn missing_index_message_preserves_the_cli_contract() {
+        let message = missing_index_message(Path::new("/repo/sub/dir"));
         assert_eq!(
-            MISSING_INDEX_MESSAGE,
-            "no index found in current directory.\nHint: run `vera index <path>` first to create an index."
+            message,
+            "no index found in /repo/sub/dir or any parent directory.\n\
+             Run `vera index .` from the repository root, then rerun this command."
         );
+    }
+
+    #[test]
+    fn find_index_root_walks_up_to_the_nearest_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let nested = root.join("crates/foo/src");
+        std::fs::create_dir_all(root.join(".vera")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join(".vera").join("metadata.db"), []).unwrap();
+        let other = temp.path().join("noindex/sub");
+        std::fs::create_dir_all(&other).unwrap();
+
+        assert_eq!(find_index_root(&root), Some(root.clone()));
+        assert_eq!(find_index_root(&nested), Some(root));
+        assert_eq!(find_index_root(&other), None);
+    }
+
+    #[test]
+    fn find_index_root_ignores_a_bare_vera_directory_without_an_index() {
+        // The legacy Vera home (`~/.vera`) and stray directories hold models
+        // and config, never a searchable index; they must not match, or read
+        // commands would fabricate an empty metadata store inside them.
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = home.join("src/project");
+        std::fs::create_dir_all(home.join(".vera")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        // A `.vera` without metadata.db is not an index.
+        assert_eq!(find_index_root(&project), None);
+        assert_eq!(find_index_root(&home), None);
+
+        // With a metadata.db it becomes one.
+        std::fs::write(home.join(".vera").join("metadata.db"), []).unwrap();
+        assert_eq!(find_index_root(&project), Some(home.clone()));
+        assert_eq!(find_index_root(&home), Some(home));
+    }
+
+    #[test]
+    fn stale_warning_dedupe_suppresses_a_repeat_inside_the_window() {
+        // No record: print.
+        assert!(stale_warning_should_print(None, "1 added", 1_000));
+        // Same summary inside the window: suppress.
+        assert!(!stale_warning_should_print(
+            Some(("1 added", 900)),
+            "1 added",
+            1_000
+        ));
+        // Same summary past the window: print again.
+        assert!(stale_warning_should_print(
+            Some(("1 added", 100)),
+            "1 added",
+            1_000
+        ));
+        // Changed summary inside the window: print.
+        assert!(stale_warning_should_print(
+            Some(("1 added", 900)),
+            "2 added",
+            1_000
+        ));
+    }
+
+    #[test]
+    fn absolute_path_filter_rewrite_maps_under_root_and_keeps_the_rest() {
+        let roots = vec![PathBuf::from("/repo")];
+
+        // Absolute path under the root becomes root-relative.
+        assert!(matches!(
+            absolute_path_filter_rewrite("/repo/src/auth", &roots),
+            PathFilterRewrite::Rewrite(rel) if rel == "src/auth"
+        ));
+        // Windows-style separators are normalized to forward slashes.
+        assert!(matches!(
+            absolute_path_filter_rewrite("/repo\\src\\auth", &roots),
+            PathFilterRewrite::Rewrite(rel) if rel == "src/auth"
+        ));
+        assert!(matches!(
+            absolute_path_filter_rewrite("C:\\repo\\src", &[PathBuf::from("C:\\repo")]),
+            PathFilterRewrite::Rewrite(rel) if rel == "src"
+        ));
+        // Windows path comparison is case-insensitive; the rewritten glob keeps
+        // the pattern's own casing.
+        assert!(matches!(
+            absolute_path_filter_rewrite_inner(
+                "C:\\Repo\\Src",
+                &[PathBuf::from("c:\\repo")],
+                true
+            ),
+            PathFilterRewrite::Rewrite(rel) if rel == "Src"
+        ));
+        assert!(matches!(
+            absolute_path_filter_rewrite_inner(
+                "C:\\Repo\\Src",
+                &[PathBuf::from("c:\\repo")],
+                false
+            ),
+            PathFilterRewrite::Keep
+        ));
+        // The root itself becomes an empty filter and is dropped.
+        assert!(matches!(
+            absolute_path_filter_rewrite("/repo", &roots),
+            PathFilterRewrite::Drop
+        ));
+        assert!(matches!(
+            absolute_path_filter_rewrite("/repo/", &roots),
+            PathFilterRewrite::Drop
+        ));
+        // Absolute path outside the root is left for `path_filter_hint`.
+        assert!(matches!(
+            absolute_path_filter_rewrite("/other/src", &roots),
+            PathFilterRewrite::Keep
+        ));
+        // Relative patterns pass through untouched.
+        assert!(matches!(
+            absolute_path_filter_rewrite("src/**", &roots),
+            PathFilterRewrite::Keep
+        ));
     }
 
     #[tokio::test]

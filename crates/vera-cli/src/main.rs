@@ -34,7 +34,33 @@ fn main() {
         .init();
 
     vera_core::init_tls();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // Agents habitually type `vera grep foo -n` (grep's line-number
+            // flag), which clap rejects because `-n` expects a value. Give
+            // that case one extra hint line; everything else keeps clap's
+            // standard behavior (including --help/--version exiting 0).
+            // Help/version errors must not take this path: their Display
+            // output is the full help text, which contains `--limit` for
+            // grep/search/structural/references and would print the hint
+            // after a perfectly good `--help`.
+            let is_help_or_version = matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayVersion
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            if !is_help_or_version && err.to_string().contains("--limit") {
+                let _ = err.print();
+                eprintln!(
+                    "hint: in vera, -n is short for --limit <N>; line numbers are always shown. Put -n after the pattern or use --limit."
+                );
+                std::process::exit(err.exit_code());
+            }
+            err.exit();
+        }
+    };
     if let Err(err) = state::apply_saved_env() {
         // Diagnose/repair commands must still run against a broken saved
         // config; everything else keeps failing fast with the parse error.
@@ -805,6 +831,29 @@ mod tests {
         let cli = Cli::parse_from(["vera", "--raw", "grep", "TODO"]);
         assert!(matches!(cli.command, Commands::Grep { .. }));
         assert!(cli.raw);
+    }
+
+    #[test]
+    fn cli_parses_grep_bare_n_as_default_limit() {
+        let cli = Cli::parse_from(["vera", "grep", "TODO", "-n"]);
+        match cli.command {
+            Commands::Grep { limit, .. } => assert_eq!(limit, Some(20)),
+            _ => panic!("expected Grep command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_grep_n_with_value() {
+        let cli = Cli::parse_from(["vera", "grep", "TODO", "-n", "7"]);
+        match cli.command {
+            Commands::Grep { limit, .. } => assert_eq!(limit, Some(7)),
+            _ => panic!("expected Grep command"),
+        }
+        let cli = Cli::parse_from(["vera", "grep", "TODO", "--limit", "30"]);
+        match cli.command {
+            Commands::Grep { limit, .. } => assert_eq!(limit, Some(30)),
+            _ => panic!("expected Grep command"),
+        }
     }
 
     #[test]

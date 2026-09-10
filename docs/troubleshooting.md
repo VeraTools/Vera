@@ -2,13 +2,13 @@
 
 ## No index found
 
-Either the repository hasn't been indexed yet, or you're running the command from the wrong directory.
+Either the repository hasn't been indexed yet, or you're running the command outside any indexed directory.
 
 ```bash
 vera index .
 ```
 
-Make sure you're in the repository root (the directory containing `.vera/`).
+Run it from the repository root (the directory where `.vera/` should live). Search, grep, structural, references, overview, stats, and update commands resolve the nearest `.vera/` up the directory tree, so they also work from subdirectories.
 
 ## Results are stale
 
@@ -17,6 +17,8 @@ Code changed after the last index. Update it:
 ```bash
 vera update .
 ```
+
+The update runs from any subdirectory and refreshes the repository root's index. An identical stale warning is printed at most once every 10 minutes per index; set `VERA_STALE_WARNING_ALWAYS=1` to see it on every run.
 
 ## Results are irrelevant
 

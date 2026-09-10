@@ -47,6 +47,22 @@ pub fn run(path: &str, json_output: bool, options: CommandOptions) -> anyhow::Re
              Hint: vera update expects a directory path, not a file."
         );
     }
+    // Read commands resolve an ancestor `.vera/` index so they work from
+    // subdirectories; update must operate on the same root or it would
+    // rebuild `<subdir>/.vera` as a nested partial index that shadows the
+    // real one for that subtree. Canonicalize first so the walk sees real
+    // parents instead of the raw CLI path's lexical parents ("." would
+    // never walk past the empty path).
+    let start = repo_path.canonicalize()?;
+    let repo_path = match crate::helpers::find_index_root(&start) {
+        Some(root) => {
+            if root != start {
+                eprintln!("note: using index at {}", root.display());
+            }
+            root
+        }
+        None => repo_path.to_path_buf(),
+    };
 
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| anyhow::anyhow!("failed to create async runtime: {e}"))?;
