@@ -147,6 +147,8 @@ npx skills add VeraTools/Vera
 <details>
 <summary><strong>Optional: MCP server</strong> (for MCP-first clients or teams standardizing on MCP)</summary>
 
+Vera also ships an MCP server: `vera mcp`. Setup for each client and the full tool list: [MCP integration](docs/mcp.md).
+
 ```bash
 claude mcp add vera -- vera mcp      # Claude Code
 ```

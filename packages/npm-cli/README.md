@@ -19,7 +19,9 @@ vera setup --potion-code --index .
 vera search "authentication logic"
 ```
 
-`vera setup` with no flags runs an interactive wizard and offers to index the current project, defaulting to yes. An interactive search also offers to create a missing index. `vera setup --api` prompts for an OpenAI-compatible endpoint and key; the wizard offers presets for OpenAI, Jina, Voyage, and Qwen via OpenRouter, with the Qwen preset needing only one shared key (`qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1`). Use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup. `vera agent install` manages skill files for your coding agents and can update `AGENTS.md` / `CLAUDE.md` style project instructions.
+`vera setup` with no flags runs an interactive wizard and offers to index the current project, defaulting to yes. An interactive search also offers to create a missing index. `vera setup --api` prompts for an OpenAI-compatible endpoint and key; the wizard offers presets for OpenAI, Jina, Voyage, and Qwen via OpenRouter, with the Qwen preset needing only one shared key (`qwen/qwen3-embedding-8b` + `qwen/qwen3-reranker-8b` via `https://openrouter.ai/api/v1`). Use `--yes` with `EMBEDDING_MODEL_*` variables for non-interactive setup.
+
+The preferred agent integration is the CLI plus the Vera skill: `vera agent install` installs it for supported coding agents and can add a short usage snippet to your project's `AGENTS.md`, `CLAUDE.md`, `COPILOT.md`, or editor rules file. Vera also ships an optional MCP server (`vera mcp`); see the [MCP guide](https://github.com/VeraTools/Vera/blob/master/docs/mcp.md) if your client is MCP-first.
 
 ## Common Tasks
 
